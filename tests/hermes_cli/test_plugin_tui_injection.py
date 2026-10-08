@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -229,6 +231,7 @@ def test_lifecycle_hooks_require_live_route_and_are_profile_scoped(tmp_path):
         profile="default", in_place=False, route_is_current=guard)
     assert [kind for kind, _ in seen] == ["resume", "compact"]
     assert seen[0][1]["route_is_current"]() is True
+    assert "turn_id" not in seen[0][1]
     assert {key: seen[1][1][key] for key in (
         "session_key", "old_session_id", "session_id", "profile", "in_place",
     )} == {
@@ -304,3 +307,138 @@ def test_lifecycle_lazily_discovers_under_its_manager_profile(tmp_path, monkeypa
         manager.on_session_resumed(
             session_key="route", session_id="native", profile="default", route_is_current=lambda: True)
     assert seen == [("discover", manager.home_path), ("hook", "native")]
+
+
+def test_lifecycle_hung_observer_has_deadline_and_does_not_block_next(tmp_path, monkeypatch):
+    context, manager = _pair(tmp_path / "home")
+    manager._discovered = True
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.03)
+    entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+
+    def hung(**_kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        exited.set()
+
+    context.register_hook("on_session_resumed", hung)
+    context.register_hook("on_session_resumed", lambda **_kwargs: calls.append("second"))
+    started = time.monotonic()
+    try:
+        manager.on_session_resumed(
+            session_key="route", session_id="native", profile="default",
+            route_is_current=lambda: True)
+        assert time.monotonic() - started < 0.5
+        assert entered.is_set()
+        assert calls == ["second"]
+    finally:
+        release.set()
+        exited.wait(timeout=2)
+
+
+def test_lifecycle_timeout_suppresses_same_observer_but_keeps_others(tmp_path, monkeypatch):
+    context, manager = _pair(tmp_path / "home")
+    manager._discovered = True
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.03)
+    release = threading.Event()
+    calls = []
+
+    def hung(**_kwargs):
+        calls.append("hung")
+        release.wait(timeout=2)
+
+    context.register_hook("on_session_resumed", hung)
+    context.register_hook("on_session_resumed", lambda **_kwargs: calls.append("next"))
+    try:
+        for _ in range(2):
+            manager.on_session_resumed(
+                session_key="route", session_id="native", profile="default",
+                route_is_current=lambda: True)
+        assert calls == ["hung", "next", "next"]
+    finally:
+        release.set()
+
+
+def test_lifecycle_distinct_routes_do_not_share_running_gate(tmp_path, monkeypatch):
+    context, manager = _pair(tmp_path / "home")
+    manager._discovered = True
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.5)
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def observer(session_key):
+        calls.append(session_key)
+        if session_key == "route-a":
+            entered.set()
+            release.wait(timeout=2)
+
+    context.register_hook("on_session_resumed", observer)
+    first = threading.Thread(target=lambda: manager.on_session_resumed(
+        session_key="route-a", session_id="native-a", profile="default", route_is_current=lambda: True))
+    first.start()
+    try:
+        assert entered.wait(timeout=1)
+        manager.on_session_resumed(
+            session_key="route-b", session_id="native-b", profile="default",
+            route_is_current=lambda: True)
+        assert calls == ["route-a", "route-b"]
+    finally:
+        release.set()
+        first.join(timeout=2)
+    assert not first.is_alive()
+
+
+def test_lifecycle_wrapper_cache_is_cleared_on_unload(tmp_path):
+    context, manager = _pair(tmp_path / "home")
+    manager._discovered = True
+    context.register_hook("on_session_resumed", lambda **_kwargs: None)
+    manager.on_session_resumed(
+        session_key="route", session_id="native", profile="default", route_is_current=lambda: True)
+    assert manager._tui_hook_wrappers
+
+    assert manager.unload("notify-plugin") is True
+    assert manager._tui_hook_wrappers == {}
+
+
+@pytest.mark.parametrize("configured_timeout", [0, -1])
+def test_lifecycle_nonpositive_timeout_still_bounds_observer(tmp_path, monkeypatch, configured_timeout):
+    context, manager = _pair(tmp_path / "home")
+    manager._discovered = True
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: configured_timeout)
+    monkeypatch.setattr("hermes_cli.plugins._HOOK_CALLBACK_TIMEOUT_SECS", 0.03)
+    release = threading.Event()
+    context.register_hook("on_session_compacted", lambda **_kwargs: release.wait(timeout=2))
+    started = time.monotonic()
+    try:
+        manager.on_session_compacted(
+            session_key="route-b", old_session_id="native-a", session_id="native-b",
+            profile="default", in_place=False, route_is_current=lambda: True)
+        assert time.monotonic() - started < 0.5
+    finally:
+        release.set()
+
+
+def test_lifecycle_worker_rechecks_route_when_start_is_delayed(tmp_path, monkeypatch):
+    context, manager = _pair(tmp_path / "home")
+    manager._discovered = True
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.01)
+    live = SimpleNamespace(value=True)
+    calls, deferred = [], []
+
+    class DeferredThread:
+        def __init__(self, *, target, name, daemon):
+            deferred.append(target)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("hermes_cli.plugins_dispatch.threading.Thread", DeferredThread)
+    context.register_hook("on_session_resumed", lambda **_kwargs: calls.append("stale"))
+    manager.on_session_resumed(
+        session_key="route", session_id="native", profile="default",
+        route_is_current=lambda: live.value)
+    assert calls == []
+    assert len(deferred) == 1
+    live.value = False  # /new before the bounded worker reaches the callback.
+    deferred[0]()
+    assert calls == []

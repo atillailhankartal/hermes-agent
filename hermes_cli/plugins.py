@@ -1237,6 +1237,10 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
+        # Stable wrappers let bounded TUI observers keep the existing timeout suppression
+        # per callback while checking the host route again inside a delayed worker.
+        self._tui_hook_wrappers: Dict[tuple[str, int], tuple[Callable, Callable]] = {}
+        self._tui_hook_wrapper_lock = threading.Lock()
         # (hook_name, id(cb), repr(exc)) already reported at WARNING; identical repeats go to DEBUG.
         self._hook_failures_reported: set = set()
         # Ledger per plugin (ownership) plus global order (reverse teardown across plugins). Process-
@@ -1261,6 +1265,23 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # and contributed tool names (so `hermes plugins list` still attributes them).
         self._predeclared_modules: Dict[str, types.ModuleType] = {}
         self._predeclared_tools: Dict[str, List[str]] = {}
+
+    def _prune_tui_hook_wrappers(self) -> None:
+        """Release wrappers for callbacks removed by targeted or full plugin unload."""
+        live = {
+            (hook_name, id(callback)): callback
+            for hook_name in ("on_session_compacted", "on_session_resumed")
+            for callback in self.iter_hook_callbacks(hook_name)
+        }
+        with self._tui_hook_wrapper_lock:
+            for key, (callback, _) in tuple(self._tui_hook_wrappers.items()):
+                if live.get(key) is not callback:
+                    self._tui_hook_wrappers.pop(key, None)
+
+    def unload(self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None) -> bool:
+        found = super().unload(plugin)
+        self._prune_tui_hook_wrappers()
+        return found
 
     @property
     def has_gateway_message_injector(self) -> bool:
@@ -1342,6 +1363,18 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             logger.warning("TUI plugin message admission failed for %s", plugin_id)
             return False
 
+    def _guard_tui_session_callback(self, callback: Callable) -> Callable:
+        """Recheck a trusted route inside a bounded observer's worker thread."""
+        def guarded(**worker_kwargs: Any) -> Any:
+            if not worker_kwargs["route_is_current"]():
+                return None
+            # The bounded engine uses turn_id to distinguish simultaneous route calls.
+            # It is internal bookkeeping, not part of the plugin observer payload.
+            return self._invoke_hook_callback(
+                callback, {key: value for key, value in worker_kwargs.items() if key != "turn_id"})
+
+        return guarded
+
     def _notify_tui_session_hook(self, hook_name: str, *, route_is_current: Callable[[], bool],
                                  **payload: Any) -> None:
         """Dispatch an observed route only while the trusted host still owns it."""
@@ -1358,13 +1391,33 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
                 return
             kwargs = {**payload, "route_is_current": route_is_current,
                       "telemetry_schema_version": OBSERVER_SCHEMA_VERSION}
-            for callback in self.iter_hook_callbacks(hook_name):
-                try:
-                    if not route_is_current():
-                        return
-                    self._invoke_hook_callback(callback, kwargs)
-                except (Exception, SystemExit) as exc:
-                    self._report_hook_failure(hook_name, callback, kwargs, exc)
+            callbacks = self.iter_hook_callbacks(hook_name)
+            timeout = _resolve_hook_callback_timeout()
+            # A disabled generic-hook timeout must not let an observer hold session.resume
+            # or compaction forever. These host route notifications are always bounded.
+            if not 0 < timeout <= _MAX_HOOK_CALLBACK_TIMEOUT_SECS:
+                timeout = _HOOK_CALLBACK_TIMEOUT_SECS
+            self._prune_tui_hook_wrappers()
+            # A different native route is a different bounded call. Without an identity,
+            # the engine's in-flight gate would silently skip another session's observer.
+            bounded_kwargs = {**kwargs, "turn_id": repr((payload["session_key"], payload["session_id"]))}
+            try:
+                for callback in callbacks:
+                    try:
+                        if not route_is_current():
+                            return
+                        key = (hook_name, id(callback))
+                        with self._tui_hook_wrapper_lock:
+                            entry = self._tui_hook_wrappers.get(key)
+                            if entry is None or entry[0] is not callback:
+                                entry = (callback, self._guard_tui_session_callback(callback))
+                                self._tui_hook_wrappers[key] = entry
+                        self._run_hook_callback_bounded(hook_name, entry[1], bounded_kwargs, timeout)
+                    except (Exception, SystemExit) as exc:
+                        self._report_hook_failure(hook_name, callback, kwargs, exc)
+            finally:
+                # An unload may race with the callback snapshot and wrapper creation.
+                self._prune_tui_hook_wrappers()
 
     def on_session_compacted(
         self, *, session_key: str, old_session_id: str, session_id: str, profile: str,
