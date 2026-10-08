@@ -223,6 +223,9 @@ class GatewayProfileReconcileMixin:
         profile's). Secrets are not re-hydrated: teardown must not block the loop on a source fetch.
         """
         from gateway.run import _profile_runtime_scope, _write_runtime_status_quiet
+        manager = (getattr(self, "_profile_plugin_managers", None) or {}).pop(name, None)
+        if manager is not None:
+            self._clear_plugin_message_injector(manager)
         pending = (getattr(self, "_profile_failed_platforms", None) or {}).pop(name, None) or {}
         tasks = [t for t in pending.values() if isinstance(t, asyncio.Task) and not t.done()]
         for task in tasks:

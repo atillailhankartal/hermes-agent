@@ -1,7 +1,10 @@
 """Tests for plugin-triggered turns in existing gateway sessions."""
 
 import asyncio
+from contextlib import nullcontext
 from datetime import datetime
+from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +19,14 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
+from gateway.session_identity import RoutingIdentity
+from hermes_constants import (
+    get_routing_process_hermes_home,
+    pin_process_hermes_home,
+    process_hermes_home_is_pinned,
+)
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+from hermes_cli.plugins_loader import _plugin_home_scope
 
 
 def _entry(*, origin=True) -> SessionEntry:
@@ -457,6 +467,234 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     newer_injector.assert_called_once_with(value="kept")
 
 
+def test_secondary_manager_injector_lifecycle_does_not_clear_primary(tmp_path):
+    runner = _runner(_entry())
+    primary = PluginManager(scope_key=str(tmp_path / "primary"))
+    secondary = PluginManager(scope_key=str(tmp_path / "secondary"))
+
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=primary):
+        runner._install_plugin_message_injector()
+    runner._install_plugin_message_injector(secondary)
+    assert primary.has_gateway_message_injector is True
+    assert secondary.has_gateway_message_injector is True
+
+    runner._clear_plugin_message_injector(secondary)
+    assert primary.has_gateway_message_injector is True
+    assert secondary.has_gateway_message_injector is False
+    runner._clear_plugin_message_injector()
+    assert primary.has_gateway_message_injector is False
+
+
+@pytest.mark.asyncio
+async def test_plugin_injection_cannot_cross_runtime_home_but_allows_shared_bot_satellite(
+    tmp_path, monkeypatch,
+):
+    home_a, home_b = tmp_path / "a", tmp_path / "b"
+    for home in (home_a, home_b):
+        home.mkdir()
+        (home / "config.yaml").write_text(yaml.safe_dump({
+            "plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}
+        }))
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    with _plugin_home_scope(home_a):
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager,
+        )
+    with _plugin_home_scope(home_b):
+        manager_b = PluginManager()
+        context_b = PluginContext(
+            PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager_b,
+        )
+
+    source = _entry().origin
+    assert source is not None
+    entry = _entry()
+    entry.origin = source
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner.session_store.peek_session_id = MagicMock(return_value=entry.session_id)
+    runner._restored_source = MagicMock(return_value=source)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._delivery_adapter_for = MagicMock(return_value=adapter)
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+        runner._install_plugin_message_injector()
+    runner._install_plugin_message_injector(manager_b)
+
+    def route_to(runtime_home: Path) -> None:
+        # The bot receiving the message belongs to B, while the runtime may belong to A.
+        source._identity = RoutingIdentity(
+            transport_profile="b", runtime_profile=runtime_home.name,
+            authorization_home=home_b, runtime_home=runtime_home,
+        )
+
+    route_to(home_b)
+    with _plugin_home_scope(home_a):
+        assert context.inject_message("wake", session_key=entry.session_key,
+                                      expected_session_id=entry.session_id) is True
+    assert await asyncio.gather(*runner._background_tasks) == [False]
+    adapter.handle_message.assert_not_awaited()
+
+    route_to(home_a)
+    with _plugin_home_scope(home_a):
+        assert context.inject_message("wake", session_key=entry.session_key,
+                                      expected_session_id=entry.session_id) is True
+    assert await asyncio.gather(*runner._background_tasks) == [True]
+    adapter.handle_message.assert_awaited_once()
+
+    route_to(home_b)
+    with _plugin_home_scope(home_b):
+        assert context_b.inject_message("wake B", session_key=entry.session_key,
+                                        expected_session_id=entry.session_id) is True
+    assert await asyncio.gather(*runner._background_tasks) == [True]
+    assert adapter.handle_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_standalone_injection_uses_pinned_launch_home_when_ambient_home_changes(
+    tmp_path, monkeypatch,
+):
+    home_a, home_b = tmp_path / "a", tmp_path / "b"
+    home_a.mkdir()
+    home_b.mkdir()
+    entry = _entry()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._restored_source = MagicMock(return_value=entry.origin)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._delivery_adapter_for = MagicMock(return_value=adapter)
+    prior_pin = get_routing_process_hermes_home() if process_hermes_home_is_pinned() else None
+    pin_process_hermes_home(home_a)
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    try:
+        assert await runner._dispatch_plugin_message_injection(
+            session_key=entry.session_key, content="wake", plugin_id="notify-plugin",
+            origin_home=home_a,
+        ) is True
+        assert await runner._dispatch_plugin_message_injection(
+            session_key=entry.session_key, content="wake", plugin_id="notify-plugin",
+            origin_home=home_b,
+        ) is False
+    finally:
+        pin_process_hermes_home(prior_pin)
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_multiplex_injection_restores_runtime_identity_from_real_session_store(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "hermes"
+    home_a, home_b = root / "profiles" / "a", root / "profiles" / "b"
+    for home in (home_a, home_b):
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(yaml.safe_dump({
+            "plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}
+        }))
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    with _plugin_home_scope(home_a):
+        manager_a = PluginManager()
+        context_a = PluginContext(
+            PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager_a,
+        )
+    with _plugin_home_scope(home_b):
+        manager_b = PluginManager()
+        context_b = PluginContext(
+            PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager_b,
+        )
+
+    config = GatewayConfig(multiplex_profiles=True)
+    store = SessionStore(sessions_dir=root / "sessions", config=config)
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42", profile="b",
+    )
+    entry = store.get_or_create_session(source)
+    entry.transport_profile = "default"  # Shared default bot runs this session in B.
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner.config = config
+    runner.session_store = store
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {"b": {}}
+    runner._primary_profile_name = "default"
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._resolve_profile_home_for_source = MagicMock(return_value=home_b)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._install_plugin_message_injector(manager_a)
+    runner._install_plugin_message_injector(manager_b)
+
+    with _plugin_home_scope(home_a):
+        assert context_a.inject_message("cross", session_key=entry.session_key,
+                                        expected_session_id=entry.session_id) is True
+    assert await asyncio.gather(*runner._background_tasks) == [False]
+    adapter.handle_message.assert_not_awaited()
+    assert source._identity.runtime_home == home_b
+    assert source._identity.transport_profile == "default"
+
+    with _plugin_home_scope(home_b):
+        assert context_b.inject_message("own", session_key=entry.session_key,
+                                        expected_session_id=entry.session_id) is True
+    assert await asyncio.gather(*runner._background_tasks) == [True]
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_profile_hot_add_and_unserve_wire_and_clear_own_manager(tmp_path):
+    runner = _runner(_entry())
+    home_a, home_b = tmp_path / "a", tmp_path / "b"
+    primary = PluginManager(scope_key=str(home_a))
+    secondary = PluginManager(scope_key=str(home_b))
+    runner._install_plugin_message_injector(primary)
+    runner._profile_plugin_managers = {"b": secondary}
+    runner._profile_adapters = {}
+    runner._profile_configs = {}
+    runner._profile_failed_platforms = {}
+    runner._served_profile_homes = {"b": home_b}
+    runner._served_profile_signatures = {}
+    runner._agent_cache = {}
+    runner._multiplex_on = MagicMock(return_value=True)
+    runner._load_secondary_profile_config = AsyncMock(return_value=SimpleNamespace(platforms={}))
+
+    assert await runner._start_one_profile_adapters("b", home_b, {}) == 0
+    assert primary.has_gateway_message_injector is True
+    assert secondary.has_gateway_message_injector is True
+
+    with patch("gateway.run._profile_runtime_scope", return_value=nullcontext()), \
+         patch("gateway.run._write_runtime_status_quiet"), \
+         patch("hermes_state_registry.close_all_under"), \
+         patch("plugins.memory.holographic.store.MemoryStore.release_all_under"):
+        await runner._unserve_profile("b", home_b)
+
+    assert primary.has_gateway_message_injector is True
+    assert secondary.has_gateway_message_injector is False
+
+
+@pytest.mark.asyncio
+async def test_secondary_config_discovery_tracks_its_own_plugin_manager(tmp_path):
+    runner = _runner(_entry())
+    home_b = tmp_path / "b"
+    home_b.mkdir()
+    manager_b = PluginManager(scope_key=str(home_b))
+    runner._snapshot_profile_busy_modes = MagicMock()
+    runner._subscribe_plugin_rewire = MagicMock()
+    runner._register_config_hooks = MagicMock()
+    profile_cfg = SimpleNamespace(platforms={})
+
+    with patch("gateway.run._profile_runtime_scope", return_value=nullcontext()), \
+         patch("gateway.run._load_gateway_config", return_value={}), \
+         patch("gateway.run._own_policy_open_startup_violation", return_value=None), \
+         patch("gateway.config.load_gateway_config", return_value=profile_cfg), \
+         patch("hermes_cli.env_loader.hydrate_profile_secret_sources"), \
+         patch("hermes_cli.plugins.discover_plugins"), \
+         patch("hermes_cli.plugins.get_plugin_manager", return_value=manager_b):
+        assert await runner._load_secondary_profile_config("b", home_b) is profile_cfg
+
+    assert runner._profile_plugin_managers["b"] is manager_b
+    runner._subscribe_plugin_rewire.assert_called_once_with(manager_b, "b", home_b)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rotation", [None, "new", "compression", "missing", "empty"])
 async def test_pinned_scheduler_checks_current_session(tmp_path, rotation):
@@ -747,3 +985,193 @@ async def test_strict_hygiene_rechecks_after_build_before_compressor(tmp_path):
     release.set()
     assert await asyncio.wait_for(task, 5) is None
     runner._cleanup_agent_resources_off_loop.assert_awaited_once_with(agent, context="session hygiene")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotation", ["reset", "compression", "generation", "none"])
+async def test_strict_hygiene_fences_worker_commit_and_adoption_after_summary_wait(rotation):
+    runner = _runner(_entry())
+    route = {"session_id": "old"}
+    runner.session_store.peek_session_id = MagicMock(side_effect=lambda _: route["session_id"])
+    runner._is_session_run_current = MagicMock(return_value=True)
+    worker_entered, worker_release, worker_done = Event(), Event(), Event()
+    summary_entered, summary_release = asyncio.Event(), asyncio.Event()
+    committed = []
+
+    def compress(*_args, commit_fence, **_kwargs):
+        worker_entered.set()
+        assert worker_release.wait(5)
+        if commit_fence.begin_commit():
+            committed.append("stale-write")
+            commit_fence.finish_commit()
+        worker_done.set()
+        return [], None
+
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(bind_session_state=lambda *_: None),
+        _compress_context=compress,
+    )
+
+    async def held_summary(*_):
+        summary_entered.set()
+        await summary_release.wait()
+        return []
+
+    runner._hmwa_hygiene_build_agent = AsyncMock(return_value=(agent, None))
+    runner._hmwa_hygiene_wait_for_summary = AsyncMock(side_effect=held_summary)
+    runner._hmwa_hygiene_apply_result = AsyncMock()
+    runner._evict_cached_agent = MagicMock()
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+    attempt = SimpleNamespace(agent=None, cleanup_deferred=False, history=[])
+    event = SimpleNamespace(metadata={
+        "gateway_session_strict": True, "gateway_session_key": "route",
+        "gateway_session_id": "old",
+    })
+    task = asyncio.create_task(runner._hmwa_hygiene_detached_attempt(
+        attempt, SimpleNamespace(total_ceiling_seconds=30),
+        SimpleNamespace(approx_tokens=10), [], [], None, {}, None,
+        SimpleNamespace(session_id="old"), "route", "route", 1, strict_event=event,
+    ))
+    try:
+        await asyncio.wait_for(summary_entered.wait(), 5)
+        assert await asyncio.to_thread(worker_entered.wait, 5)
+        if rotation in {"reset", "compression"}:
+            route["session_id"] = "new"
+        elif rotation == "generation":
+            runner._is_session_run_current.return_value = False
+        worker_release.set()
+        assert await asyncio.to_thread(worker_done.wait, 5)
+        summary_release.set()
+        await asyncio.wait_for(task, 5)
+    finally:
+        worker_release.set()
+        summary_release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    if rotation == "none":
+        assert committed == ["stale-write"]
+        runner._hmwa_hygiene_apply_result.assert_awaited_once()
+    else:
+        assert committed == []
+        runner._hmwa_hygiene_apply_result.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotation_boundary", ["none", "rewrite", "save"])
+async def test_strict_hygiene_adoption_only_repoints_its_current_route(rotation_boundary):
+    runner = _runner(_entry())
+    route = {"session_id": "old"}
+    runner.session_store.peek_session_id = MagicMock(side_effect=lambda _: route["session_id"])
+    runner._is_session_run_current = MagicMock(return_value=True)
+    runner._rebind_turn_lease = MagicMock()
+    runner._sync_telegram_topic_binding = MagicMock()
+    original = [{"role": "user", "content": "a" * 1000}] * 4
+    compressed = [{"role": "assistant", "content": "summary"}]
+    entry = SimpleNamespace(session_id="old", last_prompt_tokens=1000)
+    agent = SimpleNamespace(session_id="compressed", _last_compaction_in_place=False)
+    fence = MagicMock()
+    attempt = SimpleNamespace(agent=agent, history=original, commit_fence=fence)
+    plan = SimpleNamespace(msg_count=4, approx_tokens=1000, warn_token_threshold=10**9)
+    event = SimpleNamespace(metadata={
+        "gateway_session_strict": True, "gateway_session_key": "route",
+        "gateway_session_id": "old",
+    })
+
+    async def rewrite(*_):
+        if rotation_boundary == "rewrite":
+            route["session_id"] = "reset"
+        return True
+
+    async def save():
+        route["session_id"] = "reset" if rotation_boundary == "save" else entry.session_id
+
+    runner.async_session_store.rewrite_transcript = AsyncMock(side_effect=rewrite)
+    runner.async_session_store._save = AsyncMock(side_effect=save)
+    result = await runner._hmwa_hygiene_adopt_transcript(
+        attempt, compressed, original, plan, session_entry=entry, source=None,
+        _quick_key="route", run_generation=1, strict_event=event,
+    )
+
+    if rotation_boundary != "none":
+        assert result == (False, False, 4, 1000)
+        assert route["session_id"] == "reset"
+        assert attempt.history is original
+        if rotation_boundary == "rewrite":
+            runner._rebind_turn_lease.assert_not_called()
+            runner.async_session_store._save.assert_not_awaited()
+        else:
+            runner._rebind_turn_lease.assert_called_once_with("route", 1, "compressed")
+            runner.async_session_store._save.assert_awaited_once()
+        runner._sync_telegram_topic_binding.assert_not_called()
+        fence.revoke_commit_admission.assert_called_once()
+    else:
+        assert result[0:2] == (True, False)
+        assert route["session_id"] == "compressed"
+        assert attempt.history is compressed
+        runner._rebind_turn_lease.assert_called_once_with("route", 1, "compressed")
+        runner._sync_telegram_topic_binding.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_hygiene_wait_defers_cleanup_without_evicting_new_route():
+    runner = _runner(_entry())
+    route = {"session_id": "old"}
+    runner.session_store.peek_session_id = MagicMock(side_effect=lambda _: route["session_id"])
+    runner._is_session_run_current = MagicMock(return_value=True)
+    worker_entered, worker_release = Event(), Event()
+    summary_entered, summary_release = asyncio.Event(), asyncio.Event()
+
+    def compress(*_args, **_kwargs):
+        worker_entered.set()
+        assert worker_release.wait(5)
+        return [], None
+
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(bind_session_state=lambda *_: None),
+        _compress_context=compress,
+    )
+
+    async def held_summary(*_):
+        summary_entered.set()
+        await summary_release.wait()
+        return []
+
+    runner._hmwa_hygiene_build_agent = AsyncMock(return_value=(agent, None))
+    runner._hmwa_hygiene_wait_for_summary = AsyncMock(side_effect=held_summary)
+    runner._hmwa_hygiene_apply_result = AsyncMock()
+    runner._evict_cached_agent = MagicMock()
+    runner._defer_agent_cleanup_until_future_done = MagicMock()
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+    attempt = SimpleNamespace(agent=None, cleanup_deferred=False, history=[])
+    event = SimpleNamespace(metadata={
+        "gateway_session_strict": True, "gateway_session_key": "route",
+        "gateway_session_id": "old",
+    })
+    task = asyncio.create_task(runner._hmwa_hygiene_detached_attempt(
+        attempt, SimpleNamespace(total_ceiling_seconds=30),
+        SimpleNamespace(approx_tokens=10), [], [], None, {}, None,
+        SimpleNamespace(session_id="old"), "route", "route", 1, strict_event=event,
+    ))
+    try:
+        await asyncio.wait_for(summary_entered.wait(), 5)
+        assert await asyncio.to_thread(worker_entered.wait, 5)
+        route["session_id"] = "new"
+        summary_release.set()
+        await asyncio.wait_for(task, 5)
+        assert attempt.cleanup_deferred is True
+        runner._defer_agent_cleanup_until_future_done.assert_called_once_with(
+            attempt.future, agent, context="stale session hygiene",
+        )
+        runner._cleanup_agent_resources_off_loop.assert_not_awaited()
+        runner._evict_cached_agent.assert_not_called()
+        runner._hmwa_hygiene_apply_result.assert_not_awaited()
+    finally:
+        worker_release.set()
+        summary_release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if attempt.future is not None:
+            await asyncio.wait_for(attempt.future, 5)

@@ -972,7 +972,8 @@ class GatewayAdapterLifecycleMixin:
             profile_runtime_cfg = _load_gateway_config()
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
             discover_plugins()
-            self._subscribe_plugin_rewire(get_plugin_manager(), profile_name, profile_home)
+            manager = get_plugin_manager()
+            self._subscribe_plugin_rewire(manager, profile_name, profile_home)
             # This profile's `hooks:` block: start() registered before any profile scope existed.
             self._register_config_hooks(
                 "shell-hook/webhook registration failed for profile '%s'", profile_name, level=logging.WARNING,
@@ -986,6 +987,10 @@ class GatewayAdapterLifecycleMixin:
                 "Enable GATEWAY_ALLOW_ALL_USERS or the platform allow-all flag "
                 "for that profile, or change dm_policy/group_policy away from 'open'."
             )
+        managers = getattr(self, "_profile_plugin_managers", None)
+        if managers is None:
+            managers = self._profile_plugin_managers = {}
+        managers[profile_name] = manager
         return profile_cfg
 
     def _refuse_duplicate_claim(
@@ -1145,6 +1150,9 @@ class GatewayAdapterLifecycleMixin:
                     claimed[claim] = profile_name
             connected += 1
             logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
+        manager = (getattr(self, "_profile_plugin_managers", None) or {}).get(profile_name)
+        if manager is not None:
+            self._install_plugin_message_injector(manager)
         return connected
 
     def _wire_adapter_handlers(

@@ -642,7 +642,8 @@ class PluginContext:
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
         try:
-            cfg = load_config_readonly() or {}
+            with _plugin_home_scope(self._manager.home_path):
+                cfg = load_config_readonly() or {}
         except Exception:
             return False
         return (_plugin_settings_entry(cfg, self.plugin_id) or {}).get("allow_gateway_injection") is True

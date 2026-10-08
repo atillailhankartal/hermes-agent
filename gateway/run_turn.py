@@ -398,13 +398,15 @@ class GatewayTurnMixin:
         except Exception:
             return False
 
-    def _hmwa_strict_turn_is_current(self, event, quick_key=None, run_generation=None) -> bool:
+    def _hmwa_strict_turn_is_current(
+        self, event, quick_key=None, run_generation=None, *, expected_session_id=None,
+    ) -> bool:
         """A queued strict event must still own its route after every preparation await."""
         metadata = getattr(event, "metadata", None) or {}
         if not metadata.get("gateway_session_strict"):
             return True
         key = metadata.get("gateway_session_key")
-        pinned_id = metadata.get("gateway_session_id")
+        pinned_id = expected_session_id or metadata.get("gateway_session_id")
         if (
             key and pinned_id and self.session_store.peek_session_id(key) == pinned_id
             and (run_generation is None or self._is_session_run_current(quick_key, run_generation))
@@ -1115,6 +1117,7 @@ class GatewayTurnMixin:
 
     async def _hmwa_hygiene_adopt_transcript(
         self, attempt, _compressed, history, plan, *, session_entry, source, _quick_key, run_generation,
+        strict_event=None,
     ):
         """Adopt a finished compression (rotation / in-place / refused); publishes the transcript to
         continue with on ``attempt.history``. Returns ``(rotated, in_place, new_count, new_tokens)``.
@@ -1124,6 +1127,19 @@ class GatewayTurnMixin:
         FAILURE and an unconditional rewrite would leave only the summary. Write-before-repoint:
         a repoint-then-failed-rewrite would point the live entry at an empty session."""
         from agent.model_metadata import estimate_messages_tokens_rough
+        def route_current(expected_session_id=None):
+            return strict_event is None or self._hmwa_strict_turn_is_current(
+                strict_event, _quick_key, run_generation,
+                expected_session_id=expected_session_id,
+            )
+
+        def stale_result():
+            if getattr(attempt, "commit_fence", None) is not None:
+                attempt.commit_fence.revoke_commit_admission()
+            return False, False, plan.msg_count, plan.approx_tokens
+
+        if not route_current():
+            return stale_result()
         _hyg_agent = attempt.agent
         # _compress_context rotates to a NEW session_id so the old transcript stays intact/searchable.
         _hyg_new_sid = _hyg_agent.session_id
@@ -1165,10 +1181,14 @@ class GatewayTurnMixin:
                 _hyg_rotated = False
                 _hyg_in_place = False
             else:
+                if not route_current():
+                    return stale_result()
                 session_entry.session_id = _hyg_new_sid
                 # The held turn lease follows the rotation (alias keys still serialize on this turn).
                 self._rebind_turn_lease(_quick_key, run_generation, _hyg_new_sid)
                 await self.async_session_store._save()
+                if not route_current(_hyg_new_sid):
+                    return stale_result()
                 await asyncio.to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="hygiene-compression",
                 )
@@ -1199,15 +1219,26 @@ class GatewayTurnMixin:
 
     async def _hmwa_hygiene_apply_result(
         self, attempt, hs, _compressed, history, plan, *,
-        session_entry, session_key, source, _quick_key, run_generation,
+        session_entry, session_key, source, _quick_key, run_generation, strict_event=None,
     ):
         """Adopt a finished hygiene compression, rebind the session + turn lease, record
         streak/cooldown, and warn the user on abort."""
         from gateway.run import _reset_hygiene_failure_streak, hygiene_compaction_recovered
+        if strict_event is not None and not self._hmwa_strict_turn_is_current(
+            strict_event, _quick_key, run_generation,
+        ):
+            attempt.commit_fence.revoke_commit_admission()
+            return False
         _hyg_rotated, _hyg_in_place, _new_count, _new_tokens = await self._hmwa_hygiene_adopt_transcript(
             attempt, _compressed, history, plan, session_entry=session_entry, source=source,
-            _quick_key=_quick_key, run_generation=run_generation,
+            _quick_key=_quick_key, run_generation=run_generation, strict_event=strict_event,
         )
+        expected_id = session_entry.session_id if _hyg_rotated else None
+        if strict_event is not None and not self._hmwa_strict_turn_is_current(
+            strict_event, _quick_key, run_generation, expected_session_id=expected_id,
+        ):
+            attempt.commit_fence.revoke_commit_admission()
+            return False
         # Summary failure aborts the compressor (nothing dropped). Warn the user visibly — agent.log
         # is invisible on TG/Discord — so they know the chat is "frozen" and can /compress or /reset.
         _comp = getattr(attempt.agent, "context_compressor", None)
@@ -1259,6 +1290,7 @@ class GatewayTurnMixin:
                 "check `auxiliary.compression.model` in config.yaml.",
                 "aux-model-fallback notice",
             )
+        return True
 
     async def _hmwa_hygiene_codex_compaction(self, hs, plan, history, session_entry, session_key, _hyg_runtime):
         """codex app-server runtime: the real context is the server-side thread, not the transcript
@@ -1323,12 +1355,28 @@ class GatewayTurnMixin:
         continue with (compressed or original) on ``attempt.history``."""
         from gateway.run import HygieneTurnHoldExceeded
         from agent.conversation_compression import CompressionCommitFence
+
+        class StrictTurnCommitFence(CompressionCommitFence):
+            def begin_commit(fence, cancel_event=None):
+                # The detached worker can outlive /new. Check again at its actual mutation
+                # boundary. Serialize admission with SessionStore reset when its lock exists.
+                if strict_event is None:
+                    return super().begin_commit(cancel_event)
+                route_lock = getattr(self.session_store, "_lock", None)
+                with route_lock if route_lock is not None else nullcontext():
+                    if self._hmwa_strict_turn_is_current(strict_event, _quick_key, run_generation):
+                        return super().begin_commit(cancel_event)
+                fence.revoke_commit_admission()
+                return False
+
         _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(_hyg_model, _hyg_runtime, session_entry)
         attempt.agent = _hyg_agent
+        stale_route = False
         try:
             if strict_event is not None and not self._hmwa_strict_turn_is_current(
                 strict_event, _quick_key, run_generation,
             ):
+                stale_route = True
                 return
             # Hygiene owns the session binding, so prefer in-place compaction over minting a
             # continuation child. Without a SessionDB this stays False.
@@ -1341,7 +1389,7 @@ class GatewayTurnMixin:
             _hyg_agent._print_fn = lambda *a, **kw: None
 
             loop = asyncio.get_running_loop()
-            _hyg_commit_fence = CompressionCommitFence(total_ceiling_seconds=hs.total_ceiling_seconds)
+            _hyg_commit_fence = StrictTurnCommitFence(total_ceiling_seconds=hs.total_ceiling_seconds)
             # Default executor (NOT self._get_executor): a hung summary must never occupy an
             # agent-work slot. MUST run in the caller's contextvars (multiplex secret scope).
             attempt.commit_fence = _hyg_commit_fence
@@ -1370,14 +1418,25 @@ class GatewayTurnMixin:
                 self._hmwa_hygiene_on_unwind(attempt, hs, session_entry, session_key)
                 raise
 
-            await self._hmwa_hygiene_apply_result(
+            if strict_event is not None and not self._hmwa_strict_turn_is_current(
+                strict_event, _quick_key, run_generation,
+            ):
+                stale_route = True
+                attempt.commit_fence.revoke_commit_admission()
+                if not attempt.future.done() and not attempt.cleanup_deferred:
+                    self._hmwa_hygiene_defer_cleanup(attempt, "stale session hygiene")
+                return
+            applied = await self._hmwa_hygiene_apply_result(
                 attempt, hs, _compressed, history, plan, session_entry=session_entry,
                 session_key=session_key, source=source, _quick_key=_quick_key,
-                run_generation=run_generation,
+                run_generation=run_generation, strict_event=strict_event,
             )
+            if applied is False:
+                stale_route = True
         finally:
-            # Evict the cached agent so the next turn rebuilds its system prompt.
-            self._evict_cached_agent(session_key)
+            # A reset can already have installed the next route's cached agent.
+            if not stale_route:
+                self._evict_cached_agent(session_key)
             if not attempt.cleanup_deferred:
                 await self._cleanup_agent_resources_off_loop(_hyg_agent, context="session hygiene")
 

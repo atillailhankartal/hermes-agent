@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import yaml
 
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+from hermes_cli.plugins_loader import _plugin_home_scope
 
 
 def _context(name: str = "notify-plugin") -> tuple[PluginContext, PluginManager]:
@@ -80,6 +81,32 @@ def test_gateway_injection_requires_explicit_permission(tmp_path, monkeypatch):
         is False
     )
     injector.assert_not_called()
+
+
+def test_gateway_injection_consent_is_pinned_to_origin_manager_home(tmp_path):
+    denied_home = tmp_path / "denied"
+    allowed_home = tmp_path / "allowed"
+    for home, allowed in ((denied_home, False), (allowed_home, True)):
+        home.mkdir()
+        (home / "config.yaml").write_text(yaml.safe_dump({
+            "plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": allowed}}}
+        }))
+    with _plugin_home_scope(denied_home):
+        denied_context, denied_manager = _context()
+    with _plugin_home_scope(allowed_home):
+        allowed_context, allowed_manager = _context()
+    denied_injector = MagicMock(return_value=True)
+    allowed_injector = MagicMock(return_value=True)
+    denied_manager.set_gateway_message_injector(object(), denied_injector)
+    allowed_manager.set_gateway_message_injector(object(), allowed_injector)
+
+    with _plugin_home_scope(allowed_home):
+        assert denied_context.inject_message("wake", session_key="route") is False
+    with _plugin_home_scope(denied_home):
+        assert allowed_context.inject_message("wake", session_key="route") is True
+
+    denied_injector.assert_not_called()
+    allowed_injector.assert_called_once()
 
 
 def test_gateway_injection_does_not_treat_string_as_permission(tmp_path, monkeypatch):

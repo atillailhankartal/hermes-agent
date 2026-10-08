@@ -17,6 +17,7 @@ import os
 import re
 import time
 from contextlib import suppress
+from pathlib import Path
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
@@ -1794,23 +1795,46 @@ class GatewayInboundMixin:
                 with suppress(AttributeError):
                     delattr(event, attr)
 
-    def _install_plugin_message_injector(self) -> None:
-        """Publish this live gateway's plugin message scheduler."""
+    def _install_plugin_message_injector(self, manager=None) -> None:
+        """Publish this runner's scheduler to one profile's plugin manager."""
         from hermes_cli.plugins import get_plugin_manager
+        from hermes_constants import hermes_home_key
 
-        get_plugin_manager().set_gateway_message_injector(
-            self, self._schedule_plugin_message_injection
-        )
+        manager = manager or get_plugin_manager()
+        managers = getattr(self, "_plugin_injector_managers", None)
+        if managers is None:
+            managers = self._plugin_injector_managers = {}
+        managers[hermes_home_key(manager.home_path)] = manager
 
-    def _clear_plugin_message_injector(self) -> None:
-        """Remove this runner's scheduler without clobbering a newer owner."""
-        from hermes_cli.plugins import get_plugin_manager
+        def inject_from_profile(**kwargs) -> bool:
+            # Capture the owning manager, never a profile name supplied by plugin code.
+            return self._schedule_plugin_message_injection(origin_home=manager.home_path, **kwargs)
 
-        get_plugin_manager().clear_gateway_message_injector(self)
+        manager.set_gateway_message_injector(self, inject_from_profile)
+
+    def _clear_plugin_message_injector(self, manager=None) -> None:
+        """Remove this runner's scheduler from one or all profile managers."""
+        managers = getattr(self, "_plugin_injector_managers", None) or {}
+        if manager is None:
+            selected = list(managers.values())
+            managers.clear()
+            if not selected:
+                from hermes_cli.plugins import get_plugin_manager
+                selected = [get_plugin_manager()]
+        else:
+            from hermes_constants import hermes_home_key
+            key = hermes_home_key(manager.home_path)
+            if managers.get(key) is manager:
+                managers.pop(key, None)
+            selected = [manager]
+
+        for profile_manager in selected:
+            profile_manager.clear_gateway_message_injector(self)
 
     def _schedule_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str,
         expected_session_id: str | None = None,
+        origin_home: Path | None = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
@@ -1827,6 +1851,7 @@ class GatewayInboundMixin:
         coro = self._dispatch_plugin_message_injection(
             session_key=session_key, content=content, plugin_id=plugin_id,
             **({"expected_session_id": expected_session_id} if expected_session_id is not None else {}),
+            **({"origin_home": origin_home} if origin_home is not None else {}),
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -1869,6 +1894,7 @@ class GatewayInboundMixin:
     async def _dispatch_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str,
         expected_session_id: str | None = None,
+        origin_home: Path | None = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         def _accepting() -> bool:
@@ -1885,8 +1911,23 @@ class GatewayInboundMixin:
         ):
             return False
 
-        from gateway.session_identity import replace_source
+        from gateway.session_identity import identity_of, replace_source
         source = replace_source(self._restored_source(entry))
+        if origin_home is not None:
+            from hermes_constants import get_routing_process_hermes_home, hermes_home_key
+            identity = identity_of(source)
+            if identity is not None:
+                target_home = identity.runtime_home
+            elif not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                target_home = get_routing_process_hermes_home()
+            else:
+                return False
+            if hermes_home_key(target_home) != hermes_home_key(origin_home):
+                logger.warning(
+                    "Plugin message injection denied across runtime homes: plugin=%s session=%s",
+                    plugin_id, session_key,
+                )
+                return False
         try:
             authorized = self._is_user_authorized_for_source(source, allow_adapter_delegation=False)
         except Exception:
