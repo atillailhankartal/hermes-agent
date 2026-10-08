@@ -26,13 +26,13 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Set, Tuple, Union
 
 from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_home_key
 from registration_lifecycle import replacement_coordinator
 from utils import env_var_enabled
 from hermes_cli.config import load_config_readonly
-from hermes_cli.middleware import VALID_MIDDLEWARE
+from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
 from hermes_cli.plugin_capabilities import plugin_capability_granted
 from hermes_cli.relay_plugin_cutover import RELAY_PLUGINS_CONFIG_ENV, legacy_relay_plugin_keys
 # Sibling modules' names are re-exported here (origin) so plugins and tests keep one import path.
@@ -130,6 +130,9 @@ VALID_HOOKS: Set[str] = {
     # error_body may be unredacted.
     "transform_api_error_classification", "on_session_start", "on_session_end",
     "on_session_finalize", "on_session_reset",
+    # TUI/Desktop continuation notifications. The host passes an exact live-route guard;
+    # a plugin must recheck it immediately before rebinding a delayed delivery.
+    "on_session_compacted", "on_session_resumed",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
@@ -205,7 +208,9 @@ VALID_HOOKS: Set[str] = {
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "transform_api_error_classification", "on_session_compacted", "on_session_resumed",
+}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()
@@ -602,17 +607,27 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
-        expected_session_id: str | None = None,
+        expected_session_id: str | None = None, surface: Literal["gateway", "tui"] | None = None,
     ) -> bool:
-        """Inject a message into a CLI or gateway conversation (new turn if idle, interrupt if running).
+        """Inject into the selected live host; the default keeps CLI-first/gateway behavior.
+
+        ``surface="tui"`` selects the separately granted TUI/Desktop callback and requires
+        both the conversation key and exact native session id. Its True receipt means the
+        host actually admitted the turn or queue candidate, not that execution finished.
         Gateway injection needs an existing ``session_key`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection``; ``True`` means the gateway accepted the
         request for async dispatch, not that delivery completed. ``expected_session_id`` pins
         gateway delivery to a native session; resets/compression reject stale messages.
         CLI calls with a pin fail closed because CLI queues cannot enforce gateway identity."""
+        if surface not in (None, "gateway", "tui"):
+            return False
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
-        if cli is not None:
+        if surface == "tui":
+            return self._manager.inject_tui_message(
+                session_key=session_key, expected_session_id=expected_session_id,
+                content=msg, plugin_id=self.plugin_id)
+        if cli is not None and surface is None:
             if expected_session_id is not None:
                 return False
             queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
@@ -1179,6 +1194,8 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         self._gateway_message_injector: tuple[object, Callable] | None = None
+        self._tui_message_injector: tuple[object, Callable] | None = None
+        self._tui_injector_lock = threading.Lock()
         self._context_engine = None  # Set by a plugin via register_context_engine()
         # Manager-local registries keyed by name (see the matching ``PluginContext.register_*``):
         # plugins, hooks, middleware, CLI + slash commands, prompt sections, skills (qualified name ->
@@ -1263,6 +1280,110 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         """Submit a plugin-triggered turn to the live gateway."""
         registered = self._gateway_message_injector
         return registered is not None and bool(registered[1](**kwargs))
+
+    @property
+    def has_tui_message_injector(self) -> bool:
+        """Return whether a TUI/Desktop host callback is currently registered."""
+        with self._tui_injector_lock:
+            return self._tui_message_injector is not None
+
+    def set_tui_message_injector(self, owner: object, injector: Callable[..., bool]) -> None:
+        """Publish one host-owned TUI callback; a replaced owner cannot clear its successor."""
+        if owner is None or not callable(injector):
+            raise ValueError("TUI injector requires an owner and callable")
+        with self._tui_injector_lock:
+            self._tui_message_injector = (owner, injector)
+
+    def clear_tui_message_injector(self, owner: object) -> None:
+        """Clear only the callback still owned by this exact host generation."""
+        with self._tui_injector_lock:
+            if self._tui_message_injector is not None and self._tui_message_injector[0] is owner:
+                self._tui_message_injector = None
+
+    def _tui_injection_allowed(self, plugin_id: str) -> bool:
+        """Check the immutable manager profile and a live plugin's separate TUI grant."""
+        loaded = self._plugins.get(plugin_id)
+        if loaded is None or not loaded.enabled or loaded.error:
+            return False
+        try:
+            with _plugin_home_scope(self.home_path):
+                cfg = load_config_readonly() or {}
+        except Exception:
+            return False
+        plugins = cfg.get("plugins") if isinstance(cfg, dict) else None
+        if not isinstance(plugins, dict):
+            return False
+        enabled = plugins.get("enabled")
+        disabled = plugins.get("disabled", [])
+        return (isinstance(enabled, list) and plugin_id in enabled
+                and (not isinstance(disabled, list) or plugin_id not in disabled)
+                and (_plugin_settings_entry(cfg, plugin_id) or {}).get("allow_tui_injection") is True)
+
+    def inject_tui_message(
+        self, *, session_key: str | None, expected_session_id: str | None,
+        content: str, plugin_id: str,
+    ) -> bool:
+        """Return True only after the TUI host callback confirms exact turn/queue admission."""
+        if not all(isinstance(value, str) and value.strip()
+                   for value in (session_key, expected_session_id, content, plugin_id)):
+            return False
+        if not self._tui_injection_allowed(plugin_id):
+            return False
+        with self._tui_injector_lock:
+            registered = self._tui_message_injector
+        if registered is None:
+            return False
+        try:
+            return registered[1](
+                session_key=session_key, expected_session_id=expected_session_id,
+                content=content, plugin_id=plugin_id) is True
+        except Exception:
+            # The host exception may contain prompt text; keep it out of logs.
+            logger.warning("TUI plugin message admission failed for %s", plugin_id)
+            return False
+
+    def _notify_tui_session_hook(self, hook_name: str, *, route_is_current: Callable[[], bool],
+                                 **payload: Any) -> None:
+        """Dispatch an observed route only while the trusted host still owns it."""
+        if not callable(route_is_current):
+            return
+        with _plugin_home_scope(self.home_path):
+            try:
+                if not route_is_current():
+                    return
+                # Resume may precede the first prompt and therefore precede normal lazy discovery.
+                self.discover_and_load()
+            except Exception:
+                logger.warning("TUI plugin %s discovery/route check failed", hook_name, exc_info=True)
+                return
+            kwargs = {**payload, "route_is_current": route_is_current,
+                      "telemetry_schema_version": OBSERVER_SCHEMA_VERSION}
+            for callback in self.iter_hook_callbacks(hook_name):
+                try:
+                    if not route_is_current():
+                        return
+                    self._invoke_hook_callback(callback, kwargs)
+                except (Exception, SystemExit) as exc:
+                    self._report_hook_failure(hook_name, callback, kwargs, exc)
+
+    def on_session_compacted(
+        self, *, session_key: str, old_session_id: str, session_id: str, profile: str,
+        in_place: bool, route_is_current: Callable[[], bool],
+    ) -> None:
+        """Notify plugins after a TUI continuation route has been published."""
+        self._notify_tui_session_hook(
+            "on_session_compacted", session_key=session_key, old_session_id=old_session_id,
+            session_id=session_id, profile=profile, in_place=in_place,
+            route_is_current=route_is_current)
+
+    def on_session_resumed(
+        self, *, session_key: str, session_id: str, profile: str,
+        route_is_current: Callable[[], bool],
+    ) -> None:
+        """Notify plugins after a live TUI/Desktop route has been resumed."""
+        self._notify_tui_session_hook(
+            "on_session_resumed", session_key=session_key, session_id=session_id,
+            profile=profile, route_is_current=route_is_current)
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found; ``force`` unloads first so config
