@@ -488,7 +488,8 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
 
 
 def _run_after_agent_ready(
-    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None
+    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
+    image_paths=None,
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
@@ -519,7 +520,7 @@ def _run_after_agent_ready(
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author, image_paths=image_paths)
 
 
 _TRUNCATION_PARAMS = (
@@ -532,7 +533,9 @@ def _lock_in_submit_turn(
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
-    with (_sessions_lock if plugin_admission is not None else contextlib.nullcontext()), _session_turn_admission(session) as admitted:
+    with _session_turn_admission(session) as admitted, (
+        _sessions_lock if plugin_admission is not None else contextlib.nullcontext()
+    ):
         if not admitted:
             return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
         if plugin_admission is not None and not plugin_admission.current(sid, session):
@@ -645,7 +648,9 @@ def _(rid, params: dict) -> dict:
     # finished between the two acquisitions, retry the claim rather than strand this
     # prompt in a queue whose drain already ran.
     while True:
-        with (_sessions_lock if plugin_admission is not None else contextlib.nullcontext()), session["history_lock"]:
+        with session["history_lock"], (
+            _sessions_lock if plugin_admission is not None else contextlib.nullcontext()
+        ):
             if plugin_admission is not None and not plugin_admission.current(sid, session):
                 return _err(rid, 4007, "plugin target is no longer live")
             if not session.get("running"):
@@ -661,19 +666,9 @@ def _(rid, params: dict) -> dict:
             # built for exactly this race — see desktop's `runRewindSubmit`) waits
             # for `running` to clear and resubmits with the truncation intact.
             return _err(rid, 4009, "session busy")
-        with (_sessions_lock if plugin_admission is not None else contextlib.nullcontext()):
-            if plugin_admission is not None and not plugin_admission.current(sid, session):
-                return _err(rid, 4007, "plugin target is no longer live")
-            prior_head = session.get("queued_prompt")
-            prior_text = prior_head.get("text") if isinstance(prior_head, dict) else None
-            prior_tail_size = len(session.get("queued_prompts") or [])
-            busy_response = _handle_busy_submit(
-                rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author)
-            if (plugin_admission is not None and busy_response is not None
-                    and session.get("queued_prompt") is prior_head
-                    and (prior_head.get("text") if isinstance(prior_head, dict) else None) == prior_text
-                    and len(session.get("queued_prompts") or []) == prior_tail_size):
-                return _err(rid, 4007, "plugin message was not queued")
+        busy_response = _handle_busy_submit(
+            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")),
+            turn_author=turn_author, plugin_admission=plugin_admission)
         if busy_response is not None:
             return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
@@ -717,7 +712,8 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author),
+            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback,
+            turn_author, [] if plugin_admission is not None else None),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread

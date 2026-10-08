@@ -134,11 +134,11 @@ def _ac_inflight_original(session: dict) -> str:
 
 
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
-                    turn_author: dict | None = None) -> None:
+                    turn_author: dict | None = None) -> bool:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
-    streams to its sender."""
+    streams to its sender. True means this candidate was inserted or merged; queue cleanup alone is not admission."""
     image_paths = list(image_paths or [])
     # Scrub live-turn self-duplicates first so the text merge below can't glue "{original}\n\n{later}" and re-fire the
     # original after a correction settles.
@@ -147,7 +147,7 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     text_only = not image_paths and isinstance(text, str)
     # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
     if text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
-        return
+        return False
     queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {}),
               **({"turn_author": turn_author} if turn_author else {})}
     existing = session.get("queued_prompt")
@@ -160,6 +160,7 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
         session.setdefault("queued_prompts", []).append(queued)
     else:
         session["queued_prompt"] = queued
+    return True
 
 
 def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict | None:
@@ -246,17 +247,17 @@ def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: 
 
 
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
-                        turn_author: dict | None = None) -> dict | None:
+                        turn_author: dict | None = None, plugin_admission=None) -> dict | None:
     """Apply ``display.busy_input_mode`` to a mid-turn prompt instead of rejecting it (rejection made clients busy-retry
     and drop sends): ``interrupt`` (default) → redirect, falling back to hard interrupt + queue; ``queue`` → queue only;
     ``steer`` → inject after the current atomic action. ``queued=True`` (client queue drain) forces queue mode: a "run
     after" message must NEVER become a live correction."""
-    mode = "queue" if queued else _load_busy_input_mode()
+    mode = "queue" if queued or plugin_admission is not None else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
             return None  # turn ended since prompt.submit's busy check; caller retries on the idle session
-        image_paths = list(session.get("attached_images", []))
+        image_paths = [] if plugin_admission is not None else list(session.get("attached_images", []))
         if image_paths:
             session["attached_images"] = []  # claim now so a later paste isn't consumed when the turn yields
     plain_text = _coerce_message_text(text).strip() if not image_paths and _is_text_only_busy_payload(text) else ""
@@ -277,8 +278,18 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
+        if plugin_admission is not None:
+            # The route check and this candidate's queue insertion are one claim.  Acquire the
+            # process lock only AFTER history_lock: session.activate uses that same order.
+            with _sessions_lock:
+                if not plugin_admission.current(sid, session):
+                    return _err(rid, 4007, "plugin target is no longer live")
+                accepted = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
+        else:
+            accepted = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
         session["last_active"] = time.time()
+        if plugin_admission is not None and not accepted:
+            return _err(rid, 4007, "plugin message was not queued")
     # Attachments need their own model invocation: queue without cancelling so the user gets both results in order.
     # ``steer`` must NEVER escalate to a hard interrupt: it would kill the live turn AND drop ``AIAgent._pending_steer``
     # (earlier accepted steers); steer fall-throughs stay FIFO-queued.

@@ -152,6 +152,9 @@ class PluginAdmission:
     session_key: str
     expected_session_id: str
     plugin_id: str
+    agent: Any
+    transport: Any
+    generation: int
 
     def current(self, sid: str, session: dict) -> bool:
         from tui_gateway import server
@@ -167,6 +170,8 @@ class PluginAdmission:
             and not any(session.get(flag) for flag in (
                 "_closing", "_finalized", "pending_hidden", "room_plumbing", "lazy"))
             and not server._transport_is_dead(transport)
+            and agent is self.agent and transport is self.transport
+            and int(session.get("_queued_prompt_generation", 0)) == self.generation
             and session.get("session_key") == self.session_key
             and getattr(agent, "session_id", None) == self.expected_session_id
             and _plugin_allowed(self.manager, self.plugin_id)
@@ -189,7 +194,11 @@ def inject_plugin_message(
         if len(matches) != 1:
             return False
         sid, session = matches[0]
-        proof = PluginAdmission(manager, session, session_key, expected_session_id, plugin_id)
+        proof = PluginAdmission(
+            manager, session, session_key, expected_session_id, plugin_id,
+            session.get("agent"), session.get("transport"),
+            int(session.get("_queued_prompt_generation", 0)),
+        )
         if not proof.current(sid, session):
             return False
         transport = session["transport"]

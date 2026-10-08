@@ -88,6 +88,7 @@ def test_idle_delivery_runs_fake_local_agent(runtime, monkeypatch):
     manager, session = runtime
     session.update(running=False, history_version=0, cols=80, slash_worker=None,
                    show_reasoning=False, tool_progress_mode="all")
+    session["attached_images"] = ["/tmp/human-draft.png"]
     seen = []
     session["agent"].clear_interrupt = lambda: None
     session["agent"].run_conversation = lambda message, **_kw: (
@@ -119,6 +120,18 @@ def test_idle_delivery_runs_fake_local_agent(runtime, monkeypatch):
     monkeypatch.setattr(server, "_get_usage", lambda *_: {})
     assert _deliver(manager) is True
     assert seen == ["Bee delivery 7"]
+    assert session["attached_images"] == ["/tmp/human-draft.png"]
+
+
+def test_normal_idle_prompt_still_claims_its_staged_image(runtime):
+    _manager, session = runtime
+    session["attached_images"] = ["/tmp/human-draft.png"]
+    admitted = server._admit_prompt_turn(
+        "ui-a", session, "human prompt", None, None, None, None)
+    assert admitted is not None
+    images, _agent = admitted
+    assert images == ["/tmp/human-draft.png"]
+    assert session["attached_images"] == []
 
 
 def test_normal_public_prompt_still_queues_without_plugin_grant(runtime):
@@ -216,11 +229,65 @@ def test_native_rotation_during_preflight_gets_no_receipt(runtime, monkeypatch):
     assert session.get("queued_prompt") is None
 
 
+def test_generation_change_during_preflight_gets_no_receipt(runtime, monkeypatch):
+    manager, session = runtime
+
+    def reset_before_admission(*_args):
+        session["_queued_prompt_generation"] = 1
+        return None
+
+    monkeypatch.setattr(server, "_ensure_active_session_slot", reset_before_admission)
+    assert _deliver(manager) is False
+    assert session.get("queued_prompt") is None
+
+
 def test_duplicate_of_inflight_prompt_is_not_acknowledged(runtime):
     manager, session = runtime
     session["inflight_turn"] = {"user": "Bee delivery 7"}
     assert _deliver(manager) is False
     assert session.get("queued_prompt") is None
+
+
+def test_scrubbed_stale_duplicate_does_not_ack_new_candidate(runtime):
+    manager, session = runtime
+    session["inflight_turn"] = {"user": "Bee delivery 7"}
+    session["queued_prompt"] = {"text": "Bee delivery 7", "transport": session["transport"]}
+    assert _deliver(manager) is False
+    assert session["queued_prompt"] is None
+
+
+def test_busy_plugin_does_not_claim_human_draft_images(runtime):
+    manager, session = runtime
+    session["attached_images"] = ["/tmp/human-draft.png"]
+    assert _deliver(manager) is True
+    assert session["queued_prompt"]["text"] == "Bee delivery 7"
+    assert "image_paths" not in session["queued_prompt"]
+    assert session["attached_images"] == ["/tmp/human-draft.png"]
+
+
+@pytest.mark.parametrize("running", [True, False])
+def test_plugin_admission_never_waits_for_history_under_sessions_lock(runtime, monkeypatch, running):
+    manager, session = runtime
+    session["running"] = running
+
+    class _CheckedHistoryLock:
+        def __init__(self):
+            self.inner = threading.Lock()
+
+        def __enter__(self):
+            assert not server._sessions_lock._is_owned(), "sessions_lock -> history_lock inversion"
+            self.inner.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.inner.release()
+
+    session["history_lock"] = _CheckedHistoryLock()
+    if not running:
+        monkeypatch.setattr(server, "_persist_session_row_for_submit", lambda *_: None)
+        monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *_: True)
+        monkeypatch.setattr(server, "_run_after_agent_ready", lambda *_args: None)
+    assert _deliver(manager) is True
 
 
 def test_secondary_profile_uses_its_own_grant(runtime, tmp_path):
