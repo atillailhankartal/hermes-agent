@@ -303,6 +303,10 @@ def _sync_session_key_after_compress(
     if restart_slash_worker:
         with contextlib.suppress(Exception):
             _restart_slash_worker(sid, session)
+    # The new native id is now the route used by approvals, queued prompts and the slash worker.
+    # An observer receives a live-record proof so a delayed rebind cannot cross a later /new.
+    from tui_gateway.plugin_injection import notify_tui_session_compacted
+    notify_tui_session_compacted(sid, session, old_key)
 
 
 def register(server) -> None:

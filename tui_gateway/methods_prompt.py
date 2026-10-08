@@ -527,13 +527,16 @@ _TRUNCATION_PARAMS = (
 
 
 def _lock_in_submit_turn(
-    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind):
+    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
+    plugin_admission=None):
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
-    with _session_turn_admission(session) as admitted:
+    with (_sessions_lock if plugin_admission is not None else contextlib.nullcontext()), _session_turn_admission(session) as admitted:
         if not admitted:
             return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
+        if plugin_admission is not None and not plugin_admission.current(sid, session):
+            return _err(rid, 4007, "plugin target is no longer live"), fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
@@ -564,7 +567,11 @@ _CLIENT_SURFACES = frozenset({"hud", "voice-live"})
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
+    from tui_gateway.plugin_injection import PluginAdmission
     sid = params.get("session_id", "")
+    plugin_admission = params.get("_plugin_admission")
+    if plugin_admission is not None and not isinstance(plugin_admission, PluginAdmission):
+        return _err(rid, 4124, "plugin admission is host-owned")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
     # Off-screen sends (widget intents) type the row so no client renders a bubble;
@@ -576,7 +583,7 @@ def _(rid, params: dict) -> dict:
         if isinstance(title_preview, str) and title_preview.strip()
         else None
     )
-    if (stopped := _typed_stop_phrase_response(rid, text)) is not None:
+    if plugin_admission is None and (stopped := _typed_stop_phrase_response(rid, text)) is not None:
         return stopped
     if params.get("interrupted"):
         # Client-side barge-in: latch so this turn's model message carries the note.
@@ -585,6 +592,10 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if plugin_admission is not None:
+        with _sessions_lock:
+            if not plugin_admission.current(sid, session):
+                return _err(rid, 4007, "plugin target is no longer live")
     from tools.bot_relay import DeliveryAuthor
 
     # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.
@@ -634,7 +645,9 @@ def _(rid, params: dict) -> dict:
     # finished between the two acquisitions, retry the claim rather than strand this
     # prompt in a queue whose drain already ran.
     while True:
-        with session["history_lock"]:
+        with (_sessions_lock if plugin_admission is not None else contextlib.nullcontext()), session["history_lock"]:
+            if plugin_admission is not None and not plugin_admission.current(sid, session):
+                return _err(rid, 4007, "plugin target is no longer live")
             if not session.get("running"):
                 break
             if internal_hosted_submit:
@@ -648,8 +661,19 @@ def _(rid, params: dict) -> dict:
             # built for exactly this race — see desktop's `runRewindSubmit`) waits
             # for `running` to clear and resubmits with the truncation intact.
             return _err(rid, 4009, "session busy")
-        busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author)
+        with (_sessions_lock if plugin_admission is not None else contextlib.nullcontext()):
+            if plugin_admission is not None and not plugin_admission.current(sid, session):
+                return _err(rid, 4007, "plugin target is no longer live")
+            prior_head = session.get("queued_prompt")
+            prior_text = prior_head.get("text") if isinstance(prior_head, dict) else None
+            prior_tail_size = len(session.get("queued_prompts") or [])
+            busy_response = _handle_busy_submit(
+                rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author)
+            if (plugin_admission is not None and busy_response is not None
+                    and session.get("queued_prompt") is prior_head
+                    and (prior_head.get("text") if isinstance(prior_head, dict) else None) == prior_text
+                    and len(session.get("queued_prompts") or []) == prior_tail_size):
+                return _err(rid, 4007, "plugin message was not queued")
         if busy_response is not None:
             return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
@@ -657,7 +681,8 @@ def _(rid, params: dict) -> dict:
         {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
         if isinstance(raw_rebind_ids, list) else None)
     err, survivor_fields = _lock_in_submit_turn(
-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
+        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
+        plugin_admission=plugin_admission)
     if err is not None:
         return err
     if turn_isolation:

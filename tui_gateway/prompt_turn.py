@@ -562,6 +562,8 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     bound = _profile_runtime_scope_tokens(session.get("profile_home"))
     if bound is not None:
         scopes.home, scopes.secret, scopes.terminal = bound.home, bound.secret, bound.terminal
+    from tui_gateway.plugin_injection import register_tui_plugin_injector
+    register_tui_plugin_injector()
     # The sudo password callback is thread-local: without re-wiring here, sudo prompts
     # fall through to /dev/tty and hang the headless gateway (re-run is a no-op).
     _wire_callbacks(sid)

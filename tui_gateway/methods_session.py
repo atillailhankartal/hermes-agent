@@ -912,6 +912,18 @@ def _resume_eager(ctx: _Resume) -> dict:
         auto_continue=_maybe_schedule_auto_continue(sid, session, ctx.target) if session else None)
 
 
+def _resume_with_plugin_notification(response: dict) -> dict:
+    """Notify after every successful resume path has published its live route and released its locks."""
+    result = response.get("result")
+    if isinstance(result, dict) and isinstance(sid := result.get("session_id"), str):
+        with _sessions_lock:
+            session = _sessions.get(sid)
+        if session is not None:
+            from tui_gateway.plugin_injection import notify_tui_session_resumed
+            notify_tui_session_resumed(sid, session)
+    return response
+
+
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     if not (target := params.get("session_id", "")):
@@ -923,7 +935,7 @@ def _(rid, params: dict) -> dict:
         if ctx.db is None:
             return _db_unavailable_error(rid, code=5000)
         if (resp := _resume_locate(ctx)) is not None:
-            return resp
+            return _resume_with_plugin_notification(resp)
         _resume_follow_tip(ctx)
         if (resp := _resume_guard(ctx)) is not None:
             return resp
@@ -932,12 +944,14 @@ def _(rid, params: dict) -> dict:
         with _session_resume_lock:
             live = _find_live_session_by_key(ctx.target, ctx.profile_home)
         if live is not None:
-            return _resume_reuse_live(ctx, *live)
-        if ctx.lazy:
-            return _resume_lazy(ctx)
-        if ctx.eager_build:
-            return _resume_eager(ctx)
-        return _resume_deferred(ctx) if ctx.defer_history else _resume_cold(ctx)
+            response = _resume_reuse_live(ctx, *live)
+        elif ctx.lazy:
+            response = _resume_lazy(ctx)
+        elif ctx.eager_build:
+            response = _resume_eager(ctx)
+        else:
+            response = _resume_deferred(ctx) if ctx.defer_history else _resume_cold(ctx)
+        return _resume_with_plugin_notification(response)
     finally:
         # Refcounting alone does not release the sqlite fds: SessionDB pins ITSELF (atexit.register) once its
         # background token writer starts; only close() unregisters.
