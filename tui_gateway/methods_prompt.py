@@ -595,6 +595,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if session.get("_route_transfer_failed"):
+        return _err(rid, 4007, "session route transfer failed; reconnect to continue")
     if plugin_admission is not None:
         with _sessions_lock:
             if not plugin_admission.current(sid, session):

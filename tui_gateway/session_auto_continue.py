@@ -134,7 +134,7 @@ def _ac_inflight_original(session: dict) -> str:
 
 
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
-                    turn_author: dict | None = None) -> bool:
+                    turn_author: dict | None = None, plugin_origin: str | None = None) -> bool:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
@@ -145,14 +145,19 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     # See #84417.
     _drop_queued_duplicates_of_inflight_user(session)
     text_only = not image_paths and isinstance(text, str)
-    # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
+    # A text-only self-copy of the live prompt would restart it on drain; reject that exact duplicate
+    # for plugin ingress too, so a rejected candidate never gets a delivery receipt.
     if text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
         return False
-    queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {}),
-              **({"turn_author": turn_author} if turn_author else {})}
+    queued = {"text": text, "transport": transport,
+              **({"image_paths": image_paths} if image_paths or plugin_origin else {}),
+              **({"turn_author": turn_author} if turn_author else {}),
+              **({"plugin_origin": plugin_origin} if plugin_origin else {})}
     existing = session.get("queued_prompt")
-    if (existing and text_only and not turn_author and isinstance(existing.get("text"), str)
+    if (existing and text_only and not turn_author and not plugin_origin
+            and isinstance(existing.get("text"), str)
             and not existing.get("image_paths") and not existing.get("turn_author")
+            and not existing.get("plugin_origin")
             and not session.get("queued_prompts")):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -175,7 +180,8 @@ def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict |
     if not isinstance(entry, dict):
         return None
     text = entry.get("text")
-    if not original or entry.get("image_paths") or entry.get("turn_author") or not isinstance(text, str):
+    if (not original or entry.get("image_paths") or entry.get("turn_author")
+            or entry.get("plugin_origin") or not isinstance(text, str)):
         return entry
     # A lossless text-merge may have glued the live original onto a later follow-up: keep the remainder.
     rest = next((text[len(original + sep):] for sep in ("\n\n", "\n") if text.startswith(original + sep)), text).strip()
@@ -255,6 +261,8 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     mode = "queue" if queued or plugin_admission is not None else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
+        if session.get("_route_transfer_failed"):
+            return _err(rid, 4007, "session route transfer failed; reconnect to continue")
         if not session.get("running"):
             return None  # turn ended since prompt.submit's busy check; caller retries on the idle session
         image_paths = [] if plugin_admission is not None else list(session.get("attached_images", []))
@@ -274,6 +282,10 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     # Queue before asking the live turn to stop. Never call a provider/compute-host method under history_lock: an
     # interrupt can wait behind the op it cancels.
     with session["history_lock"]:
+        if session.get("_route_transfer_failed"):
+            if image_paths:
+                session["attached_images"] = image_paths + list(session.get("attached_images", []))
+            return _err(rid, 4007, "session route transfer failed; reconnect to continue")
         if not session.get("running"):
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
@@ -284,7 +296,9 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             with _sessions_lock:
                 if not plugin_admission.current(sid, session):
                     return _err(rid, 4007, "plugin target is no longer live")
-                accepted = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
+                accepted = _enqueue_prompt(
+                    session, text, transport, image_paths=image_paths, turn_author=turn_author,
+                    plugin_origin=plugin_admission.plugin_id)
         else:
             accepted = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
         session["last_active"] = time.time()
@@ -306,7 +320,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """Fire a queued next-turn prompt if one is waiting and the session is idle. True when dispatched: the caller
     skips lower-priority follow-ups this cycle (the user's message wins)."""
     with _session_turn_admission(session) as admitted:
-        if not admitted or session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
+        if (not admitted or session.get("_closing") or session.get("_route_transfer_failed")
+                or not (queued := session.get("queued_prompt")) or session.get("running")):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         _ac_set_queue(session, session.get("queued_prompts") or [])
@@ -320,16 +335,19 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             _attach_session_transport(session, queued_transport)
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
-        if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
+        if (int(session.get("_queued_prompt_generation", 0)) != queue_generation
+                or session.get("_route_transfer_failed")):
             # Generation bump cancelled the claim (Stop, compress re-anchor, …): don't dispatch, but restore the
             # envelope (claimed head first, then whatever advanced into the slot) so a legitimate follow-up isn't dropped.
             # See #84417.
             advanced = session.get("queued_prompt")
             _ac_set_queue(session, [queued, *([advanced] if advanced else []), *(session.get("queued_prompts") or [])])
             session["running"] = False
-            return True
+            return not session.get("_route_transfer_failed")
     kwargs: dict = {"queued_prompt_generation": queue_generation}
-    if queued.get("image_paths"):
+    if queued.get("plugin_origin"):
+        kwargs["image_paths"] = []
+    elif "image_paths" in queued:
         kwargs["image_paths"] = queued["image_paths"]
     # The compute-host frame has no author field, so only the inline runner receives it.
     author_kwargs = {"turn_author": queued["turn_author"]} if queued.get("turn_author") else {}

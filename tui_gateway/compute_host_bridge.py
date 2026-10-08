@@ -106,10 +106,18 @@ def _compute_host_adopt_frame_meta(session: dict, frame: dict) -> None:
     by its owner — never claimed from the child pid (authority stays singular, #103737 review)."""
     new_key = str(frame.get("session_key") or "")
     if new_key and new_key != str(session.get("session_key") or ""):
-        if not _transfer_active_session_slot(str(frame.get("sid") or ""), session, new_session_id=new_key):
+        session["_route_transfer_failed"] = True
+        transferred = _transfer_active_session_slot(str(frame.get("sid") or ""), session, new_session_id=new_key)
+        lease = session.get("active_session_lease")
+        if not transferred or (lease is not None and str(getattr(lease, "session_id", "")) != new_key):
             logger.warning("Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
                            frame.get("sid"), session.get("session_key"), new_key)
+            return
         session["session_key"] = new_key
+        session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+        session.pop("_route_transfer_failed", None)
+    elif session.get("_route_transfer_failed"):
+        return
     if frame.get("history_version") is not None:
         with contextlib.suppress(Exception):
             session["history_version"] = max(int(session.get("history_version", 0)),

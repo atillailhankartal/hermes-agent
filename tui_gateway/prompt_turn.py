@@ -132,7 +132,7 @@ def _admit_prompt_turn(
         _emit("error", sid, {"message": str(ownership_refusal)})
         return None
     with session["history_lock"]:
-        if session.get("_closing") or (
+        if session.get("_closing") or session.get("_route_transfer_failed") or (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation):
             session["running"] = False

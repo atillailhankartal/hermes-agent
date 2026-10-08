@@ -261,7 +261,62 @@ def test_busy_plugin_does_not_claim_human_draft_images(runtime):
     session["attached_images"] = ["/tmp/human-draft.png"]
     assert _deliver(manager) is True
     assert session["queued_prompt"]["text"] == "Bee delivery 7"
-    assert "image_paths" not in session["queued_prompt"]
+    assert session["queued_prompt"]["image_paths"] == []
+    assert session["queued_prompt"]["plugin_origin"] == "bee-collaborate"
+    assert session["attached_images"] == ["/tmp/human-draft.png"]
+
+
+@pytest.mark.parametrize("bee_first", [False, True])
+def test_busy_plugin_and_human_text_keep_separate_queue_envelopes(runtime, bee_first):
+    manager, session = runtime
+
+    def human_send():
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": "human", "method": "prompt.submit",
+            "params": {"session_id": "ui-a", "text": "human follow-up", "queued": True},
+        }, transport=session["transport"])
+        assert response["result"]["status"] == "queued"
+
+    if bee_first:
+        assert _deliver(manager) is True
+        human_send()
+    else:
+        human_send()
+        assert _deliver(manager) is True
+
+    envelopes = [session["queued_prompt"], *(session.get("queued_prompts") or [])]
+    assert [entry["text"] for entry in envelopes] == (
+        ["Bee delivery 7", "human follow-up"] if bee_first
+        else ["human follow-up", "Bee delivery 7"])
+    bee_entry = next(entry for entry in envelopes if entry["text"] == "Bee delivery 7")
+    human_entry = next(entry for entry in envelopes if entry["text"] == "human follow-up")
+    assert bee_entry["plugin_origin"] == "bee-collaborate"
+    assert bee_entry["image_paths"] == []
+    assert "plugin_origin" not in human_entry
+
+
+def test_busy_plugin_drain_after_turn_end_keeps_later_human_draft(runtime, monkeypatch):
+    manager, session = runtime
+    session.update(_compute_host_active=True, cwd=str(manager.home_path))
+    frames = []
+
+    class _Supervisor:
+        def submit_turn(self, frame, *, on_complete):
+            frames.append(frame)
+
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *_args: _Supervisor())
+    monkeypatch.setattr(server, "_compute_host_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_release_deferred_active_session_lease", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    assert _deliver(manager) is True
+    session["attached_images"].append("/tmp/human-draft.png")
+    server._on_compute_host_turn_done("turn-end", "ui-a", session, {"type": "turn.end"})
+
+    assert len(frames) == 1
+    assert frames[0]["text"] == "Bee delivery 7"
+    assert frames[0]["attached_images"] == []
     assert session["attached_images"] == ["/tmp/human-draft.png"]
 
 
@@ -382,6 +437,135 @@ def test_compression_emits_after_route_switch_with_live_proof(runtime, monkeypat
         "session_id": "native-b", "profile": "default", "in_place": False,
     }
     assert event["route_is_current"]() is True
+
+
+def test_failed_inline_compression_lease_transfer_keeps_old_route_and_suppresses_hook(runtime, monkeypatch):
+    manager, session = runtime
+    from hermes_cli import plugins
+
+    lease = SimpleNamespace(session_id="key-a", released=False, enabled=True, release=lambda: None)
+    session["active_session_lease"] = lease
+    session["agent"].session_id = "native-b"
+    events = []
+    manager.on_session_compacted = lambda **kwargs: events.append(kwargs)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: False)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+
+    server._sync_session_key_after_compress("ui-a", session)
+
+    assert session["session_key"] == "key-a"
+    assert lease.session_id == "key-a"
+    assert events == []
+    assert session.get("_route_transfer_failed") is True
+    assert _deliver(manager, expected_session_id="native-b") is False
+
+    session["attached_images"] = ["/tmp/human-draft.png"]
+    response = server.dispatch({
+        "jsonrpc": "2.0", "id": "human-after-failure", "method": "prompt.submit",
+        "params": {"session_id": "ui-a", "text": "human message", "queued": True},
+    }, transport=session["transport"])
+    assert response["error"]["code"] == 4007
+    assert session["attached_images"] == ["/tmp/human-draft.png"]
+    assert session.get("queued_prompt") is None
+
+
+def test_failed_route_blocks_direct_synthesized_turn_until_reanchored(runtime):
+    _manager, session = runtime
+    session.update(_route_transfer_failed=True, running=True,
+                   attached_images=["/tmp/human-draft.png"])
+
+    admitted = server._admit_prompt_turn("ui-a", session, "auto continuation", None, None, None, None)
+
+    assert admitted is None
+    assert session["running"] is False
+    assert session["attached_images"] == ["/tmp/human-draft.png"]
+
+
+def test_failed_compute_compression_transfer_keeps_old_route_and_drain_closed(runtime, monkeypatch):
+    manager, session = runtime
+    lease = SimpleNamespace(session_id="key-a", released=False, enabled=True, release=lambda: None)
+    session.update(active_session_lease=lease, _compute_host_active=True,
+                   queued_prompt={"text": "queued after child", "transport": session["transport"]},
+                   running=False)
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: False)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", lambda *_a, **_k: pytest.fail("must not drain"))
+
+    with session["history_lock"]:
+        server._compute_host_adopt_frame_meta(session, {
+            "sid": "ui-a", "session_key": "native-b", "history_version": 9,
+        })
+
+    assert session["session_key"] == "key-a"
+    assert lease.session_id == "key-a"
+    assert session.get("_route_transfer_failed") is True
+    assert server._drain_queued_prompt("after-end", "ui-a", session) is False
+    assert session["queued_prompt"]["text"] == "queued after child"
+    assert _deliver(manager, expected_session_id="native-b") is False
+
+
+def test_compression_hook_observes_new_route_only_after_lease_reanchors(runtime, monkeypatch):
+    manager, session = runtime
+    from hermes_cli import plugins
+
+    lease = SimpleNamespace(session_id="key-a", released=False, enabled=True, release=lambda: None)
+    session["active_session_lease"] = lease
+    session["agent"].session_id = "native-b"
+    observed = []
+    manager.on_session_compacted = lambda **kwargs: observed.append((lease.session_id, kwargs))
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+
+    def transfer(*_args, **kwargs):
+        assert session["session_key"] == "key-a"
+        lease.session_id = kwargs["new_session_id"]
+        return True
+
+    monkeypatch.setattr(server, "_transfer_active_session_slot", transfer)
+
+    server._sync_session_key_after_compress("ui-a", session)
+
+    assert session["session_key"] == "native-b"
+    assert len(observed) == 1
+    assert observed[0][0] == "native-b"
+    assert observed[0][1]["route_is_current"]() is True
+
+
+def test_transfer_success_without_matching_lease_does_not_publish_route(runtime, monkeypatch):
+    _manager, session = runtime
+    lease = SimpleNamespace(session_id="key-a", released=False, enabled=True, release=lambda: None)
+    session["active_session_lease"] = lease
+    session["agent"].session_id = "native-b"
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: True)
+
+    server._sync_session_key_after_compress("ui-a", session)
+
+    assert session["session_key"] == "key-a"
+    assert session["_route_transfer_failed"] is True
+
+
+def test_successful_retry_reopens_failed_route_only_after_lease_reanchors(runtime, monkeypatch):
+    manager, session = runtime
+    lease = SimpleNamespace(session_id="key-a", released=False, enabled=True, release=lambda: None)
+    session["active_session_lease"] = lease
+    session["agent"].session_id = "native-b"
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: False)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+
+    server._sync_session_key_after_compress("ui-a", session)
+    assert session["_route_transfer_failed"] is True
+
+    def successful_transfer(*_args, **kwargs):
+        lease.session_id = kwargs["new_session_id"]
+        return True
+
+    monkeypatch.setattr(server, "_transfer_active_session_slot", successful_transfer)
+    server._sync_session_key_after_compress("ui-a", session)
+
+    assert session["session_key"] == "native-b"
+    assert "_route_transfer_failed" not in session
+    assert _deliver(manager, session_key="native-b", expected_session_id="native-b") is True
 
 
 def test_delayed_compaction_hook_after_new_cannot_rebind(runtime, monkeypatch):

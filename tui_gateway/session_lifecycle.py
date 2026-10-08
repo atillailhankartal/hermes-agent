@@ -18,7 +18,7 @@ def _session_turn_admission(session: dict):
     from hermes_cli.backend_retirement import retirement
 
     with retirement.work() as admitted, session["history_lock"]:
-        yield admitted
+        yield bool(admitted and not session.get("_route_transfer_failed"))
 
 
 def _start_session_work(target, *, name: str, session: dict | None = None):

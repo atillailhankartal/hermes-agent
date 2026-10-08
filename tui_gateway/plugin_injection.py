@@ -16,6 +16,14 @@ _OWNER = object()
 logger = logging.getLogger(__name__)
 
 
+def _route_lease_current(session: dict) -> bool:
+    """A transfer-in-flight must never authorize the old published route."""
+    lease = session.get("active_session_lease")
+    return (not session.get("_route_transfer_failed")
+            and (lease is None or (not getattr(lease, "released", False)
+                                   and str(getattr(lease, "session_id", "")) == session.get("session_key"))))
+
+
 @dataclass(frozen=True)
 class _SessionRoute:
     """One TUI record generation; a delayed observer must check this again before rebinding."""
@@ -46,6 +54,7 @@ class _SessionRoute:
                     and session.get("source") in {"tui", "desktop"}
                     and not any(session.get(flag) for flag in (
                         "_closing", "_finalized", "pending_hidden", "room_plumbing", "lazy"))
+                    and _route_lease_current(session)
                     and not server._transport_is_dead(session.get("transport"))
                     and Path(session.get("profile_home") or server._hermes_home).resolve() == self.profile_home
                     and session.get("session_key") == self.session_key
@@ -169,6 +178,7 @@ class PluginAdmission:
             and source in {"tui", "desktop"}
             and not any(session.get(flag) for flag in (
                 "_closing", "_finalized", "pending_hidden", "room_plumbing", "lazy"))
+            and _route_lease_current(session)
             and not server._transport_is_dead(transport)
             and agent is self.agent and transport is self.transport
             and int(session.get("_queued_prompt_generation", 0)) == self.generation

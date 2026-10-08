@@ -278,13 +278,23 @@ def _sync_session_key_after_compress(
     old_key = session.get("session_key", "") or ""
     if not new_session_id or new_session_id == old_key:
         return
-    if not _transfer_active_session_slot(sid, session, new_session_id=new_session_id):
-        logger.warning(
-            "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
-            sid, old_key, new_session_id,
-        )
-    # Even if the approval module fails to import, anchor session_key on the continuation id.
-    session["session_key"] = new_session_id
+    # Serialize the lease transfer, route publication and queued-claim generation
+    # against prompt admission. A failed transfer leaves the old route and lease.
+    with session.get("history_lock") or contextlib.nullcontext():
+        session["_route_transfer_failed"] = True
+        transferred = _transfer_active_session_slot(sid, session, new_session_id=new_session_id)
+        lease = session.get("active_session_lease")
+        if not transferred or (lease is not None and str(getattr(lease, "session_id", "")) != new_session_id):
+            logger.warning(
+                "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
+                sid, old_key, new_session_id,
+            )
+            return
+        # Even if the approval module fails to import, anchor session_key on the continuation id.
+        session["session_key"] = new_session_id
+        # A queue drain claimed under the old route must restore its envelope.
+        session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+        session.pop("_route_transfer_failed", None)
     with contextlib.suppress(Exception):
         from tools import approval
         with contextlib.suppress(Exception):
@@ -295,9 +305,6 @@ def _sync_session_key_after_compress(
                 approval.disable_session_yolo(old_key)
         with contextlib.suppress(Exception):
             approval.register_gateway_notify(new_session_id, lambda data: _emit_approval_request(sid, data))
-    # Invalidate any in-flight ``_drain_queued_prompt`` claim taken under the pre-rotation key: a raced
-    # drain must not dispatch on the continuation (its envelope is restored to the queue).
-    session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     if clear_pending_title:
         session["pending_title"] = None
     if restart_slash_worker:
