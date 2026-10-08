@@ -602,14 +602,19 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
+        expected_session_id: str | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation (new turn if idle, interrupt if running).
         Gateway injection needs an existing ``session_key`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection``; ``True`` means the gateway accepted the
-        request for async dispatch, not that delivery completed."""
+        request for async dispatch, not that delivery completed. ``expected_session_id`` pins
+        gateway delivery to a native session; resets/compression reject stale messages.
+        CLI calls with a pin fail closed because CLI queues cannot enforce gateway identity."""
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
         if cli is not None:
+            if expected_session_id is not None:
+                return False
             queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
             queue_.put(msg)
             return True
@@ -627,6 +632,7 @@ class PluginContext:
         try:
             return bool(self._manager.inject_gateway_message(
                 session_key=session_key, content=msg, plugin_id=self.plugin_id,
+                **({"expected_session_id": expected_session_id} if expected_session_id is not None else {}),
             ))
         except Exception:
             logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id,

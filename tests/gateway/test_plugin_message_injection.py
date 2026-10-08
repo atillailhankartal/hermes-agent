@@ -73,9 +73,11 @@ class _RoutingAdapter(BasePlatformAdapter):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", [False, True])
 async def test_plugin_context_routes_through_live_gateway_to_existing_session(
     tmp_path,
     monkeypatch,
+    pinned,
 ):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
@@ -125,6 +127,7 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
             context.inject_message(
                 "/approve always",
                 session_key=entry.session_key,
+                **({"expected_session_id": entry.session_id} if pinned else {}),
             )
             is True
         )
@@ -452,3 +455,295 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     assert manager.has_gateway_message_injector is True
     assert manager.inject_gateway_message(value="kept") is True
     newer_injector.assert_called_once_with(value="kept")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotation", [None, "new", "compression", "missing", "empty"])
+async def test_pinned_scheduler_checks_current_session(tmp_path, rotation):
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_entry().origin)
+    expected = entry.session_id
+    if rotation == "new":
+        store.reset_session(entry.session_key)
+    elif rotation == "compression":
+        entry.session_id = "compressed-native-id"
+    elif rotation == "missing":
+        expected = "unknown-native-id"
+    elif rotation == "empty":
+        expected = ""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner.session_store = store
+    del runner._async_session_store
+    runner._gateway_loop = asyncio.get_running_loop()
+
+    accepted = runner._schedule_plugin_message_injection(
+        session_key=entry.session_key, content="wake", plugin_id="notify-plugin",
+        expected_session_id=expected,
+    )
+    assert accepted is (rotation is None)
+    if accepted:
+        await asyncio.gather(*runner._background_tasks)
+        event = adapter.handle_message.await_args.args[0]
+        assert event.metadata["gateway_session_id"] == expected
+        assert event.metadata["gateway_session_strict"] is True
+    else:
+        assert not runner._background_tasks
+        adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pinned_dispatch_rejects_rotation_after_scheduling(tmp_path):
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_entry().origin)
+    expected = entry.session_id
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner.session_store = store
+    del runner._async_session_store
+    runner._gateway_loop = asyncio.get_running_loop()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=entry.session_key, content="wake", plugin_id="notify-plugin",
+        expected_session_id=expected,
+    ) is True
+    tasks = list(runner._background_tasks)
+    entry.session_id = "replacement-id"
+    assert await asyncio.gather(*tasks) == [False]
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pinned_dispatch_rechecks_before_adapter():
+    entry = _entry()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner.session_store.peek_session_id = MagicMock(return_value="replacement-id")
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="wake", plugin_id="notify-plugin",
+        expected_session_id=entry.session_id,
+    ) is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strict_handler_drops_injection_rotated_after_adapter_queue():
+    entry = _entry()
+    runner = _runner(entry)
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._session_key_for_source = MagicMock(return_value=entry.session_key)
+    runner._cache_session_source = MagicMock(side_effect=AssertionError("stale turn started"))
+    event = MessageEvent(
+        text="wake", source=entry.origin, internal=True, allow_gateway_control=False,
+        metadata={"gateway_session_key": entry.session_key,
+                  "gateway_session_id": "old-native-id", "gateway_session_strict": True},
+    )
+
+    await runner._handle_message_with_agent(event, entry.origin, entry.session_key, 1)
+    runner._cache_session_source.assert_not_called()
+
+
+def test_bound_session_key_never_uses_ambient_environment(monkeypatch):
+    from contextvars import Context
+    from gateway.session_context import (
+        clear_session_vars, get_bound_session_key, reset_session_vars, set_session_vars,
+    )
+    monkeypatch.setenv("HERMES_SESSION_KEY", "ambient-route")
+
+    def check():
+        assert get_bound_session_key() is None
+        tokens = set_session_vars(session_key="task-route")
+        assert get_bound_session_key() == "task-route"
+        clear_session_vars(tokens)
+        assert get_bound_session_key() is None
+        reset_session_vars()
+        assert get_bound_session_key() is None
+
+    Context().run(check)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["topic", "session_hook", "history", "prepare", "agent_hook"])
+@pytest.mark.parametrize("rotation", ["reset", "compression", "generation", "none"])
+async def test_strict_turn_rechecks_after_await(tmp_path, boundary, rotation):
+    """Rotate at a deterministic await boundary, before any model invocation."""
+    from threading import Event
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_entry().origin)
+    original_id = entry.session_id
+    runner = _runner(entry)
+    runner.session_store = store
+    del runner._async_session_store
+    runner.config = GatewayConfig()
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._session_key_for_source = MagicMock(return_value=entry.session_key)
+    runner._cache_session_source = MagicMock()
+    runner._is_telegram_topic_lane = MagicMock(return_value=False)
+    runner._is_session_run_current = MagicMock(return_value=True)
+    runner._set_session_env = MagicMock(return_value=["test-token"])
+    runner._clear_session_env = MagicMock()
+    runner._pinned_session_context_prompt = MagicMock(return_value="")
+    runner._mark_durable_active_turn = AsyncMock()
+    runner._voice_channel_sidecar_note = MagicMock(return_value=None)
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="wake")
+    runner._bind_adapter_run_generation = MagicMock()
+    class AgentReached(BaseException):
+        pass
+
+    runner._run_agent = AsyncMock(side_effect=AgentReached)
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner.async_session_store.load_transcript = AsyncMock(
+        return_value=[{"role": "user", "content": "prior"}]
+    )
+    event = MessageEvent(
+        text="wake", source=entry.origin, internal=True, allow_gateway_control=False,
+        metadata={"gateway_session_key": entry.session_key,
+                  "gateway_session_id": original_id, "gateway_session_strict": True},
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    thread_entered = Event()
+    thread_release = Event()
+
+    async def pause(result=None):
+        entered.set()
+        await release.wait()
+        return result
+
+    if boundary == "topic":
+        def topic_probe(source):
+            thread_entered.set()
+            assert thread_release.wait(5)
+            return False
+        runner._is_telegram_topic_lane.side_effect = topic_probe
+    elif boundary == "history":
+        async def history(*_):
+            return await pause([{"role": "user", "content": "prior"}])
+        runner.async_session_store.load_transcript.side_effect = history
+    elif boundary == "prepare":
+        async def prepare(**_):
+            return await pause("wake")
+        runner._prepare_profile_scoped_inbound_message_text.side_effect = prepare
+    else:
+        async def hook(name, payload):
+            if name == ("session:start" if boundary == "session_hook" else "agent:start"):
+                await pause()
+        runner.hooks.emit.side_effect = hook
+
+    with patch("gateway.run._load_gateway_config", return_value={}):
+        task = asyncio.create_task(runner._handle_message_with_agent(
+            event, entry.origin, entry.session_key, 1
+        ))
+        try:
+            if boundary == "topic":
+                assert await asyncio.to_thread(thread_entered.wait, 5)
+            else:
+                await asyncio.wait_for(entered.wait(), 5)
+            if rotation == "reset":
+                store.reset_session(entry.session_key)
+            elif rotation == "compression":
+                entry.session_id = "compressed-id"
+            elif rotation == "generation":
+                runner._is_session_run_current.return_value = False
+            thread_release.set()
+            release.set()
+            if rotation == "none":
+                with pytest.raises(AgentReached):
+                    await asyncio.wait_for(task, 5)
+            else:
+                assert await asyncio.wait_for(task, 5) is None
+        finally:
+            thread_release.set()
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    if rotation == "none":
+        runner._run_agent.assert_awaited_once()
+        assert runner._run_agent.await_args.kwargs["session_id"] == original_id
+        return
+    runner._run_agent.assert_not_awaited()
+    if boundary == "topic":
+        runner.hooks.emit.assert_not_awaited()
+    elif boundary == "session_hook":
+        runner._set_session_env.assert_not_called()
+    else:
+        runner._clear_session_env.assert_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["settings", "plan"])
+async def test_strict_hygiene_drops_rotation_during_preflight(tmp_path, boundary):
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_entry().origin)
+    runner = _runner(entry)
+    runner.session_store = store
+    runner._is_session_run_current = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="wake", source=entry.origin, internal=True,
+        metadata={"gateway_session_key": entry.session_key,
+                  "gateway_session_id": entry.session_id, "gateway_session_strict": True},
+    )
+    settings = SimpleNamespace(compression_enabled=True)
+    plan = SimpleNamespace(needs_compress=True)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def suspended(*args):
+        entered.set()
+        await release.wait()
+        return settings if boundary == "settings" else plan
+
+    runner._hmwa_hygiene_settings = AsyncMock(return_value=settings)
+    runner._hmwa_hygiene_plan = AsyncMock(return_value=plan)
+    getattr(runner, "_hmwa_hygiene_" + boundary).side_effect = suspended
+    runner._resolve_session_agent_runtime = MagicMock(side_effect=AssertionError("stale compression started"))
+    runner._bound_hygiene_payload = MagicMock(side_effect=AssertionError("stale history bounded"))
+    history = [{"role": "user", "content": "prior"}] * 4
+    task = asyncio.create_task(runner._hmwa_run_session_hygiene(
+        event, entry.origin, entry, entry.session_key, history, entry.session_key, 1,
+    ))
+    await asyncio.wait_for(entered.wait(), 5)
+    store.reset_session(entry.session_key)
+    release.set()
+    assert await asyncio.wait_for(task, 5) is history
+    runner._resolve_session_agent_runtime.assert_not_called()
+    if boundary == "settings":
+        runner._hmwa_hygiene_plan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strict_hygiene_rechecks_after_build_before_compressor(tmp_path):
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_entry().origin)
+    runner = _runner(entry)
+    runner.session_store = store
+    runner._is_session_run_current = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="wake", source=entry.origin, internal=True,
+        metadata={"gateway_session_key": entry.session_key,
+                  "gateway_session_id": entry.session_id, "gateway_session_strict": True},
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    agent = object()  # Any attempt to configure or run this compressor fails.
+
+    async def build(*args):
+        entered.set()
+        await release.wait()
+        return agent, None
+
+    runner._hmwa_hygiene_build_agent = AsyncMock(side_effect=build)
+    runner._evict_cached_agent = MagicMock()
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+    attempt = SimpleNamespace(agent=None, cleanup_deferred=False)
+    task = asyncio.create_task(runner._hmwa_hygiene_detached_attempt(
+        attempt, None, None, [], [], None, {}, entry.origin, entry,
+        entry.session_key, entry.session_key, 1, strict_event=event,
+    ))
+    await asyncio.wait_for(entered.wait(), 5)
+    store.reset_session(entry.session_key)
+    release.set()
+    assert await asyncio.wait_for(task, 5) is None
+    runner._cleanup_agent_resources_off_loop.assert_awaited_once_with(agent, context="session hygiene")

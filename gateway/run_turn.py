@@ -398,6 +398,21 @@ class GatewayTurnMixin:
         except Exception:
             return False
 
+    def _hmwa_strict_turn_is_current(self, event, quick_key=None, run_generation=None) -> bool:
+        """A queued strict event must still own its route after every preparation await."""
+        metadata = getattr(event, "metadata", None) or {}
+        if not metadata.get("gateway_session_strict"):
+            return True
+        key = metadata.get("gateway_session_key")
+        pinned_id = metadata.get("gateway_session_id")
+        if (
+            key and pinned_id and self.session_store.peek_session_id(key) == pinned_id
+            and (run_generation is None or self._is_session_run_current(quick_key, run_generation))
+        ):
+            return True
+        logger.info("Dropping stale strict-session turn for key=%s", key)
+        return False
+
     async def _hmwa_resolve_session(self, event, source):
         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
         topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
@@ -449,14 +464,26 @@ class GatewayTurnMixin:
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
-            session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
+        is_topic_lane = await asyncio.to_thread(self._is_telegram_topic_lane, source)
+        if not self._hmwa_strict_turn_is_current(event):
+            return
+        if is_topic_lane:
+            session_entry = await self._hmwa_heal_telegram_topic_binding(
+                source, session_entry, session_key,
+                **({"expected_session_id": pinned_session_id} if strict_session else {}),
+            )
+            if session_entry is None or not self._hmwa_strict_turn_is_current(event):
+                return
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
             return
+        if not self._hmwa_strict_turn_is_current(event):
+            return
         return source, session_entry, session_key
 
-    async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
+    async def _hmwa_heal_telegram_topic_binding(
+        self, source, session_entry, session_key, *, expected_session_id=None,
+    ):
         """Follow the (chat_id, thread_id) topic binding — healed to its compression tip — or record
         a fresh one. Returns the (possibly switched) session entry."""
         binding = None
@@ -468,6 +495,8 @@ class GatewayTurnMixin:
                 )
         except Exception:
             logger.debug("Failed to read Telegram topic binding", exc_info=True)
+        if expected_session_id is not None and self.session_store.peek_session_id(session_key) != expected_session_id:
+            return
         if not binding:
             try:
                 await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
@@ -488,6 +517,11 @@ class GatewayTurnMixin:
                 canonical_session_id = bound_session_id
             if canonical_session_id and canonical_session_id != bound_session_id:
                 bound_session_id = canonical_session_id
+        if expected_session_id is not None and (
+            self.session_store.peek_session_id(session_key) != expected_session_id
+            or (bound_session_id and bound_session_id != expected_session_id)
+        ):
+            return
         if bound_session_id and bound_session_id != session_entry.session_id:
             # Route through SessionStore so the key → id mapping persists and the previous lane
             # session ends cleanly (in-place mutation split-brained the JSON index). The two DB
@@ -1283,7 +1317,7 @@ class GatewayTurnMixin:
 
     async def _hmwa_hygiene_detached_attempt(
         self, attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
-        source, session_entry, session_key, _quick_key, run_generation,
+        source, session_entry, session_key, _quick_key, run_generation, *, strict_event=None,
     ):
         """Run one detached hygiene compression attempt end to end; publishes the transcript to
         continue with (compressed or original) on ``attempt.history``."""
@@ -1292,6 +1326,10 @@ class GatewayTurnMixin:
         _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(_hyg_model, _hyg_runtime, session_entry)
         attempt.agent = _hyg_agent
         try:
+            if strict_event is not None and not self._hmwa_strict_turn_is_current(
+                strict_event, _quick_key, run_generation,
+            ):
+                return
             # Hygiene owns the session binding, so prefer in-place compaction over minting a
             # continuation child. Without a SessionDB this stays False.
             _hyg_agent.compression_in_place = True
@@ -1354,10 +1392,14 @@ class GatewayTurnMixin:
             return history
 
         hs = await self._hmwa_hygiene_settings(source, session_key)
+        if not self._hmwa_strict_turn_is_current(event, _quick_key, run_generation):
+            return history
         # Hygiene can never land with compression disabled; a sub-limit transcript is the identity (#111988).
         if not hs.compression_enabled:
             return self._bound_hygiene_payload(history, hs, session_entry)
         plan = await self._hmwa_hygiene_plan(hs, history, session_entry, session_key)
+        if not self._hmwa_strict_turn_is_current(event, _quick_key, run_generation):
+            return history
         # No compression this turn (under both thresholds, cooldown, or one already in flight): without
         # the bound the model would get the full uncompressed transcript.
         if not plan.needs_compress:
@@ -1379,6 +1421,7 @@ class GatewayTurnMixin:
                     await self._hmwa_hygiene_detached_attempt(
                         attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
                         source, session_entry, session_key, _quick_key, run_generation,
+                        **({"strict_event": event} if (event.metadata or {}).get("gateway_session_strict") else {}),
                     )
         except HygieneTurnHoldExceeded:
             # Availability boundary, not a failure — already logged at INFO by the turn-hold handler.
@@ -2057,7 +2100,20 @@ class GatewayTurnMixin:
         ``(_PreparedTurn, env_tokens)``; a ``str`` first element is a reply to send instead of
         running (history unreadable); ``None`` drops the turn (inbound text rejected)."""
         from gateway.run import _load_gateway_config
+        _session_env_tokens = None
+
+        def still_current():
+            if self._hmwa_strict_turn_is_current(event, _quick_key, run_generation):
+                return True
+            if _session_env_tokens is not None:
+                self._clear_session_env(_session_env_tokens)
+            return False
+
+        if not still_current():
+            return None, _session_env_tokens
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
+        if not still_current():
+            return None, _session_env_tokens
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -2077,6 +2133,8 @@ class GatewayTurnMixin:
         turn_sidecar_notes: List[str] = []
         if _was_auto_reset:
             await self._hmwa_deliver_auto_reset_notice(session_entry, source, turn_sidecar_notes)
+            if not still_current():
+                return None, _session_env_tokens
 
         # Auto-load bound skill(s) only on NEW sessions; ongoing ones carry the content in history.
         _auto = getattr(event, "auto_skill", None)
@@ -2084,18 +2142,26 @@ class GatewayTurnMixin:
             self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
 
         await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
+        if not still_current():
+            return None, _session_env_tokens
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
         await self._mark_durable_active_turn(event, session_entry.session_key)
+        if not still_current():
+            return None, _session_env_tokens
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
+            if not still_current():
+                return None, _session_env_tokens
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )
+            if not still_current():
+                return None, _session_env_tokens
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
             return (
@@ -2105,6 +2171,8 @@ class GatewayTurnMixin:
             ), _session_env_tokens
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes)
+        if not still_current():
+            return None, _session_env_tokens
 
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
         # forced a rebuild + prompt-cache re-key per message).
@@ -2116,6 +2184,8 @@ class GatewayTurnMixin:
         message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event, source=source, history=history, session_key=session_key,
         )
+        if not still_current():
+            return None, _session_env_tokens
         if message_text is None:
             return None, _session_env_tokens
 
@@ -2159,6 +2229,8 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        if not self._hmwa_strict_turn_is_current(event, _quick_key, run_generation):
+            return
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2167,6 +2239,8 @@ class GatewayTurnMixin:
         history, message_text = prepared.history, prepared.message_text
 
         try:
+            if not self._hmwa_strict_turn_is_current(event, _quick_key, run_generation):
+                return
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -2182,6 +2256,8 @@ class GatewayTurnMixin:
             # (a /new may move session_entry.session_id while the old run is still unwinding).
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
+                return
+            if not self._hmwa_strict_turn_is_current(event, _quick_key, run_generation):
                 return
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
