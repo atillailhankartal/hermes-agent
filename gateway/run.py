@@ -19076,6 +19076,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         strict_session = bool(event_metadata.get("gateway_session_strict"))
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
+        _session_env_tokens = None
+
+        def _strict_turn_is_current() -> bool:
+            # Awaited preparation can outlive /new, compression or /stop. The
+            # entry object may be detached or mutated, so read the live route.
+            if not strict_session or (
+                self.session_store.peek_session_id(expected_session_key) == pinned_session_id
+                and self._is_session_run_current(_quick_key, run_generation)
+            ):
+                return True
+            logger.info("Dropping stale strict-session turn for key=%s", expected_session_key)
+            if _session_env_tokens is not None:
+                self._clear_session_env(_session_env_tokens)
+            return False
+
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(
                 expected_session_key
@@ -19110,16 +19125,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if resolved_entry is None:
                 return
             session_entry = resolved_entry
+        if not _strict_turn_is_current():
+            return
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+            if not _strict_turn_is_current():
+                return
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )) if self._session_db else None
+                if not _strict_turn_is_current():
+                    return
             except Exception:
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)
                 binding = None
+            if not _strict_turn_is_current():
+                return
             if binding:
                 bound_session_id = str(binding.get("session_id") or "")
                 # Heal bindings that point at a pre-compression parent: walk
@@ -19133,24 +19156,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         canonical_session_id = await self._session_db.get_compression_tip(
                             bound_session_id,
                         )
+                        if not _strict_turn_is_current():
+                            return
                     except Exception:
                         logger.debug(
                             "compression-tip lookup failed for %s",
                             bound_session_id, exc_info=True,
                         )
                         canonical_session_id = bound_session_id
+                    if not _strict_turn_is_current():
+                        return
                     if (
                         canonical_session_id
                         and canonical_session_id != bound_session_id
                     ):
                         bound_session_id = canonical_session_id
                 if bound_session_id and bound_session_id != session_entry.session_id:
+                    if strict_session:
+                        return
                     # Route the override through SessionStore so the session_key
                     # → session_id mapping is persisted to disk and the previous
                     # lane session is ended cleanly. Mutating session_entry in
                     # place here created a split-brain state where the JSON
                     # index pointed at one id but code downstream used another.
                     switched = await self.async_session_store.switch_session(session_key, bound_session_id)
+                    if not _strict_turn_is_current():
+                        return
                     if switched is not None:
                         session_entry = switched
                 # If the stored binding pointed at a parent, rewrite it to the
@@ -19163,11 +19194,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compression-tip-walk",
                     )
+                    if not _strict_turn_is_current():
+                        return
             else:
                 try:
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
+                    if not _strict_turn_is_current():
+                        return
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        if not _strict_turn_is_current():
+            return
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -19206,6 +19243,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
+            if not _strict_turn_is_current():
+                return
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
@@ -19320,6 +19359,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_info = await asyncio.to_thread(
                                 self._reset_notice_session_info, source
                             )
+                            if not _strict_turn_is_current():
+                                return
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -19328,6 +19369,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source.chat_id, notice,
                             metadata=self._thread_metadata_for_source(source),
                         )
+                        if not _strict_turn_is_current():
+                            return
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
 
@@ -19388,6 +19431,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # stale unwind can't release a newer turn's lease.
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is not None:
+            if not _strict_turn_is_current():
+                return
             try:
                 _lease_token = await _lease_registry.acquire(
                     session_entry.session_id,
@@ -19407,15 +19452,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+        if not _strict_turn_is_current():
+            return
 
         # A turn only becomes durable recovery work after it owns (or has
         # explicitly degraded past) the per-session lease.  Marking before the
         # await above would falsely recover an alias-routed message that never
         # began processing if the gateway died while it was still waiting.
         await self._mark_durable_active_turn(event, session_entry.session_key)
+        if not _strict_turn_is_current():
+            return
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
+        if not _strict_turn_is_current():
+            return
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -19556,7 +19607,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _hyg_configured_provider,
                             _hyg_provider,
                         ):
+                            if not _strict_turn_is_current():
+                                return
                             _hyg_config_context_length = None
+                        if not _strict_turn_is_current():
+                            return
                     except Exception:
                         _hyg_config_context_length = None
 
@@ -19595,6 +19650,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     config_context_length=_hyg_config_context_length,
                     provider=_hyg_provider or "",
                 )
+                if not _strict_turn_is_current():
+                    return
                 _compress_token_threshold = int(
                     _hyg_context_length * _hyg_threshold_pct
                 )
@@ -19702,6 +19759,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_session_row = await self._session_db.get_session(
                                         session_entry.session_id
                                     )
+                                    if not _strict_turn_is_current():
+                                        return
                                 except Exception as exc:
                                     _hyg_session_row = None
                                     logger.warning(
@@ -19798,6 +19857,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     asyncio.shield(_hyg_future),
                                                     timeout=_slice,
                                                 )
+                                                if not _strict_turn_is_current():
+                                                    return
                                                 break
                                             except asyncio.TimeoutError:
                                                 _hyg_waited = time.monotonic() - _hyg_wait_started
@@ -19844,6 +19905,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # completed result instead of treating a
                                             # successful compaction as a timeout.
                                             _compressed, _ = await _hyg_future
+                                            if not _strict_turn_is_current():
+                                                return
                                         else:
                                             # #76354 F4: release the timed-out
                                             # worker's durable lease via the
@@ -19865,6 +19928,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     session_key,
                                                     _hyg_failure_cooldown_seconds,
                                                 )
+                                                if not _strict_turn_is_current():
+                                                    return
                                                 _record_hygiene_cooldown(
                                                     self, session_entry.session_id,
                                                     _hyg_cooldown,
@@ -19909,6 +19974,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                         _timeout_msg,
                                                         metadata=_hyg_meta,
                                                     )
+                                                    if not _strict_turn_is_current():
+                                                        return
                                             except Exception as _werr:
                                                 logger.warning(
                                                     "Failed to deliver compression-timeout "
@@ -19993,6 +20060,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         if not await self.async_session_store.rewrite_transcript(
                                             _hyg_new_sid, _compressed
                                         ):
+                                            if not _strict_turn_is_current():
+                                                return
                                             logger.error(
                                                 "Session hygiene: failed to persist "
                                                 "compressed transcript for rotated "
@@ -20006,6 +20075,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_rotated = False
                                             _hyg_in_place = False
                                         else:
+                                            if not _strict_turn_is_current():
+                                                return
                                             session_entry.session_id = _hyg_new_sid
                                             # The held turn lease follows the
                                             # rotation so an alias key resolving
@@ -20015,11 +20086,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _quick_key, run_generation, _hyg_new_sid
                                             )
                                             await self.async_session_store._save()
+                                            if not _strict_turn_is_current():
+                                                return
                                             await asyncio.to_thread(
                                                 self._sync_telegram_topic_binding,
                                                 source, session_entry,
                                                 reason="hygiene-compression",
                                             )
+                                            if not _strict_turn_is_current():
+                                                return
 
                                     if _hyg_rotated:
                                         # Reset stored token count — transcript rewritten
@@ -20104,6 +20179,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 self,
                                                 session_key,
                                             )
+                                            if not _strict_turn_is_current():
+                                                return
                                     if _hyg_aborted:
                                         if _hyg_failure_cooldown_seconds >= 0:
                                             _hyg_cooldown = await asyncio.to_thread(
@@ -20112,6 +20189,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 session_key,
                                                 _hyg_failure_cooldown_seconds,
                                             )
+                                            if not _strict_turn_is_current():
+                                                return
                                             _record_hygiene_cooldown(
                                                 self, session_entry.session_id,
                                                 _hyg_cooldown,
@@ -20147,6 +20226,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _adapter = self._adapter_for_source(source)
                                             if _adapter and source.chat_id:
                                                 await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
+                                                if not _strict_turn_is_current():
+                                                    return
                                         except Exception as _werr:
                                             logger.warning(
                                                 "Failed to deliver compression-failure warning to user: %s",
@@ -20171,6 +20252,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _adapter = self._adapter_for_source(source)
                                             if _adapter and source.chat_id:
                                                 await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
+                                                if not _strict_turn_is_current():
+                                                    return
                                         except Exception as _werr:
                                             logger.warning(
                                                 "Failed to deliver aux-model-fallback notice to user: %s",
@@ -20197,6 +20280,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # system-prompt diff and agent rebuild.
         if not history and not await self.async_session_store.has_any_sessions():
             # Default first-contact note: a brief self-introduction.
+            if not _strict_turn_is_current():
+                return
             _intro_note = (
                 "[System note: This is the user's very first message ever. "
                 "Briefly introduce yourself and mention that /help shows available commands. "
@@ -20231,6 +20316,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pb_err,
                 )
                 turn_sidecar_notes.append(_intro_note)
+        if not _strict_turn_is_current():
+            return
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
@@ -20285,6 +20372,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"or ignore to skip."
                 )
                 await self._deliver_platform_notice(source, notice)
+                if not _strict_turn_is_current():
+                    return
         
         # -----------------------------------------------------------------
         # Voice channel awareness — deliver current voice channel state so
@@ -20318,6 +20407,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             history=history,
             session_key=session_key,
         )
+        if not _strict_turn_is_current():
+            return
         if message_text is None:
             return
 
@@ -20390,6 +20481,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # against so post-run compression publication can be identity-guarded
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
+            if not _strict_turn_is_current():
+                return
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
