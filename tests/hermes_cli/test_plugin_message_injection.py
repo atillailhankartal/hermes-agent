@@ -202,3 +202,31 @@ def test_gateway_injection_fails_closed_on_host_exception(tmp_path, monkeypatch)
         )
         is False
     )
+
+
+def test_gateway_injection_forwards_expected_session_id(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    assert context.inject_message(
+        "wake up", session_key="route", expected_session_id="native-id"
+    ) is True
+    injector.assert_called_once_with(
+        session_key="route", content="wake up", plugin_id="notify-plugin",
+        expected_session_id="native-id",
+    )
+
+
+def test_cli_rejects_gateway_session_pin():
+    context, manager = _context()
+    cli = SimpleNamespace(
+        _agent_running=False, _pending_input=SimpleQueue(),
+        _interrupt_queue=SimpleQueue(),
+    )
+    manager._cli_ref = cli
+
+    assert context.inject_message("wake", expected_session_id="gateway-id") is False
+    assert cli._pending_input.empty()
+    assert cli._interrupt_queue.empty()

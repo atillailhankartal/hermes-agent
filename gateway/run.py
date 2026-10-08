@@ -18861,16 +18861,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        expected_session_id: str | None = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop."""
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
 
+        if expected_session_id is not None and (
+            not expected_session_id
+            or self.session_store.peek_session_id(session_key) != expected_session_id
+        ):
+            return False
+
         coro = self._dispatch_plugin_message_injection(
             session_key=session_key,
             content=content,
             plugin_id=plugin_id,
+            **(
+                {"expected_session_id": expected_session_id}
+                if expected_session_id is not None else {}
+            ),
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -18929,6 +18940,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        expected_session_id: str | None = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
@@ -18936,6 +18948,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None:
+            return False
+        if expected_session_id is not None and (
+            not expected_session_id or entry.session_id != expected_session_id
+        ):
             return False
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
             return False
@@ -18967,6 +18983,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter is None:
             return False
 
+        # The async lookup may have yielded while /new or compression rotated
+        # the route. Recheck immediately before entering the adapter; queued
+        # delivery is protected by the existing strict-session handler guard.
+        if expected_session_id is not None and (
+            self.session_store.peek_session_id(session_key) != expected_session_id
+        ):
+            return False
+
         event = MessageEvent(
             text=content,
             message_type=MessageType.TEXT,
@@ -18977,7 +19001,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "hermes_plugin_id": plugin_id,
                 "hermes_plugin_injection": True,
                 "gateway_session_key": session_key,
-                "gateway_session_id": entry.session_id,
+                "gateway_session_id": (
+                    expected_session_id if expected_session_id is not None else entry.session_id
+                ),
                 "gateway_session_strict": True,
             },
         )

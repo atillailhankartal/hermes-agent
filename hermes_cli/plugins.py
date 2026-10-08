@@ -1976,6 +1976,7 @@ class PluginContext:
         role: str = "user",
         *,
         session_key: str | None = None,
+        expected_session_id: str | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
 
@@ -1987,6 +1988,9 @@ class PluginContext:
 
         Gateway injection requires an existing ``session_key`` and an explicit
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant.
+        ``expected_session_id`` optionally pins gateway delivery to that native
+        session; a reset or compression replacement rejects the stale message.
+        This guard is gateway-only; CLI calls with a pin fail closed.
         A ``True`` return means the live gateway accepted the request for
         asynchronous dispatch, not that platform delivery has completed.
 
@@ -1996,6 +2000,8 @@ class PluginContext:
         msg = content if role == "user" else f"[{role}] {content}"
 
         if cli is not None:
+            if expected_session_id is not None:
+                return False
             if getattr(cli, "_agent_running", False):
                 # Agent is mid-turn - interrupt with the message
                 cli._interrupt_queue.put(msg)
@@ -2030,6 +2036,10 @@ class PluginContext:
                     session_key=session_key,
                     content=msg,
                     plugin_id=plugin_id,
+                    **(
+                        {"expected_session_id": expected_session_id}
+                        if expected_session_id is not None else {}
+                    ),
                 )
             )
         except Exception:

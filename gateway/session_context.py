@@ -390,6 +390,16 @@ def reset_session_vars() -> None:
         pass
 
 
+def get_bound_session_key() -> str | None:
+    """Return only the task-local gateway route, never an ambient env value.
+
+    An unbound or cleared context has no route. Background consumers should
+    capture this key together with the native session ID during the turn.
+    """
+    value = _SESSION_KEY.get()
+    return value if value is not _UNSET and value else None
+
+
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session context variable by its legacy ``HERMES_SESSION_*`` name.
 

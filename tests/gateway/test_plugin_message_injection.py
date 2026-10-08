@@ -75,9 +75,11 @@ class _RoutingAdapter(BasePlatformAdapter):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", [False, True])
 async def test_plugin_context_routes_through_live_gateway_to_existing_session(
     tmp_path,
     monkeypatch,
+    pinned,
 ):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
@@ -127,6 +129,7 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
             context.inject_message(
                 "/approve always",
                 session_key=entry.session_key,
+                **({"expected_session_id": entry.session_id} if pinned else {}),
             )
             is True
         )
@@ -560,3 +563,109 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     assert manager.has_gateway_message_injector is True
     assert manager.inject_gateway_message(value="kept") is True
     newer_injector.assert_called_once_with(value="kept")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotation", [None, "new", "compression", "missing", "empty"])
+async def test_pinned_scheduler_checks_current_session(tmp_path, rotation):
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_entry().origin)
+    expected = entry.session_id
+    if rotation == "new":
+        store.reset_session(entry.session_key)
+    elif rotation == "compression":
+        entry.session_id = "compressed-native-id"
+    elif rotation == "missing":
+        expected = "unknown-native-id"
+    elif rotation == "empty":
+        expected = ""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner.session_store = store
+    del runner._async_session_store
+    runner._gateway_loop = asyncio.get_running_loop()
+
+    accepted = runner._schedule_plugin_message_injection(
+        session_key=entry.session_key, content="wake", plugin_id="notify-plugin",
+        expected_session_id=expected,
+    )
+    assert accepted is (rotation is None)
+    if accepted:
+        await asyncio.gather(*runner._background_tasks)
+        event = adapter.handle_message.await_args.args[0]
+        assert event.metadata["gateway_session_id"] == expected
+        assert event.metadata["gateway_session_strict"] is True
+    else:
+        assert not runner._background_tasks
+        adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pinned_dispatch_rejects_rotation_after_scheduling(tmp_path):
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_entry().origin)
+    expected = entry.session_id
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner.session_store = store
+    del runner._async_session_store
+    runner._gateway_loop = asyncio.get_running_loop()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=entry.session_key, content="wake", plugin_id="notify-plugin",
+        expected_session_id=expected,
+    ) is True
+    tasks = list(runner._background_tasks)
+    entry.session_id = "replacement-id"
+    assert await asyncio.gather(*tasks) == [False]
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pinned_dispatch_rechecks_before_adapter():
+    entry = _entry()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner.session_store.peek_session_id = MagicMock(return_value="replacement-id")
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="wake", plugin_id="notify-plugin",
+        expected_session_id=entry.session_id,
+    ) is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strict_handler_drops_injection_rotated_after_adapter_queue():
+    entry = _entry()
+    runner = _runner(entry)
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._session_key_for_source = MagicMock(return_value=entry.session_key)
+    runner._cache_session_source = MagicMock(side_effect=AssertionError("stale turn started"))
+    event = MessageEvent(
+        text="wake", source=entry.origin, internal=True, allow_gateway_control=False,
+        metadata={"gateway_session_key": entry.session_key,
+                  "gateway_session_id": "old-native-id", "gateway_session_strict": True},
+    )
+
+    await runner._handle_message_with_agent(event, entry.origin, entry.session_key, 1)
+    runner._cache_session_source.assert_not_called()
+
+
+def test_bound_session_key_never_uses_ambient_environment(monkeypatch):
+    from contextvars import Context
+    from gateway.session_context import (
+        clear_session_vars, get_bound_session_key, reset_session_vars, set_session_vars,
+    )
+    monkeypatch.setenv("HERMES_SESSION_KEY", "ambient-route")
+
+    def check():
+        assert get_bound_session_key() is None
+        tokens = set_session_vars(session_key="task-route")
+        assert get_bound_session_key() == "task-route"
+        clear_session_vars(tokens)
+        assert get_bound_session_key() is None
+        reset_session_vars()
+        assert get_bound_session_key() is None
+
+    Context().run(check)
