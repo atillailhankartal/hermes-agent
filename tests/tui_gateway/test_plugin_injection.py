@@ -265,6 +265,49 @@ def test_busy_plugin_does_not_claim_human_draft_images(runtime):
     assert session["attached_images"] == ["/tmp/human-draft.png"]
 
 
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+def test_isolated_plugin_frame_never_claims_human_draft_images(runtime, monkeypatch, dispatch_fails):
+    manager, session = runtime
+    session.update(running=False, _compute_host_active=True, cwd=str(manager.home_path))
+    session["attached_images"] = ["/tmp/human-draft.png"]
+    frames = []
+
+    class _Supervisor:
+        def submit_turn(self, frame, *, on_complete):
+            frames.append(frame)
+            if dispatch_fails:
+                raise RuntimeError("synthetic compute send failure")
+
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *_args: _Supervisor())
+    monkeypatch.setattr(server, "_persist_session_row_for_submit", lambda *_args: None)
+    monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *_args: True)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *_args: None)
+
+    assert _deliver(manager) is True
+    assert len(frames) == 1
+    assert frames[0]["attached_images"] == []
+    assert session["attached_images"] == ["/tmp/human-draft.png"]
+
+
+def test_cold_isolated_session_without_child_identity_proof_has_no_ack_or_frame(runtime, monkeypatch):
+    manager, session = runtime
+    session.update(agent=None, agent_ready=threading.Event(), running=False,
+                   source="desktop", cwd=str(manager.home_path))
+    frames = []
+
+    class _Supervisor:
+        def submit_turn(self, frame, *, on_complete):
+            frames.append(frame)
+
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *_args: _Supervisor())
+
+    assert _deliver(manager, expected_session_id="key-a") is False
+    assert frames == []
+    assert session.get("inflight_turn") is None
+
+
 @pytest.mark.parametrize("running", [True, False])
 def test_plugin_admission_never_waits_for_history_under_sessions_lock(runtime, monkeypatch, running):
     manager, session = runtime
