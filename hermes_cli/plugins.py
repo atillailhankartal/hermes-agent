@@ -951,7 +951,13 @@ class PluginContext:
             logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                            key, ", ".join(sorted(valid)))
         mapping.setdefault(key, []).append(callback)
-        handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
+
+        def release() -> None:
+            self._manager._remove_callback(mapping, key, callback)
+            if kind == "hook" and key in {"on_session_compacted", "on_session_resumed"}:
+                self._manager._invalidate_tui_hook_wrapper(key, callback)
+
+        handle = self._track(kind, key, release)
         logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
 
@@ -1239,7 +1245,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
         # Stable wrappers let bounded TUI observers keep the existing timeout suppression
         # per callback while checking the host route again inside a delayed worker.
-        self._tui_hook_wrappers: Dict[tuple[str, int], tuple[Callable, Callable]] = {}
+        self._tui_hook_wrappers: Dict[tuple[str, int], tuple[Callable, Callable, object]] = {}
         self._tui_hook_wrapper_lock = threading.Lock()
         # (hook_name, id(cb), repr(exc)) already reported at WARNING; identical repeats go to DEBUG.
         self._hook_failures_reported: set = set()
@@ -1274,9 +1280,17 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             for callback in self.iter_hook_callbacks(hook_name)
         }
         with self._tui_hook_wrapper_lock:
-            for key, (callback, _) in tuple(self._tui_hook_wrappers.items()):
+            for key, (callback, _, _) in tuple(self._tui_hook_wrappers.items()):
                 if live.get(key) is not callback:
                     self._tui_hook_wrappers.pop(key, None)
+
+    def _invalidate_tui_hook_wrapper(self, hook_name: str, callback: Callable) -> None:
+        """Retire the exact callback generation when its registration is disposed."""
+        key = (hook_name, id(callback))
+        with self._tui_hook_wrapper_lock:
+            entry = self._tui_hook_wrappers.get(key)
+            if entry is not None and entry[0] is callback:
+                self._tui_hook_wrappers.pop(key, None)
 
     def unload(self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None) -> bool:
         found = super().unload(plugin)
@@ -1363,11 +1377,19 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             logger.warning("TUI plugin message admission failed for %s", plugin_id)
             return False
 
-    def _guard_tui_session_callback(self, callback: Callable) -> Callable:
-        """Recheck a trusted route inside a bounded observer's worker thread."""
+    def _guard_tui_session_callback(
+        self, hook_name: str, callback: Callable, generation: object,
+    ) -> Callable:
+        """Recheck route and registration inside a bounded observer's worker thread."""
         def guarded(**worker_kwargs: Any) -> Any:
             if not worker_kwargs["route_is_current"]():
                 return None
+            if not any(current is callback for current in self.iter_hook_callbacks(hook_name)):
+                return None
+            with self._tui_hook_wrapper_lock:
+                entry = self._tui_hook_wrappers.get((hook_name, id(callback)))
+                if entry is None or entry[0] is not callback or entry[2] is not generation:
+                    return None
             # The bounded engine uses turn_id to distinguish simultaneous route calls.
             # It is internal bookkeeping, not part of the plugin observer payload.
             return self._invoke_hook_callback(
@@ -1410,7 +1432,10 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
                         with self._tui_hook_wrapper_lock:
                             entry = self._tui_hook_wrappers.get(key)
                             if entry is None or entry[0] is not callback:
-                                entry = (callback, self._guard_tui_session_callback(callback))
+                                generation = object()
+                                entry = (callback,
+                                         self._guard_tui_session_callback(hook_name, callback, generation),
+                                         generation)
                                 self._tui_hook_wrappers[key] = entry
                         self._run_hook_callback_bounded(hook_name, entry[1], bounded_kwargs, timeout)
                     except (Exception, SystemExit) as exc:

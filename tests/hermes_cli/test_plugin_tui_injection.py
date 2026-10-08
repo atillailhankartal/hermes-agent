@@ -25,6 +25,20 @@ def _pair(home, entry: dict | None = None):
     return PluginContext(manifest, manager), manager
 
 
+def _defer_hook_workers(monkeypatch):
+    deferred = []
+
+    class DeferredThread:
+        def __init__(self, *, target, name, daemon):
+            deferred.append(target)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("hermes_cli.plugins_dispatch.threading.Thread", DeferredThread)
+    return deferred
+
+
 def test_tui_callback_has_owner_pinned_lifecycle(tmp_path):
     _context, manager = _pair(tmp_path / "home", {"allow_tui_injection": True})
     first_owner, second_owner = object(), object()
@@ -423,16 +437,7 @@ def test_lifecycle_worker_rechecks_route_when_start_is_delayed(tmp_path, monkeyp
     manager._discovered = True
     monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.01)
     live = SimpleNamespace(value=True)
-    calls, deferred = [], []
-
-    class DeferredThread:
-        def __init__(self, *, target, name, daemon):
-            deferred.append(target)
-
-        def start(self):
-            pass
-
-    monkeypatch.setattr("hermes_cli.plugins_dispatch.threading.Thread", DeferredThread)
+    calls, deferred = [], _defer_hook_workers(monkeypatch)
     context.register_hook("on_session_resumed", lambda **_kwargs: calls.append("stale"))
     manager.on_session_resumed(
         session_key="route", session_id="native", profile="default",
@@ -442,3 +447,61 @@ def test_lifecycle_worker_rechecks_route_when_start_is_delayed(tmp_path, monkeyp
     live.value = False  # /new before the bounded worker reaches the callback.
     deferred[0]()
     assert calls == []
+
+
+@pytest.mark.parametrize("unload_target", ["notify-plugin", None])
+def test_lifecycle_deferred_worker_skips_unloaded_callback(tmp_path, monkeypatch, unload_target):
+    context, manager = _pair(tmp_path / "home")
+    manager._discovered = True
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.01)
+    deferred = _defer_hook_workers(monkeypatch)
+    calls = []
+    context.register_hook("on_session_resumed", lambda **_kwargs: calls.append("unloaded"))
+    manager.on_session_resumed(
+        session_key="route", session_id="native", profile="default", route_is_current=lambda: True)
+    assert calls == [] and len(deferred) == 1
+
+    assert manager.unload(unload_target) is True
+    assert manager.iter_hook_callbacks("on_session_resumed") == ()
+    deferred[0]()  # The route is still live, but registration no longer is.
+    assert calls == []
+
+
+def test_lifecycle_deferred_worker_skips_replaced_same_callable(tmp_path, monkeypatch):
+    context, manager = _pair(tmp_path / "home")
+    manager._discovered = True
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.01)
+    deferred = _defer_hook_workers(monkeypatch)
+    calls = []
+
+    def reused(**_kwargs):
+        calls.append("current")
+
+    old_registration = context.register_hook("on_session_resumed", reused)
+    manager.on_session_resumed(
+        session_key="route", session_id="native", profile="default", route_is_current=lambda: True)
+    old_registration.dispose()
+    context.register_hook("on_session_resumed", reused)
+    manager.on_session_resumed(
+        session_key="route", session_id="native", profile="default", route_is_current=lambda: True)
+    assert len(deferred) == 2
+
+    deferred[0]()
+    assert calls == []
+    deferred[1]()
+    assert calls == ["current"]
+
+
+def test_lifecycle_deferred_worker_runs_retained_callback(tmp_path, monkeypatch):
+    context, manager = _pair(tmp_path / "home")
+    manager._discovered = True
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.01)
+    deferred = _defer_hook_workers(monkeypatch)
+    calls = []
+    context.register_hook("on_session_compacted", lambda **_kwargs: calls.append("retained"))
+    manager.on_session_compacted(
+        session_key="route", old_session_id="old", session_id="native", profile="default",
+        in_place=False, route_is_current=lambda: True)
+    assert calls == [] and len(deferred) == 1
+    deferred[0]()
+    assert calls == ["retained"]
