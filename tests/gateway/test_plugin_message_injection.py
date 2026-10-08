@@ -3,7 +3,11 @@
 import asyncio
 from contextlib import nullcontext
 from datetime import datetime
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,7 +22,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
+from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, SessionStore, build_session_key
 from gateway.session_identity import RoutingIdentity
 from hermes_constants import (
     get_routing_process_hermes_home,
@@ -1102,7 +1106,7 @@ async def test_strict_hygiene_adoption_only_repoints_its_current_route(rotation_
             runner._rebind_turn_lease.assert_not_called()
             runner.async_session_store._save.assert_not_awaited()
         else:
-            runner._rebind_turn_lease.assert_called_once_with("route", 1, "compressed")
+            runner._rebind_turn_lease.assert_not_called()
             runner.async_session_store._save.assert_awaited_once()
         runner._sync_telegram_topic_binding.assert_not_called()
         fence.revoke_commit_admission.assert_called_once()
@@ -1175,3 +1179,266 @@ async def test_stale_hygiene_wait_defers_cleanup_without_evicting_new_route():
             await asyncio.gather(task, return_exceptions=True)
         if attempt.future is not None:
             await asyncio.wait_for(attempt.future, 5)
+
+
+@pytest.mark.parametrize("route", ["current", "reset"])
+def test_strict_hygiene_commit_with_real_session_store_does_not_deadlock(route, tmp_path):
+    """The worker must admit a live route and refuse a reset route without lock recursion."""
+    probe = Path(__file__).with_name("strict_hygiene_store_probe.py")
+    try:
+        result = subprocess.run(
+            [sys.executable, str(probe), route], cwd=Path(__file__).resolve().parents[2],
+            env={"PATH": os.environ.get("PATH", ""), "HERMES_HOME": str(tmp_path / "home")},
+            capture_output=True, text=True, timeout=8, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"strict hygiene worker deadlocked with real SessionStore ({route})")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.fixture
+def strict_hygiene_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    store.close_all_db_handles()
+    store._db = None  # Exercise the real routing lock/reset without opening a DB per case.
+    entry = SessionEntry(
+        session_key="route", session_id="old", created_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+    store._entries["route"] = entry
+    store._loaded = True
+    try:
+        yield store, entry
+    finally:
+        store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unwind", ["timeout", "cancel", "error"])
+@pytest.mark.parametrize("route_state", ["current", "reset", "generation"])
+async def test_strict_hygiene_unwind_only_evicts_the_current_route(
+    strict_hygiene_store, unwind, route_state,
+):
+    store, entry = strict_hygiene_store
+    runner = _runner(None)
+    runner.session_store = store
+    runner._is_session_run_current = MagicMock(return_value=True)
+    worker_entered, worker_release = Event(), Event()
+    wait_entered, wait_release = asyncio.Event(), asyncio.Event()
+
+    def compress(*_args, **_kwargs):
+        worker_entered.set()
+        assert worker_release.wait(5)
+        return [], None
+
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(bind_session_state=lambda *_: None),
+        _compress_context=compress,
+    )
+
+    async def wait_then_unwind(*_args):
+        wait_entered.set()
+        await wait_release.wait()
+        if unwind == "timeout":
+            raise asyncio.TimeoutError
+        if unwind == "cancel":
+            raise asyncio.CancelledError
+        raise RuntimeError("synthetic hygiene failure")
+
+    runner._hmwa_hygiene_build_agent = AsyncMock(return_value=(agent, None))
+    runner._hmwa_hygiene_wait_for_summary = AsyncMock(side_effect=wait_then_unwind)
+    runner._hmwa_hygiene_on_timeout = AsyncMock(side_effect=asyncio.TimeoutError)
+    runner._hmwa_hygiene_on_unwind = MagicMock()
+    runner._evict_cached_agent = MagicMock()
+    runner._defer_agent_cleanup_until_future_done = MagicMock()
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+    attempt = SimpleNamespace(agent=None, cleanup_deferred=False, history=[])
+    event = SimpleNamespace(metadata={
+        "gateway_session_strict": True, "gateway_session_key": "route",
+        "gateway_session_id": "old",
+    })
+    task = asyncio.create_task(runner._hmwa_hygiene_detached_attempt(
+        attempt, SimpleNamespace(total_ceiling_seconds=30),
+        SimpleNamespace(approx_tokens=10), [], [], None, {}, None,
+        entry, "route", "route", 1, strict_event=event,
+    ))
+    try:
+        await asyncio.wait_for(wait_entered.wait(), 5)
+        assert await asyncio.to_thread(worker_entered.wait, 5)
+        if route_state == "reset":
+            store.reset_session("route")
+        elif route_state == "generation":
+            runner._is_session_run_current.return_value = False
+        wait_release.set()
+        if route_state != "current" and unwind != "cancel":
+            assert await asyncio.wait_for(task, 5) is None
+        else:
+            with pytest.raises((asyncio.TimeoutError, asyncio.CancelledError, RuntimeError)):
+                await asyncio.wait_for(task, 5)
+        if route_state != "current":
+            runner._evict_cached_agent.assert_not_called()
+            runner._hmwa_hygiene_on_timeout.assert_not_awaited()
+            if unwind == "timeout":
+                runner._hmwa_hygiene_on_unwind.assert_not_called()
+            else:
+                runner._hmwa_hygiene_on_unwind.assert_called_once()
+        else:
+            runner._evict_cached_agent.assert_called_once_with("route")
+            if unwind == "timeout":
+                runner._hmwa_hygiene_on_timeout.assert_awaited_once()
+            else:
+                runner._hmwa_hygiene_on_unwind.assert_called_once()
+        runner._cleanup_agent_resources_off_loop.assert_not_awaited()
+        assert attempt.cleanup_deferred is True
+    finally:
+        worker_release.set()
+        wait_release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if attempt.future is not None:
+            await asyncio.wait_for(attempt.future, 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["cancel", "cooldown"])
+async def test_strict_hygiene_timeout_does_not_warn_after_reset_during_handler(
+    strict_hygiene_store, boundary,
+):
+    store, entry = strict_hygiene_store
+    runner = _runner(None)
+    runner.session_store = store
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def cancel_or_adopt(*_args):
+        if boundary == "cancel":
+            entered.set()
+            await release.wait()
+        return None
+
+    async def cooldown(*_args):
+        if boundary == "cooldown":
+            entered.set()
+            await release.wait()
+
+    runner._hmwa_hygiene_cancel_or_adopt = AsyncMock(side_effect=cancel_or_adopt)
+    runner._hmwa_hygiene_record_failure_cooldown = AsyncMock(side_effect=cooldown)
+    runner._hmwa_hygiene_stamp = MagicMock()
+    runner._hmwa_hygiene_notify = AsyncMock()
+    attempt = SimpleNamespace(
+        commit_fence=MagicMock(deadline_exceeded=False, is_cancelled=False),
+        wait_started=time.monotonic(), agent=object(), meta={},
+    )
+    hs = SimpleNamespace(total_ceiling_seconds=30, timeout_seconds=3)
+    task = asyncio.create_task(runner._hmwa_hygiene_on_timeout(
+        attempt, hs, entry, "route", None,
+        route_current=lambda: store.peek_session_id("route") == "old",
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        store.reset_session("route")
+        release.set()
+        assert await asyncio.wait_for(task, 5) is None
+        if boundary == "cancel":
+            runner._hmwa_hygiene_record_failure_cooldown.assert_not_awaited()
+        else:
+            runner._hmwa_hygiene_record_failure_cooldown.assert_awaited_once()
+        runner._hmwa_hygiene_stamp.assert_not_called()
+        runner._hmwa_hygiene_notify.assert_not_awaited()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_strict_hygiene_own_rotation_still_evicts_old_cached_agent(strict_hygiene_store):
+    store, entry = strict_hygiene_store
+    runner = _runner(None)
+    runner.session_store = store
+    runner._is_session_run_current = MagicMock(return_value=True)
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(bind_session_state=lambda *_: None),
+        _compress_context=lambda *_args, **_kwargs: ([], None),
+    )
+
+    async def adopt(*_args, **_kwargs):
+        with store._lock:
+            entry.session_id = "child"
+        return True
+
+    async def wait_summary(attempt, *_args):
+        return (await attempt.future)[0]
+
+    runner._hmwa_hygiene_build_agent = AsyncMock(return_value=(agent, None))
+    runner._hmwa_hygiene_wait_for_summary = AsyncMock(side_effect=wait_summary)
+    runner._hmwa_hygiene_apply_result = AsyncMock(side_effect=adopt)
+    runner._evict_cached_agent = MagicMock()
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+    attempt = SimpleNamespace(agent=None, cleanup_deferred=False, history=[])
+    event = SimpleNamespace(metadata={
+        "gateway_session_strict": True, "gateway_session_key": "route",
+        "gateway_session_id": "old",
+    })
+    await runner._hmwa_hygiene_detached_attempt(
+        attempt, SimpleNamespace(total_ceiling_seconds=30),
+        SimpleNamespace(approx_tokens=10), [], [], None, {}, None,
+        entry, "route", "route", 1, strict_event=event,
+    )
+    runner._evict_cached_agent.assert_called_once_with("route")
+    runner._cleanup_agent_resources_off_loop.assert_awaited_once_with(agent, context="session hygiene")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("save_fails", [False, True])
+async def test_strict_hygiene_rotation_persists_under_store_lock_and_rolls_back(
+    strict_hygiene_store, save_fails,
+):
+    store, entry = strict_hygiene_store
+    runner = _runner(None)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner.async_session_store.rewrite_transcript = AsyncMock(return_value=True)
+    runner._is_session_run_current = MagicMock(return_value=True)
+    runner._rebind_turn_lease = MagicMock()
+    runner._sync_telegram_topic_binding = MagicMock()
+    original_save = store._save
+
+    def checked_save():
+        assert store._lock.locked(), "routing persistence requires the store lock"
+        if save_fails:
+            raise OSError("synthetic persistence failure")
+        return original_save()
+
+    store._save = checked_save
+    original = [{"role": "user", "content": "a" * 1000}] * 4
+    compressed = [{"role": "assistant", "content": "summary"}]
+    attempt = SimpleNamespace(
+        agent=SimpleNamespace(session_id="child", _last_compaction_in_place=False),
+        history=original, commit_fence=MagicMock(),
+    )
+    plan = SimpleNamespace(msg_count=4, approx_tokens=1000, warn_token_threshold=10**9)
+    event = SimpleNamespace(metadata={
+        "gateway_session_strict": True, "gateway_session_key": "route",
+        "gateway_session_id": "old",
+    })
+    if save_fails:
+        with pytest.raises(OSError, match="synthetic persistence failure"):
+            await runner._hmwa_hygiene_adopt_transcript(
+                attempt, compressed, original, plan, session_entry=entry, source=None,
+                _quick_key="route", run_generation=1, strict_event=event,
+            )
+        assert store.peek_session_id("route") == "old"
+        runner._rebind_turn_lease.assert_not_called()
+        runner._sync_telegram_topic_binding.assert_not_called()
+    else:
+        result = await runner._hmwa_hygiene_adopt_transcript(
+            attempt, compressed, original, plan, session_entry=entry, source=None,
+            _quick_key="route", run_generation=1, strict_event=event,
+        )
+        assert result[0:2] == (True, False)
+        assert store.peek_session_id("route") == "child"
+        runner._rebind_turn_lease.assert_called_once_with("route", 1, "child")
+        runner._sync_telegram_topic_binding.assert_called_once()
