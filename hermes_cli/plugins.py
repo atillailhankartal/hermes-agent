@@ -1675,8 +1675,8 @@ def publish_tui_message_host(owner: object, injector: Callable[..., bool]) -> No
     global _published_tui_message_injector
     with _published_tui_host_lock:
         _published_tui_message_injector = (owner, injector)
-    for manager in _known_plugin_managers():
-        manager.set_tui_message_injector(owner, injector)
+        for manager in _known_plugin_managers():
+            manager.set_tui_message_injector(owner, injector)
 
 
 def clear_published_tui_message_host(owner: object) -> None:
@@ -1686,16 +1686,16 @@ def clear_published_tui_message_host(owner: object) -> None:
         if (_published_tui_message_injector is not None
                 and _published_tui_message_injector[0] is owner):
             _published_tui_message_injector = None
-    for manager in _known_plugin_managers():
-        manager.clear_tui_message_injector(owner)
+        for manager in _known_plugin_managers():
+            manager.clear_tui_message_injector(owner)
 
 
 def _attach_published_tui_host(manager: PluginManager) -> None:
     """Give a newly resolved manager the process TUI host, if one is installed and the slot is empty."""
     with _published_tui_host_lock:
         host = _published_tui_message_injector
-    if host is not None and manager._tui_message_injector is None:
-        manager._tui_message_injector = host
+        if host is not None and manager._tui_message_injector is None:
+            manager.set_tui_message_injector(*host)
 
 
 def get_plugin_manager() -> PluginManager:
