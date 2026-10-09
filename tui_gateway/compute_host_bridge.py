@@ -105,7 +105,7 @@ def _compute_host_session_info(session: dict) -> dict:
     return _session_info(session.get("agent"), session)
 
 
-def _compute_host_adopt_frame_meta(session: dict, frame: dict) -> None:
+def _compute_host_adopt_frame_meta(session: dict, frame: dict) -> bool:
     """Adopt a host frame's session_key / history_version. Caller holds history_lock.
 
     A rotated ``session_key`` means the child compressed A->B. The child only holds an inert
@@ -116,11 +116,13 @@ def _compute_host_adopt_frame_meta(session: dict, frame: dict) -> None:
         if not _transfer_active_session_slot(str(frame.get("sid") or ""), session, new_session_id=new_key):
             logger.warning("Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
                            frame.get("sid"), session.get("session_key"), new_key)
+            return False
         session["session_key"] = new_key
     if frame.get("history_version") is not None:
         with contextlib.suppress(Exception):
             session["history_version"] = max(int(session.get("history_version", 0)),
                                              int(frame.get("history_version") or 0))
+    return True
 
 
 def _relay_compute_host_rpc(message: dict) -> bool:
@@ -225,13 +227,14 @@ def _lock_compute_host_clarify(rid: str, request_id: str, question_id: str, answ
     return _ok(rid, result)
 
 
-def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
+def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> bool:
     """Mirror host-owned session metadata: under turn isolation the host is the only
     writer of live agent/history state, and UI reads must not build a second agent."""
     if not isinstance(frame, dict):
-        return
+        return False
     with _history_lock(session):
-        _compute_host_adopt_frame_meta(session, frame)
+        if not _compute_host_adopt_frame_meta(session, frame):
+            return False
         if frame.get("message_count") is not None:
             with contextlib.suppress(Exception):
                 session["_metadata_message_count"] = int(frame.get("message_count") or 0)
@@ -239,11 +242,12 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
     if isinstance(info, dict):
         session["_metadata_mirror"] = {**_metadata_mirror(session), **info}
         session["_metadata_mirror_updated_at"] = time.time()
+    return True
 
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
     with session["history_lock"]:
-        _compute_host_adopt_frame_meta(session, frame)
+        route_adopted = _compute_host_adopt_frame_meta(session, frame)
         session["running"] = False
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
@@ -256,6 +260,10 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     if frame.get("type") == "turn.error":
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+    if not route_adopted:
+        _release_deferred_active_session_lease(session)
+        _emit("error", sid, {"message": _SESSION_OWNERSHIP_UNAVAILABLE})
+        return
     _apply_compute_host_metadata_mirror(session, frame)
     # Settlement of a turn whose session was closed mid-flight: the real lease was held for it.
     _release_deferred_active_session_lease(session)
@@ -308,12 +316,24 @@ def _submit_prompt_to_compute_host(
 def _send_compute_host_control(
     sid: str, *, route_name: str, command: str = "", payload: dict | None = None,
     wait: bool = True, timeout: float = 30.0, on_late_ack=None) -> dict:
+    if route_name in {"session.compress", "slash.compress"}:
+        session = _sessions.get(sid)
+        if session is None:
+            raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE)
+        if (ownership_refusal := _prove_active_session_slot(sid, session)) is not None:
+            raise RuntimeError(ownership_refusal)
     frame = dict(payload or {})
     frame.setdefault("type", "control")
     frame.setdefault("command", command)
-    return _get_compute_host_supervisor().control(
+    ack = _get_compute_host_supervisor().control(
         sid, route_name=route_name, payload=frame, wait=wait, timeout=timeout,
         on_late_ack=on_late_ack)
+    if (route_name in {"session.compress", "slash.compress"} and isinstance(ack, dict)
+            and ack.get("type") not in {"control.error", "error"}):
+        with _history_lock(session):
+            if not _compute_host_adopt_frame_meta(session, ack):
+                raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE)
+    return ack
 
 
 def _compute_host_ack_error(rid, ack: dict, code: int, default: str):
@@ -354,7 +374,10 @@ def _adopt_late_compute_host_compress_ack(sid: str, session: dict, ack: dict, *,
         _emit("error", sid, {"message": f"compression failed: {message}"})
         _status_update(sid, "ready")
         return
-    _apply_compute_host_metadata_mirror(session, ack)
+    if not _apply_compute_host_metadata_mirror(session, ack):
+        _emit("error", sid, {"message": _SESSION_OWNERSHIP_UNAVAILABLE})
+        _status_update(sid, "ready")
+        return
     _emit("session.info", sid, _compute_host_session_info(session))
     _status_update(sid, "compacted", "✓ Context compression complete")
 

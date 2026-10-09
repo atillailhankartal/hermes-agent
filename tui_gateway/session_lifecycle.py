@@ -137,6 +137,18 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     return limit_message
 
 
+def _prove_active_session_slot(sid: str, session: dict) -> str | None:
+    """Reserve or verify the stored route before an off-turn operation mutates its history."""
+    if (refusal := _ensure_active_session_slot(sid, session)) is not None:
+        return str(refusal)
+    lease = session.get("active_session_lease")
+    key = str(session.get("session_key") or "")
+    if (not key or lease is None or getattr(lease, "released", False)
+            or str(getattr(lease, "session_id", "")) != key):
+        return _SESSION_OWNERSHIP_UNAVAILABLE
+    return None
+
+
 def _attach_lease(session: dict, lease) -> None:
     session["active_session_lease"] = lease
     session.pop("_lease_taken_over", None)  # owning again: its finalize ends the row like any owner
@@ -278,11 +290,12 @@ def _other_runtime_lease_guard(session_id: str, session: dict):
 
 
 def _transfer_active_session_slot(sid: str, session: dict, *, new_session_id: str) -> bool:
-    if not new_session_id:
+    if not new_session_id or not session.get("session_key"):
         return False
     lease = session.get("active_session_lease")
-    if lease is None:
-        return True
+    if (lease is None or getattr(lease, "released", False)
+            or str(getattr(lease, "session_id", "")) != str(session.get("session_key") or "")):
+        return False
     try:
         from hermes_cli.active_sessions import transfer_active_session
         if transfer_active_session(lease, session_id=new_session_id, metadata=_lease_metadata(sid)):
