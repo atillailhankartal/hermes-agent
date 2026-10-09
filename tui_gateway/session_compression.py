@@ -250,6 +250,8 @@ def _manual_compress_turn(sid: str, session: dict):
             raise CompressionBusy(busy_message("compress", bool(session.get("_manual_compress_active"))))
         session["running"] = session["_manual_compress_active"] = True
     try:
+        if (ownership_refusal := _prove_active_session_slot(sid, session)) is not None:
+            raise RuntimeError(ownership_refusal)
         yield
     finally:
         with session["history_lock"]:
@@ -328,6 +330,7 @@ def _sync_session_key_after_compress(
             "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
             sid, old_key, new_session_id,
         )
+        raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE)
     # Even if the approval module fails to import, anchor session_key on the continuation id.
     session["session_key"] = new_session_id
     with contextlib.suppress(Exception):
