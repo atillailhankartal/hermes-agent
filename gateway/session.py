@@ -1188,6 +1188,42 @@ class SessionStore(
         )
         return new_entry
 
+    def reconcile_failed_reset(self, session_key: str, old_session_id: str) -> Optional[SessionEntry]:
+        """Adopt a reset only when its new route is proven by the authoritative routing index.
+
+        A writer can commit the routing row and then report an error before publishing its
+        in-memory candidate. Called after that writer has drained, while Gateway holds the
+        per-key route gate. An unproven result leaves the already-revoked route closed.
+        """
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if current is None or (current.session_id != old_session_id and not current.is_fresh_reset):
+                return None
+            try:
+                loader = self._routing_db_method("load_gateway_routing_entries")
+                if loader is not None:
+                    raw = loader(scope=self._routing_scope()).get(session_key)
+                    durable_data = json.loads(raw) if raw else None
+                else:
+                    durable_data = json.loads(
+                        (self.sessions_dir / "sessions.json").read_text(encoding="utf-8-sig")
+                    ).get(session_key)
+                durable = SessionEntry.from_dict(durable_data) if isinstance(durable_data, dict) else None
+            except Exception:
+                logger.warning("Gateway reset route readback failed for %s", session_key, exc_info=True)
+                return None
+            if (durable is None or durable.session_key != session_key
+                    or durable.session_id == old_session_id or not durable.is_fresh_reset
+                    or not durable.route_epoch or durable.route_claim_blocked
+                    or durable.origin != current.origin
+                    or current.session_id not in (old_session_id, durable.session_id)
+                    or (current.session_id == old_session_id and not current.route_claim_blocked)
+                    or (current.session_id == durable.session_id
+                        and current.route_epoch != durable.route_epoch)):
+                return None
+            self._entries[session_key] = durable
+            return replace(durable)
+
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
         """Persist a fresh route and epoch before publishing either in memory. Lock held."""
         new_entry = SessionEntry(

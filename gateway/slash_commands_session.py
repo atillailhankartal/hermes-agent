@@ -28,9 +28,9 @@ from gateway.slash_commands_status import history_unreadable
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
 
-# Bound on the off-loop agent cleanup during /new; past it the reset proceeds and the teardown
-# finishes (or leaks) in its worker thread rather than blocking the event loop.
+# Bound on the off-loop old-agent cleanup after /new has durably published its new route.
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+_RESET_AGENT_UNSET = object()
 # chat_type values whose session key is per-user (DM-like), incl. the unknown/blank case.
 _DM_CHAT_TYPES = {"dm", "direct", "private", ""}
 
@@ -117,12 +117,12 @@ class GatewaySessionCommandsMixin:
 
     # ------------------------------------------------------------------ /new, /reset
 
-    async def _cleanup_old_agent_for_reset(self, session_key: str) -> None:
-        """Close the old agent's tool resources (sandboxes, browsers, subprocesses) before eviction.
+    async def _cleanup_old_agent_for_reset(self, session_key: str, old_agent=_RESET_AGENT_UNSET) -> None:
+        """Close the captured old agent's tool resources (sandboxes, browsers, subprocesses).
         Blocking work on the event loop (confirm-button click) → offloaded with a bounded timeout.
         wait_for cancels the await, not the worker thread: a wedged teardown keeps running (or
         leaks); the reset proceeds either way."""
-        _old_agent = self._cached_agent_for(session_key)
+        _old_agent = self._cached_agent_for(session_key) if old_agent is _RESET_AGENT_UNSET else old_agent
         if _old_agent is None:
             return
         try:
@@ -172,36 +172,79 @@ class GatewaySessionCommandsMixin:
         """Handle /new or /reset command."""
         source = event.source
         session_key = self._session_key_for_source(source)
-        # Snapshot the epoch that owns the old Bee receiver BEFORE revocation rotates it.
-        # The gate serializes this snapshot with admission and the offloaded durable fence;
-        # the store takes its own lock while copying against legacy synchronous writers.
+        # Keep the old identity, durable reset, and conversation boundary in one admission
+        # interval. /resume must see either the old route or the fully published new route.
+        cancelled = False
         async with self._session_route_gate(session_key):
             old_entry = await self.async_session_store.snapshot_route_entry(session_key)
+            old_agent = self._cached_agent_for(session_key)
             self._invalidate_session_run_generation(session_key, reason="session_reset")
-            await self._revoke_route_claim_async(session_key)
-        # Evict the running-agent slot now that the generation is bumped: the in-flight run's own
-        # guarded release (old generation) returns False and would leave a zombie slot that silently
-        # drops all later messages. Idempotent, so the run's finally calling it again is harmless.
-        self._release_running_agent_state(session_key)
-        await self._cleanup_old_agent_for_reset(session_key)
-        self._evict_cached_agent(session_key)
-        # Conversation boundary: ALL conversation-scoped per-session state + security state in one
-        # funnel call (see _CONVERSATION_SCOPED_STATE in gateway/run.py).
-        self._clear_conversation_scope(session_key, reason="session_reset")
-        # In-flight async delegations end WITH the conversation: once the id rotates their
-        # completions have no live owner. Expire by durable id, routing key as legacy fallback.
-        with contextlib.suppress(Exception):
-            from tools.async_delegation import interrupt_for_session
-            interrupt_for_session(session_key=session_key, reason="session_reset",
-                                  parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
-        _reset_process_scoped_tool_state()
+            try:
+                try:
+                    await self._revoke_route_claim_async(session_key)
+                except asyncio.CancelledError:
+                    cancelled = True
+                try:
+                    new_entry, write_cancelled = await self._drain_reset_boundary_operation(
+                        self.async_session_store.reset_session(session_key))
+                    cancelled |= write_cancelled
+                except Exception:
+                    # The writer has finished, but its completion may have been lost after the
+                    # durable routing commit. Only exact authoritative readback can publish it.
+                    cancelled |= bool(asyncio.current_task().cancelling())
+                    new_entry, read_cancelled = await self._drain_reset_boundary_operation(
+                        self.async_session_store.reconcile_failed_reset(
+                            session_key, old_entry.session_id if old_entry else ""))
+                    cancelled |= read_cancelled
+                    if new_entry is None:
+                        raise
+                    logger.warning("Gateway reset writer reported an error after durable route commit for %s",
+                                   session_key, exc_info=True)
+                was_reset = new_entry is not None
+                if new_entry is None:
+                    new_entry, write_cancelled = await self._drain_reset_boundary_operation(
+                        self.async_session_store.get_or_create_session(source, force_new=True))
+                    cancelled |= write_cancelled
+            except BaseException:
+                # A failed boundary cannot leave the displaced turn's slot pinning this key.
+                self._release_running_agent_state(session_key)
+                self._evict_cached_agent(session_key)
+                raise
+            # Clear the displaced turn and conversation before a successor can enter. Keep the
+            # old agent object for bounded resource cleanup after the route gate is released.
+            self._release_running_agent_state(session_key)
+            detached_agent = self._evict_cached_agent(session_key, defer_release=True)
+            self._clear_conversation_scope(session_key, reason="session_reset")
+            with contextlib.suppress(Exception):
+                from tools.async_delegation import interrupt_for_session
+                interrupt_for_session(session_key=session_key, reason="session_reset",
+                                      parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
+            _reset_process_scoped_tool_state()
 
-        new_entry = await self.async_session_store.reset_session(session_key)
-        was_reset = new_entry is not None
-        if new_entry is None:
-            new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
-        _old_sid = old_entry.session_id if old_entry else None
-        await self._fire_session_reset_hooks(source, session_key, old_entry, new_entry)
+        try:
+            _, cleanup_cancelled = await self._drain_reset_boundary_operation(
+                self._cleanup_old_agent_for_reset(session_key, old_agent))
+            cancelled |= cleanup_cancelled
+        except Exception:
+            logger.warning("Agent resource cleanup for %s failed after /new publication", session_key,
+                           exc_info=True)
+        finally:
+            if detached_agent is old_agent and old_agent is not None:
+                try:
+                    self._spawn_release_thread(
+                        self._release_evicted_agent_soft, (old_agent,),
+                        f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
+                        session_key=session_key,
+                    )
+                except Exception:
+                    logger.warning("Old agent client release failed after /new for %s", session_key,
+                                   exc_info=True)
+
+        _, hook_cancelled = await self._drain_reset_boundary_operation(
+            self._fire_session_reset_hooks(source, session_key, old_entry, new_entry))
+        cancelled |= hook_cancelled
+        if cancelled:
+            raise asyncio.CancelledError
         # Scoped to the profile serving this source so a multiplexed /new banner reports the
         # profile's model, not the base config's.
         try:
@@ -231,6 +274,18 @@ class GatewaySessionCommandsMixin:
             _tip_line = ""
         body = f"{header}\n\n{session_info}" if session_info else header
         return EphemeralReply(f"{body}{_tip_line}")
+
+    @staticmethod
+    async def _drain_reset_boundary_operation(operation):
+        """Finish a route write or boundary callback after caller cancellation."""
+        task = asyncio.create_task(operation)
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        return task.result(), cancelled
 
     async def _reset_titled_header(self, header: str, session_id: str, title_arg: str) -> str:
         """``/new <title>``: titled header on success, else the header plus a rejection note."""

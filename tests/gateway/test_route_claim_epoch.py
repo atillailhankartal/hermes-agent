@@ -755,6 +755,239 @@ async def test_actual_new_finalizes_pre_revoke_epoch(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_actual_new_publishes_before_slow_cleanup_and_resume_replaces_only_new_route(tmp_path, monkeypatch):
+    store, old = _store(tmp_path, monkeypatch)
+    initial_epoch = old.route_epoch
+    monkeypatch.setattr(store, "_generate_session_key", lambda _source: "route")
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_key_for_source = lambda _source: "route"
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._release_running_agent_state = Mock()
+    old_agent = object()
+    runner._agent_cache = {"route": (old_agent, "signature")}
+    runner._agent_cache_lock = threading.Lock()
+    runner._spawn_release_thread = Mock()
+    runner._evict_cached_agent = Mock(wraps=runner._evict_cached_agent)
+    runner._clear_conversation_scope = Mock()
+    runner._reset_notice_session_info = Mock(return_value="")
+    runner._telegram_topic_new_header = Mock(return_value=None)
+    runner._is_telegram_topic_lane = Mock(return_value=False)
+    runner._session_db = SimpleNamespace(get_session_title=AsyncMock(return_value="C"))
+    runner._finalize_session_off_loop = AsyncMock()
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._normalize_source_for_session_key = lambda value: value
+    runner._resolve_resume_target = AsyncMock(return_value=("C", "C"))
+    runner._resume_access_denied_reply = AsyncMock(return_value=None)
+    runner._session_state("route").persistent.run_generation = 1
+    emitted = AsyncMock()
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
+
+    cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event()
+
+    async def held_cleanup(_key, old_agent=None):
+        assert old_agent is captured_old_agent
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    captured_old_agent = old_agent
+    runner._cleanup_old_agent_for_reset = held_cleanup
+    reset = asyncio.create_task(runner._handle_reset_command(MessageEvent(text="/new", source=old.origin)))
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), 2)
+        reset_entry = store.lookup_by_session_key("route")
+        assert reset_entry.session_id not in ("A", "C")
+        assert reset_entry.route_epoch != initial_epoch
+        assert runner._clear_conversation_scope.call_count == 1
+        assert runner._evict_cached_agent.call_count == 1
+
+        resumed = await asyncio.wait_for(
+            runner._handle_resume_command(MessageEvent(text="/resume C", source=old.origin)), 2,
+        )
+        assert resumed
+        current = store.lookup_by_session_key("route")
+        assert current.session_id == "C" and current.route_epoch != reset_entry.route_epoch
+    finally:
+        release_cleanup.set()
+        await asyncio.wait_for(reset, 2)
+
+    reopened = SessionStore(tmp_path / "sessions", GatewayConfig())
+    reopened._db = None
+    assert reopened.lookup_by_session_key("route").route_epoch == current.route_epoch
+    reset_events = [call.args[2] for call in emitted.await_args_list if call.args[1] == "on_session_reset"]
+    resume_events = [call.args[2] for call in emitted.await_args_list if call.args[1] == "on_session_resumed"]
+    assert len(reset_events) == len(resume_events) == 1
+    assert reset_events[0]["old_route_epoch"] == initial_epoch
+    assert reset_events[0]["route_epoch"] == reset_entry.route_epoch
+    assert resume_events[0]["old_route_epoch"] == reset_entry.route_epoch
+    assert resume_events[0]["route_epoch"] == current.route_epoch
+    assert runner._clear_conversation_scope.call_count == 2
+    assert runner._evict_cached_agent.call_count == 2
+    assert runner._agent_cache == {}
+    assert runner._spawn_release_thread.call_count == 1
+    assert runner._spawn_release_thread.call_args.args[1] == (captured_old_agent,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion_error", [False, True])
+async def test_cancelled_new_drains_durable_reset_before_route_gate_release(tmp_path, monkeypatch, completion_error):
+    store, old = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_key_for_source = lambda _source: "route"
+    runner._release_running_agent_state = Mock()
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._evict_cached_agent = Mock()
+    runner._clear_conversation_scope = Mock()
+    runner._reset_notice_session_info = Mock(return_value="")
+    runner._telegram_topic_new_header = Mock(return_value=None)
+    runner._is_telegram_topic_lane = Mock(return_value=False)
+    runner._session_db = None
+    runner._finalize_session_off_loop = AsyncMock()
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._session_state("route").persistent.run_generation = 1
+    entered, release = threading.Event(), threading.Event()
+    real_persist = store._persist_routing_data
+
+    def held_reset_write(data, generation):
+        if data.get("route", {}).get("session_id") != "A":
+            entered.set()
+            assert release.wait(3)
+        result = real_persist(data, generation)
+        if completion_error and data.get("route", {}).get("session_id") != "A":
+            raise OSError("completion lost after durable commit")
+        return result
+
+    monkeypatch.setattr(store, "_persist_routing_data", held_reset_write)
+    gate = runner._session_route_gate("route")
+    reset = asyncio.create_task(runner._handle_reset_command(MessageEvent(text="/new", source=old.origin)))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        reset.cancel()
+        await asyncio.sleep(0)
+        assert gate.locked(), "A cancelled offloaded writer must retain the route gate until its durable result"
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.01, heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), 0.1)
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(reset, 2)
+    current = store.lookup_by_session_key("route")
+    assert current.session_id != "A"
+    assert _durable(tmp_path)["route_epoch"] == current.route_epoch
+    assert not gate.locked()
+    assert runner._clear_conversation_scope.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_new_route_write_keeps_old_route_closed_and_emits_no_reset(tmp_path, monkeypatch):
+    store, old = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_key_for_source = lambda _source: "route"
+    runner._release_running_agent_state = Mock()
+    runner._evict_cached_agent = Mock()
+    runner._clear_conversation_scope = Mock()
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._session_state("route").persistent.run_generation = 1
+    emitted = AsyncMock()
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
+    real_persist = store._persist_routing_data
+
+    def failed_reset_write(data, generation):
+        if data.get("route", {}).get("session_id") != "A":
+            raise OSError("reset write failed")
+        return real_persist(data, generation)
+
+    monkeypatch.setattr(store, "_persist_routing_data", failed_reset_write)
+    with pytest.raises(OSError, match="reset write failed"):
+        await runner._handle_reset_command(MessageEvent(text="/new", source=old.origin))
+    current = store.lookup_by_session_key("route")
+    assert current.session_id == "A" and current.route_claim_blocked
+    assert _durable(tmp_path)["session_id"] == "A"
+    assert _durable(tmp_path)["route_claim_blocked"] is True
+    assert runner._release_running_agent_state.call_count == 1
+    assert runner._evict_cached_agent.call_count == 1
+    assert runner._clear_conversation_scope.call_count == 0
+    assert runner._cleanup_old_agent_for_reset.await_count == 0
+    assert emitted.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_new_cleanup_failure_still_finalizes_exact_old_epoch(tmp_path, monkeypatch):
+    store, old = _store(tmp_path, monkeypatch)
+    original_epoch = old.route_epoch
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_key_for_source = lambda _source: "route"
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._release_running_agent_state = Mock()
+    runner._evict_cached_agent = Mock()
+    runner._clear_conversation_scope = Mock()
+    runner._cleanup_old_agent_for_reset = AsyncMock(side_effect=RuntimeError("cleanup failed"))
+    runner._reset_notice_session_info = Mock(return_value="")
+    runner._telegram_topic_new_header = Mock(return_value=None)
+    runner._is_telegram_topic_lane = Mock(return_value=False)
+    runner._session_db = None
+    runner._finalize_session_off_loop = AsyncMock()
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._session_state("route").persistent.run_generation = 1
+    emitted = AsyncMock()
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
+
+    await runner._handle_reset_command(MessageEvent(text="/new", source=old.origin))
+    current = store.lookup_by_session_key("route")
+    assert current.session_id != "A" and _durable(tmp_path)["route_epoch"] == current.route_epoch
+    assert runner._finalize_session_off_loop.await_args.kwargs["route_epoch"] == original_epoch
+    assert emitted.await_args.args[2]["old_route_epoch"] == original_epoch
+    assert emitted.await_args.args[2]["route_epoch"] == current.route_epoch
+
+
+@pytest.mark.asyncio
+async def test_new_reconciles_committed_reset_after_writer_reports_error(tmp_path, monkeypatch):
+    store, old = _store(tmp_path, monkeypatch)
+    original_epoch = old.route_epoch
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_key_for_source = lambda _source: "route"
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._release_running_agent_state = Mock()
+    runner._evict_cached_agent = Mock()
+    runner._clear_conversation_scope = Mock()
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._reset_notice_session_info = Mock(return_value="")
+    runner._telegram_topic_new_header = Mock(return_value=None)
+    runner._is_telegram_topic_lane = Mock(return_value=False)
+    runner._session_db = None
+    runner._finalize_session_off_loop = AsyncMock()
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._session_state("route").persistent.run_generation = 1
+    emitted = AsyncMock()
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
+    real_persist = store._persist_routing_data
+
+    def committed_then_failed(data, generation):
+        real_persist(data, generation)
+        if data.get("route", {}).get("session_id") != "A":
+            raise OSError("completion lost after durable commit")
+
+    monkeypatch.setattr(store, "_persist_routing_data", committed_then_failed)
+    await runner._handle_reset_command(MessageEvent(text="/new", source=old.origin))
+    current = store.lookup_by_session_key("route")
+    assert current.session_id != "A" and current.route_epoch != original_epoch
+    assert _durable(tmp_path)["session_id"] == current.session_id
+    assert _durable(tmp_path)["route_epoch"] == current.route_epoch
+    assert runner._finalize_session_off_loop.await_args.kwargs["route_epoch"] == original_epoch
+    assert emitted.await_args.args[2]["route_epoch"] == current.route_epoch
+
+
+@pytest.mark.asyncio
 async def test_post_dispatch_route_change_reports_unknown_before_retry(tmp_path, monkeypatch):
     store, entry = _store(tmp_path, monkeypatch)
     runner = object.__new__(GatewayRunner)
