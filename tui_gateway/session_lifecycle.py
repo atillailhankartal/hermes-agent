@@ -123,6 +123,8 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
     that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible. An
     inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream."""
+    if session.get("_compression_faulted"):
+        return _SESSION_OWNERSHIP_UNAVAILABLE
     if session.get("active_session_lease") is not None:
         return None
     key = str(session.get("session_key") or "")

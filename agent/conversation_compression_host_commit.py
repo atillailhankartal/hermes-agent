@@ -34,9 +34,22 @@ def run_compaction_host_commit(
         outcome = commit_fn(prepared)
         if publication is not None and outcome.session_commit_succeeded:
             publication.publish(agent, outcome)
+    if host_commit is not None and not outcome.session_commit_succeeded and outcome.refused_prompt is None:
+        raise RuntimeError("Compression persistence failed before host publication")
     if host_commit is not None and outcome.session_commit_succeeded:
         _commit_deferred_memory_session(agent, messages, outcome.old_session_id)
     return outcome
+
+
+def publish_rotated_with_host_commit(agent: Any, child_id: str, host_commit: Any, **kwargs) -> None:
+    """Stage the registry route before SQLite COMMIT and settle uncertain COMMIT errors."""
+    try:
+        agent._session_db.publish_compression_child(
+            **kwargs, **({"route_before_commit": host_commit.stage_route_before_sqlite_commit}
+                       if host_commit is not None else {}))
+    except Exception:
+        if host_commit is None or not host_commit.reconcile_failed_rotation(agent, child_id):
+            raise
 
 
 def prepare_host_candidate(compressed: list, salvage: Callable[[list], tuple]) -> tuple:

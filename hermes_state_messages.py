@@ -26,6 +26,7 @@ from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
+_PROMPT_UNSET = object()
 
 # One INSERT shape for every message writer (append, batch, replace, compact, import).
 _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_call_id,
@@ -987,7 +988,8 @@ class SessionMessagesMixin:
         lock_holder: Optional[str] = None, tail_count: int = 0,
         carried_messages: Optional[List[Dict[str, Any]]] = None,
         covered_ids: Optional[List[int]] = None,
-        unresolved_held: Optional[List[Dict[str, Any]]] = None) -> int:
+        unresolved_held: Optional[List[Dict[str, Any]]] = None,
+        system_prompt: Any = _PROMPT_UNSET) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
@@ -995,9 +997,8 @@ class SessionMessagesMixin:
         compacted set by a pure-SQL clone (fresh ids); ``None`` archives everything. *covered_ids*: the
         rows the compressor actually held. When proved, only those are summarized; every other active
         row is cloned after the new set, so a gap below the newest held id is not archived unseen.
-        ``None`` keeps the watermark path. *unresolved_held*: held dicts with no row id, matched inside
-        the transaction. *lock_holder*: verified
-        in-txn so a reclaimed lease fails instead of clobbering the winner. *tail_count*: the LAST N compacted
+        ``None`` keeps the watermark path. *unresolved_held*: held dicts with no row id, matched in-txn.
+        *lock_holder* fences reclaimed leases. *tail_count*: the LAST N compacted
         rows are the verbatim carried tail; *carried_messages* names exact durable originals carried forward
         verbatim when they are not a contiguous suffix (micro-compaction's prefix + marker + suffix shape).
         They are resolved inside this transaction by row id when present, else by unique durable identity +
@@ -1005,15 +1006,19 @@ class SessionMessagesMixin:
         (``active=0, compacted=0``) so search doesn't return each carried message once per compaction.
         ``model_config_patch`` merges in the same txn (``None`` removes a key).
 
-        Concurrent-append safety (#75316): when *watermark* is provided (the value of
-        :meth:`get_active_message_watermark` captured at compression START), rows that arrived during the
-        slow provider summary call (``id > watermark``) are NOT summarized away. They are re-sequenced after
-        the compacted set by a pure-SQL column clone (every column except ``id`` — content, api_content,
+        Concurrent tail rows retain every column except ``id`` — content, api_content,
         platform_message_id, token counts, reasoning sidecars all survive byte-exact, and the FTS triggers
         index the clones naturally), and the originals are archived. NOTE: re-sequencing assigns the tail
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
         """
         from hermes_state import SessionCompressionInProgressError
+        def _store_prompt(conn):
+            if system_prompt is not _PROMPT_UNSET:
+                conn.execute(
+                    "UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
+                    (self._store_system_prompt(conn, system_prompt), session_id),
+                )
+                self._delete_unreferenced_system_prompts(conn)
         def _do(conn):
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
@@ -1026,10 +1031,12 @@ class SessionMessagesMixin:
                 conn, session_id, model_config_patch, on_missing="raise") if patch else None
             proved = self._proved_coverage(conn, session_id, covered_ids, unresolved_held, watermark)
             if proved is not None:
-                return self._archive_named_rows(
+                result = self._archive_named_rows(
                     conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
                     carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
                     merged_away=proved[1])
+                _store_prompt(conn)
+                return result
             tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
                 (session_id, int(watermark)))
@@ -1067,6 +1074,7 @@ class SessionMessagesMixin:
             self._reconcile_display_orders(conn, session_id)
             conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
                 (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
+            _store_prompt(conn)
             return inserted
         return self._execute_transcript_write(_do, compacted_messages)
 

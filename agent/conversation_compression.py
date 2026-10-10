@@ -3305,11 +3305,9 @@ def _compression_child_source(agent: Any, parent_session_id: str) -> str:
 
 def _publish_rotated_compaction(
     agent: Any, messages: list, compressed: list, *, new_system_prompt: str, lease: _CompressionLease,
-    old_session_id: str, compressed_user_turn_outcome: str,
+    old_session_id: str, compressed_user_turn_outcome: str, host_commit: Any = None,
 ) -> None:
-    """Rotate the session: flush the parent, publish the child, re-point the agent.
-    Flushes current-turn msgs to the OLD session, passing the durable prefix (messages[:persist idx]) so
-    preflight, which runs before rows are marker-stamped, can't re-append them."""
+    """Flush the parent, publish the child, and re-point the agent."""
     current_idx = getattr(agent, "_persist_user_message_idx", None)
     persisted_history = (
         messages[:current_idx] if isinstance(current_idx, int) and 0 <= current_idx <= len(messages) else None
@@ -3338,8 +3336,10 @@ def _publish_rotated_compaction(
     old_title = agent._session_db.get_session_title(agent.session_id)
     new_session_id = mint_session_id()
     from agent.context_compressor import _DB_PERSISTED_MARKER
+    from agent.conversation_compression_host_commit import publish_rotated_with_host_commit
     from tools.approval_yolo import with_session_yolo
-    agent._session_db.publish_compression_child(
+    publish_rotated_with_host_commit(
+        agent, new_session_id, host_commit,
         parent_session_id=old_session_id, child_session_id=new_session_id,
         source=_compression_child_source(agent, old_session_id), model=agent.model,
         model_config=with_session_yolo(agent._session_init_model_config, old_session_id),
@@ -3674,13 +3674,10 @@ def _commit_compaction(
     messages_before_compression: Optional[list], made_progress: bool, attempt: _Attempt,
     verbatim_tail: Optional[list] = None, carried_messages: Optional[list] = None,
     defer_memory_commit: bool = False, prepared_candidate: Optional[tuple] = None,
+    host_commit: Any = None,
 ) -> _CommitOutcome:
-    """Persist the compacted transcript: memory extraction, anti-growth guard, then the
-    in-place archive or the parent->child rotation.
-
-    Failures roll the live list back and arm the split-failure cooldown; a refused (would-grow) candidate returns
-    ``refused_prompt`` so the caller hands back the input unchanged. ``verbatim_tail`` (``/compress here N``) is
-    re-inserted after the compacted head by either commit and stamped once durable.
+    """Commit an in-place archive or rotated child and roll back the live list on failure.
+    A grown candidate returns ``refused_prompt``; ``verbatim_tail`` remains durable after success.
     """
     session_commit_succeeded = False
     compacted_in_place = False
@@ -3757,6 +3754,7 @@ def _commit_compaction(
                     watermark=_held_watermark(agent, lease.watermark, messages, verbatim_tail),
                     lock_holder=lease.holder, tail_count=tail_count, carried_messages=carried_messages,
                     covered_ids=covered_ids, unresolved_held=unresolved_held,
+                    **({"system_prompt": new_system_prompt} if host_commit is not None else {}),
                 )
                 compressed = persisted
                 split_status = "in_place_committed"
@@ -3771,7 +3769,8 @@ def _commit_compaction(
                 # re-baseline transcript handling.
                 compacted_in_place = True
                 # In-place still updates the current row's prompt; rotation published it atomically above.
-                agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+                if host_commit is None:
+                    agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
                 agent._last_flushed_db_idx = 0
             else:
                 # Bind old_session_id first: it is the rollback key in the handler below.
@@ -3796,6 +3795,7 @@ def _commit_compaction(
                 _publish_rotated_compaction(
                     agent, messages, compressed, new_system_prompt=new_system_prompt, lease=lease,
                     old_session_id=old_session_id, compressed_user_turn_outcome=compressed_user_turn_outcome,
+                    host_commit=host_commit,
                 )
                 if verbatim_tail:
                     stamp_db_persisted_markers(verbatim_tail)
@@ -4253,7 +4253,7 @@ def compress_context(
                 system_message=system_message, compressed_user_turn_outcome=compressed_user_turn_outcome,
                 messages_before_compression=messages_before_compression, made_progress=_compression_made_progress,
                 attempt=attempt, verbatim_tail=verbatim_tail, defer_memory_commit=host_commit is not None,
-                prepared_candidate=prepared,
+                prepared_candidate=prepared, host_commit=host_commit,
                 # The reinserted copy keeps the original's _row_id/timestamp (production flush stamps
                 # both); carry exactly that one row so the commit rewinds the durable original instead
                 # of archiving it compacted=1 next to a fresh twin (display would show it twice). The

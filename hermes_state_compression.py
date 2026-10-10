@@ -249,7 +249,8 @@ class SessionCompressionMixin:
         system_prompt: str = None, cwd: str = None, profile_name: str = None,
         compression_lock_holder: str = None, require_compression_lease: bool = True,
         require_lease_refresh: bool = False, lease_ttl_seconds: float = 300.0,
-        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None) -> None:
+        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None,
+        route_before_commit=None) -> None:
         """Atomically close a parent and publish its durable compression child: closure, child row, and
         handoff commit in one transaction, so readers see the live parent or a complete child, never an
         ended parent with a missing/empty child. *watermark* (the parent's highest row already represented
@@ -335,6 +336,9 @@ class SessionCompressionMixin:
                 # A live continuation under an idle-sweep archive re-activates the chat; after the
                 # closure above the child is linked into the lineage walk (#117713).
                 self._unarchive_auto_archived_lineage(conn, child_session_id)
+            if route_before_commit is not None:
+                # A failed TUI registry write aborts the SQLite parent/child transaction.
+                route_before_commit(child_session_id)
         self._execute_transcript_write(_do, messages)
 
     def _write_sql_logged(self, op: str, session_id: str, sql: str, params) -> None:

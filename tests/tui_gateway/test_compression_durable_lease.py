@@ -3,16 +3,40 @@
 from __future__ import annotations
 
 import threading
+import types
 from copy import copy
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.context_compressor import SUMMARY_PREFIX
+from agent import conversation_compression as core
+from hermes_cli import active_sessions as active
 from hermes_cli.active_sessions import active_session_registry_snapshot, try_acquire_active_session
 from hermes_state import SessionDB
 from run_agent import AIAgent
 from tui_gateway import server
+from tui_gateway import session_compression
+
+
+def _resume_in_fresh_tui_record(monkeypatch, db, parent, expected):
+    """Exercise the actual session.resume admission and tip binding after a simulated restart."""
+    captured = {}
+
+    def make_agent(_sid, _key, session_id=None, **_kwargs):
+        captured["agent_session_id"] = session_id
+        return types.SimpleNamespace(model="test", provider="test")
+
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    monkeypatch.setattr(server, "_session_info", lambda *_a: {"model": "test", "tools": {}, "skills": {}})
+    monkeypatch.setattr(server, "_init_session", lambda *_a, **_kw: None)
+    response = server.handle_request(
+        {"id": "resume-after-fault", "method": "session.resume",
+         "params": {"session_id": parent, "eager_build": True}})
+    assert response["result"]["session_key"] == expected
+    assert captured["agent_session_id"] == expected
 
 
 def _real_session(tmp_path, monkeypatch, *, in_place=True):
@@ -191,6 +215,253 @@ def test_cancel_before_commit_leaves_real_db_and_memory_untouched(tmp_path, monk
         assert memory_calls == [] and "session:compress" not in hooks
         assert active_session_registry_snapshot(home) == []
     finally:
+        if session.get("active_session_lease") is not None:
+            session["active_session_lease"].release()
+        agent.close()
+        db.close()
+
+
+def test_rotated_registry_write_failure_rolls_back_child_and_can_restart(tmp_path, monkeypatch):
+    db, agent, session, before, home, compressor, hooks = _real_session(
+        tmp_path, monkeypatch, in_place=False)
+    parent = session["session_key"]
+    child = "child-transfer-write-fault"
+    compressor.compress.side_effect = lambda _messages, *_a, **_kw: [
+        {"role": "user", "content": SUMMARY_PREFIX + " earlier turns"}, before[-1].copy()]
+    real_write = active._write_entries
+
+    def reject_child(path, entries):
+        if any(row.get("session_id") == child for row in entries):
+            raise OSError("injected registry transfer write failure")
+        return real_write(path, entries)
+
+    try:
+        with patch.object(core, "mint_session_id", return_value=child), patch.object(
+                active, "_write_entries", side_effect=reject_child):
+            with pytest.raises(RuntimeError, match="persistence failed"):
+                with server._manual_compress_turn("ui", session):
+                    server._compress_session_history(session)
+        fresh = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert fresh.get_session(parent)["ended_at"] is None
+            assert fresh.get_session(child) is None
+            assert fresh.get_messages_as_conversation(parent) == before
+            assert fresh.resolve_resume_session_id(parent) == parent
+            _resume_in_fresh_tui_record(monkeypatch, fresh, parent, parent)
+        finally:
+            fresh.close()
+        assert agent.session_id == parent
+        assert session["session_key"] == parent and session["history_version"] == 0
+        assert session["history"] == before
+        assert active_session_registry_snapshot(home) == []
+        assert "session:compress" not in hooks
+        with server._manual_compress_turn("ui", session):
+            removed, _usage = server._compress_session_history(session)
+            assert removed > 0
+            server._sync_session_key_after_compress("ui", session, restart_slash_worker=False)
+        retry_child = session["session_key"]
+        assert retry_child != parent and agent.session_id == retry_child
+        assert db.get_session(retry_child) is not None
+        assert [row["session_id"] for row in active_session_registry_snapshot(home)] == [retry_child]
+        assert hooks.count("session:compress") == 1
+    finally:
+        if session.get("active_session_lease") is not None:
+            session["active_session_lease"].release()
+        agent.close()
+        db.close()
+
+
+def test_in_place_prompt_write_failure_rolls_back_archive_and_hook(tmp_path, monkeypatch):
+    db, agent, session, before, home, compressor, hooks = _real_session(tmp_path, monkeypatch)
+    parent = session["session_key"]
+    compressor.compress.side_effect = lambda _messages, *_a, **_kw: [
+        {"role": "user", "content": SUMMARY_PREFIX + " earlier turns"}, before[-1].copy()]
+    try:
+        with patch.object(db, "_store_system_prompt", side_effect=OSError("injected prompt write failure")), \
+                patch.object(db, "update_system_prompt", side_effect=AssertionError("separate prompt write")):
+            with server._manual_compress_turn("ui", session):
+                with pytest.raises(RuntimeError, match="persistence failed"):
+                    server._compress_session_history(session)
+        fresh = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert fresh.get_messages_as_conversation(parent) == before
+            assert fresh.resolve_resume_session_id(parent) == parent
+        finally:
+            fresh.close()
+        assert session["history"] == before and session["history_version"] == 0
+        assert agent.session_id == session["session_key"] == parent
+        assert active_session_registry_snapshot(home) == []
+        assert "session:compress" not in hooks
+    finally:
+        if session.get("active_session_lease") is not None:
+            session["active_session_lease"].release()
+        agent.close()
+        db.close()
+
+
+@pytest.mark.parametrize("sqlite_commit_happened", [False, True])
+def test_registry_transfer_then_sqlite_commit_error_reconciles_from_readback(
+        tmp_path, monkeypatch, sqlite_commit_happened):
+    db, agent, session, before, home, compressor, hooks = _real_session(
+        tmp_path, monkeypatch, in_place=False)
+    parent = session["session_key"]
+    child = "child-ambiguous-sqlite-commit"
+    compressor.compress.side_effect = lambda _messages, *_a, **_kw: [
+        {"role": "user", "content": SUMMARY_PREFIX + " earlier turns"}, before[-1].copy()]
+    real_conn = db._conn
+    route_staged = False
+    fault_fired = False
+    real_stage = session_compression._TuiCompressionCommit.stage_route_before_sqlite_commit
+
+    def stage_route(commit, child_id):
+        nonlocal route_staged
+        real_stage(commit, child_id)
+        route_staged = True
+
+    class CommitFaultConnection:
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+        def commit(self):
+            nonlocal fault_fired
+            if route_staged and not fault_fired:
+                fault_fired = True
+                if sqlite_commit_happened:
+                    real_conn.commit()
+                raise OSError("injected SQLite COMMIT result failure")
+            return real_conn.commit()
+
+    try:
+        db._conn = CommitFaultConnection()
+        with patch.object(core, "mint_session_id", return_value=child), patch.object(
+                session_compression._TuiCompressionCommit, "stage_route_before_sqlite_commit", stage_route):
+            if sqlite_commit_happened:
+                with server._manual_compress_turn("ui", session):
+                    removed, _usage = server._compress_session_history(session)
+                    assert removed > 0
+                    server._sync_session_key_after_compress("ui", session, restart_slash_worker=False)
+            else:
+                with pytest.raises(RuntimeError, match="persistence failed"):
+                    with server._manual_compress_turn("ui", session):
+                        server._compress_session_history(session)
+        assert route_staged and fault_fired
+        db._conn = real_conn
+        fresh = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            if sqlite_commit_happened:
+                assert fresh.get_session(parent)["end_reason"] == "compression"
+                assert fresh.get_session(child) is not None
+                assert len(fresh.get_messages_as_conversation(child)) == len(session["history"]) < len(before)
+                assert fresh.resolve_resume_session_id(parent) == child
+                _resume_in_fresh_tui_record(monkeypatch, fresh, parent, child)
+            else:
+                assert fresh.get_session(parent)["ended_at"] is None
+                assert fresh.get_session(child) is None
+                assert fresh.get_messages_as_conversation(parent) == before
+                assert fresh.resolve_resume_session_id(parent) == parent
+                _resume_in_fresh_tui_record(monkeypatch, fresh, parent, parent)
+        finally:
+            fresh.close()
+        expected = child if sqlite_commit_happened else parent
+        assert agent.session_id == session["session_key"] == expected
+        assert session["history_version"] == int(sqlite_commit_happened)
+        assert hooks.count("session:compress") == int(sqlite_commit_happened)
+        rows = active_session_registry_snapshot(home)
+        assert [row["session_id"] for row in rows] == ([child] if sqlite_commit_happened else [])
+        if sqlite_commit_happened:
+            assert rows[0]["lease_id"] == session["active_session_lease"].lease_id
+    finally:
+        db._conn = real_conn
+        if session.get("active_session_lease") is not None:
+            session["active_session_lease"].release()
+        agent.close()
+        db.close()
+
+
+@pytest.mark.parametrize("fault", ["unreadable_sqlite", "failed_registry_compensation"])
+def test_unresolved_commit_fault_blocks_live_route_and_restart_resolves_from_db(
+        tmp_path, monkeypatch, fault):
+    db, agent, session, before, home, compressor, hooks = _real_session(
+        tmp_path, monkeypatch, in_place=False)
+    parent = session["session_key"]
+    child = "child-unresolved-commit"
+    compressor.compress.side_effect = lambda _messages, *_a, **_kw: [
+        {"role": "user", "content": SUMMARY_PREFIX + " earlier turns"}, before[-1].copy()]
+    real_conn = db._conn
+    real_stage = session_compression._TuiCompressionCommit.stage_route_before_sqlite_commit
+    real_get = db.get_session
+    real_write = active._write_entries
+    staged = False
+    fired = False
+
+    def stage_route(commit, child_id):
+        nonlocal staged
+        real_stage(commit, child_id)
+        staged = True
+
+    def get_with_fault(session_id):
+        if fault == "unreadable_sqlite" and staged:
+            raise OSError("injected readback failure")
+        return real_get(session_id)
+
+    def write_with_fault(path, entries):
+        if (fault == "failed_registry_compensation" and staged
+                and any(row.get("session_id") == parent for row in entries)):
+            raise OSError("injected compensation write failure")
+        return real_write(path, entries)
+
+    class CommitFaultConnection:
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+        def commit(self):
+            nonlocal fired
+            if staged and not fired:
+                fired = True
+                raise OSError("injected SQLite COMMIT failure")
+            return real_conn.commit()
+
+    try:
+        db._conn = CommitFaultConnection()
+        with patch.object(core, "mint_session_id", return_value=child), patch.object(
+                session_compression._TuiCompressionCommit, "stage_route_before_sqlite_commit", stage_route), \
+                patch.object(db, "get_session", side_effect=get_with_fault), \
+                patch.object(active, "_write_entries", side_effect=write_with_fault):
+            with pytest.raises(RuntimeError, match="persistence failed"):
+                with server._manual_compress_turn("ui", session):
+                    server._compress_session_history(session)
+        db._conn = real_conn
+        assert staged and fired and session["_compression_faulted"] is True
+        assert server._ensure_active_session_slot("ui", session) is not None
+        assert server._prove_active_session_slot("ui", session) is not None
+        old_runtime = server._sessions.get("ui")
+        server._sessions["ui"] = session
+        try:
+            refused = server.handle_request(
+                {"id": "faulted-prompt", "method": "prompt.submit",
+                 "params": {"session_id": "ui", "text": "continue"}})
+            assert refused["error"]["code"] == 4090
+        finally:
+            if old_runtime is None:
+                server._sessions.pop("ui", None)
+            else:
+                server._sessions["ui"] = old_runtime
+        with pytest.raises(RuntimeError, match="could not safely reserve"):
+            with server._manual_compress_turn("ui", session):
+                pass
+        assert session["history"] == before and session["history_version"] == 0
+        assert "session:compress" not in hooks
+        fresh = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert fresh.get_session(parent)["ended_at"] is None
+            assert fresh.get_session(child) is None
+            assert fresh.resolve_resume_session_id(parent) == parent
+            assert fresh.get_messages_as_conversation(parent) == before
+            _resume_in_fresh_tui_record(monkeypatch, fresh, parent, parent)
+        finally:
+            fresh.close()
+    finally:
+        db._conn = real_conn
         if session.get("active_session_lease") is not None:
             session["active_session_lease"].release()
         agent.close()

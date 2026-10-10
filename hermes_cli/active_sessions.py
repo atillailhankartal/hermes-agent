@@ -447,6 +447,19 @@ class _ActiveSessionLeaseCommit:
         # Borrowed compute-host tokens move locally; only the parent can retarget its real row.
         self.lease.session_id = target
 
+    def current_session_id(self) -> str:
+        """Read back the pinned row while its caller still holds the registry file lock."""
+        entries = _read_entries(self.state_path, strict=True)
+        lease_id = str(self.lease.lease_id)
+        if not self.lease.enabled:
+            lease_id = lease_id.removeprefix("borrowed:")
+        row = next((entry for entry in entries
+                    if str(entry.get("lease_id") or "") == lease_id), None)
+        if row is None:
+            raise ActiveSessionRegistryError("active session lease disappeared during commit")
+        self.entries, self.row = entries, row
+        return str(row.get("session_id") or "")
+
 
 @contextmanager
 def active_session_lease_guard(

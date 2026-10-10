@@ -254,6 +254,7 @@ class _TuiCompressionCommit:
         self.supported = False
         self.entered = False
         self.published = False
+        self._route_staged = None
         self._registry_guard = None
         self._owner = None
 
@@ -294,15 +295,54 @@ class _TuiCompressionCommit:
         if not new_key:
             raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE)
         if new_key != self.key:
-            try:
-                self._owner.transfer(new_key, metadata=_lease_metadata(self.sid))
-            except ActiveSessionRegistryError as exc:
-                raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE) from exc
+            if self._route_staged != new_key:
+                try:
+                    self._owner.transfer(new_key, metadata=_lease_metadata(self.sid))
+                except ActiveSessionRegistryError as exc:
+                    raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE) from exc
             session["session_key"] = new_key
             session["_compression_route_from"] = self.key
         session["history"] = commit.compressed
         session["history_version"] = self.history_version + 1
         self.published = True
+
+    def stage_route_before_sqlite_commit(self, child_id: str) -> None:
+        """Transfer the pinned JSON row while SQLite can still roll its child back."""
+        self._owner.transfer(child_id, metadata=_lease_metadata(self.sid))
+        self._route_staged = child_id
+
+    def reconcile_failed_rotation(self, agent, child_id: str) -> bool:
+        """Resolve a SQLite COMMIT error before leaving the registry lock.
+
+        True means the child actually committed and can finish publishing. False means
+        SQLite rolled back and any staged registry transfer was compensated to A.
+        """
+        try:
+            child = agent._session_db.get_session(child_id)
+            parent = agent._session_db.get_session(self.key)
+            row_key = self._owner.current_session_id()
+            committed = (child is not None and parent is not None
+                         and child.get("parent_session_id") == self.key
+                         and parent.get("end_reason") == "compression")
+            rolled_back = (child is None and parent is not None and parent.get("ended_at") is None)
+            if committed:
+                if self._owner.lease.enabled and row_key != child_id:
+                    raise RuntimeError("committed child has no matching active-session route")
+                self._owner.lease.session_id = child_id
+                self._route_staged = child_id
+                return True
+            if rolled_back:
+                if row_key not in {self.key, child_id}:
+                    raise RuntimeError("active-session route changed during rollback")
+                if self._owner.lease.enabled and row_key != self.key:
+                    self._owner.transfer(self.key, metadata=_lease_metadata(self.sid))
+                self._owner.lease.session_id = self.key
+                self._route_staged = None
+                return False
+            raise RuntimeError("compression SQLite outcome is ambiguous")
+        except BaseException:
+            self.session["_compression_faulted"] = True
+            raise
 
 
 @contextlib.contextmanager
