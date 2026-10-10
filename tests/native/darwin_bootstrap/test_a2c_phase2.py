@@ -60,7 +60,10 @@ def observe_barrier(parts, process, stage, final, observer, mode, reject, attemp
         expected_fds = list(range(7)) if checkpoint == 3 else [0, 1, 2, 3, 4, 6]
         if sorted(info["fds"]) != expected_fds:
             failures.append(f"live descriptor mismatch: {info}")
-        info["artifact_sha256"] = hashlib.sha256(expected.read_bytes()).hexdigest()
+        info["frozen_sha256"] = snapshots[0][str(expected)]
+        info["artifact_sha256"] = hashlib.sha256(Path(info["path"]).read_bytes()).hexdigest()
+        if info["artifact_sha256"] != info["frozen_sha256"]:
+            failures.append("live digest differs from frozen artifact")
     if mode == "a_death" and checkpoint == 4:
         os.kill(attempt, signal.SIGKILL)
         records.append("HARNESS A_KILLED_AT_LIVE_F")
@@ -132,10 +135,46 @@ def handle_line(line, process, stage, final, observer, mode, reject, parked, att
         if parked:
             kill_parked_parent(process, observer, attempt, records, failures)
             parent_killed = True
+    if parts[:2] in (["AUDIT", "PREFINAL"], ["AUDIT", "POST_X"]):
+        kill_parked_parent(process, observer, attempt, records, failures)
+        parent_killed = True
     if parts[:1] == ["BARRIER"]:
         child = observe_barrier(parts, process, stage, final, observer, mode, reject,
                                 attempt, records, snapshots, failures)
     return attempt, child, parent_killed
+
+
+def verify_late_loss(mode, parent_killed, child, records, failures):
+    if not parent_killed:
+        failures.append("late P death barrier missing")
+    if f"AUDIT RESULT {child} 0" not in records:
+        failures.append("actual A source result did not terminally reject")
+    expected = 53 << 8 if mode == "prefinal" else 0
+    if f"AUDIT REAP {child} {expected}" not in records:
+        failures.append("late P loss missing exact final reap")
+    forwarded = f"AUDIT FORWARD {child} 88" in records
+    if forwarded != (mode == "post_x"):
+        failures.append("unexpected final X ordering")
+
+
+def freeze_artifacts(stage, final, mode):
+    frozen = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (stage, final)}
+    if mode == "digest_replace":
+        original = final.read_bytes()
+        saved = final.with_suffix(".saved")
+        saved.write_bytes(original)
+        saved.chmod(0o755)
+        final.write_bytes(original + b"CONTROLLED_SOURCE_DIGEST_NEGATIVE")
+    return frozen
+
+
+def verify_digest_negative(mode, records, failures):
+    if mode == "digest_replace":
+        if "live digest differs from frozen artifact" in failures:
+            failures.remove("live digest differs from frozen artifact")
+            records.append("DIGEST_NEGATIVE REJECTED")
+        else:
+            failures.append("changed live path digest falsely accepted")
 
 
 def run_case(parent, stage, final, observer, mode="normal", reject=False):
@@ -156,6 +195,7 @@ def run_case(parent, stage, final, observer, mode="normal", reject=False):
                 pass
         if mode == "closed_audit":
             os.close(reader)
+        frozen = freeze_artifacts(stage, final, mode)
         process = subprocess.Popen([str(parent), directory], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=writer, start_new_session=True)
         os.close(writer)
@@ -164,7 +204,7 @@ def run_case(parent, stage, final, observer, mode="normal", reject=False):
             selector.register(reader, selectors.EVENT_READ, "audit")
         selector.register(process.stdout, selectors.EVENT_READ, "parent")
         buffers = {"audit": b"", "parent": b""}
-        records, snapshots, failures = [], {}, []
+        records, snapshots, failures = [], {0: frozen}, []
         attempt = child = None
         parent_killed = False
         rescue = False
@@ -190,8 +230,12 @@ def run_case(parent, stage, final, observer, mode="normal", reject=False):
                 print("FAILURE_BEFORE_CLEANUP", json.dumps(records), flush=True)
                 os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=1)
-            verify_progress(parked, parent_killed, reject, mode, process, child, observer, records,
-                            snapshots, audit_lost, failures)
+            if mode in ("prefinal", "post_x"):
+                verify_late_loss(mode, parent_killed, child, records, failures)
+            else:
+                verify_progress(parked, parent_killed, reject, mode, process, child, observer, records,
+                                snapshots, audit_lost, failures)
+            verify_digest_negative(mode, records, failures)
             verify_fault_status(mode, child, attempt, observer, records, audit_lost, failures)
             if journal.read_bytes() != b"ATTEMPT_PENDING_SOURCE_ONLY\n":
                 failures.append("pending latch changed")
@@ -213,6 +257,9 @@ def run_case(parent, stage, final, observer, mode="normal", reject=False):
             process.wait(timeout=1)
             raise
         finally:
+            saved = final.with_suffix(".saved")
+            if saved.exists():
+                saved.replace(final)
             selector.close()
             if mode != "closed_audit":
                 os.close(reader)
@@ -256,7 +303,12 @@ def main():
             ("child_stop", [], True),
             ("report_loss", [], True),
             ("uncertain_reap", ["AUTO_REAP"], True),
+            ("prefinal", ["PARK_PREFINAL"], False),
+            ("post_x", ["PARK_POST_X"], False),
+            ("digest_replace", [], False),
         ]
+        if "--fix1-only" in sys.argv:
+            cases = cases[-3:]
         for suffix, faults, reject in cases:
             selected_stage = failed_stage if suffix in ("exec_fail", "full_status") else stage
             attempt, parent = build / ("attempt-" + suffix), build / ("parent-" + suffix)

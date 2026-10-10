@@ -305,9 +305,18 @@ int bh_a2c_phase2(struct bh_a2c_control *control, struct bh_a2a_root *root) {
     progress[0] = 4;
     if (!bh_a2c_send(3, progress, sizeof(progress), control->deadline_ms) ||
         !bh_a2c_guard(control, root, 4)) goto done;
+#ifdef BH_A2C_TEST_PARK_PREFINAL
+    AUDIT("PREFINAL", child, 0);
+    (void)raise(SIGSTOP);
+#endif
     message = 'X';
+    if (!bh_a2c_check_alive(control, root)) goto done;
     if (!bh_a2c_send(transport[0], &message, 1, control->deadline_ms)) goto done;
     AUDIT("FORWARD", child, message);
+#ifdef BH_A2C_TEST_PARK_POST_X
+    AUDIT("POST_X", child, 0);
+    (void)raise(SIGSTOP);
+#endif
     okay = 1;
 done:
     if (!okay) { control->terminal = 1; root->cancelled = 1; }
@@ -317,6 +326,9 @@ done:
     (void)signal(SIGCHLD, SIG_IGN);
 #endif
     if (!reap_child(child, &status)) return 0;
-    return okay && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!bh_a2c_check_alive(control, root)) okay = 0;
+    int result = okay && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    AUDIT("RESULT", child, result);
+    return result;
 }
 #endif
