@@ -239,6 +239,72 @@ class CompressionBusy(Exception):
     """Raised by _manual_compress_turn when a turn already holds the session; callers map it to their busy reply."""
 
 
+class _CompressionSnapshotStale(Exception):
+    """A host edit won during the slow summary; no durable compression may start."""
+
+
+class _TuiCompressionCommit:
+    """Pin the host route and registry row across the short core DB + TUI publication."""
+
+    def __init__(self, sid: str, session: dict, history_version: int):
+        self.sid = sid
+        self.session = session
+        self.key = str(session.get("session_key") or "")
+        self.history_version = history_version
+        self.supported = False
+        self.entered = False
+        self.published = False
+        self._registry_guard = None
+        self._owner = None
+
+    def __enter__(self):
+        from hermes_cli.active_sessions import ActiveSessionRegistryError, active_session_lease_guard
+
+        session = self.session
+        session["history_lock"].acquire()
+        try:
+            if (str(session.get("session_key") or "") != self.key
+                    or int(session.get("history_version", 0)) != self.history_version
+                    or str(getattr(session["agent"], "session_id", "") or "") != self.key):
+                raise _CompressionSnapshotStale()
+            self._registry_guard = active_session_lease_guard(
+                session.get("active_session_lease"), session_id=self.key,
+                live_session_id=self.sid, registry_home=session.get("profile_home"))
+            self._owner = self._registry_guard.__enter__()
+        except ActiveSessionRegistryError as exc:
+            session["history_lock"].release()
+            raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE) from exc
+        except BaseException:
+            session["history_lock"].release()
+            raise
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            return self._registry_guard.__exit__(exc_type, exc, traceback)
+        finally:
+            self.session["history_lock"].release()
+
+    def publish(self, agent, commit) -> None:
+        from hermes_cli.active_sessions import ActiveSessionRegistryError
+
+        session = self.session
+        new_key = str(agent.session_id or "")
+        if not new_key:
+            raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE)
+        if new_key != self.key:
+            try:
+                self._owner.transfer(new_key, metadata=_lease_metadata(self.sid))
+            except ActiveSessionRegistryError as exc:
+                raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE) from exc
+            session["session_key"] = new_key
+            session["_compression_route_from"] = self.key
+        session["history"] = commit.compressed
+        session["history_version"] = self.history_version + 1
+        self.published = True
+
+
 @contextlib.contextmanager
 def _manual_compress_turn(sid: str, session: dict):
     """Hold the session busy (``running``) for a whole manual compaction: snapshot, LLM summary, commit
@@ -298,13 +364,17 @@ def _compress_session_history(
     # RPC thread: bind the session cwd, or the boundary prompt rebuild resolves the backend's cwd and
     # persists a prompt every other process then rejects as stale runtime (fresh build, no tools pin).
     tokens = _set_session_context(session.get("session_key") or "", cwd=_session_cwd(session))
+    manual_sid = session.get("_manual_compress_sid")
+    host_commit = _TuiCompressionCommit(manual_sid, session, history_version) if manual_sid is not None else None
     def snapshot_is_current():
         with session["history_lock"]:
             return int(session.get("history_version", 0)) == history_version
 
     try:
         result = compress_now(agent, before_messages, request, task_id=session.get("session_key") or "default",
-                              snapshot_is_current=snapshot_is_current)
+                              snapshot_is_current=snapshot_is_current, host_commit=host_commit)
+    except _CompressionSnapshotStale:
+        return 0, _get_usage(agent)
     finally:
         _clear_session_context(tokens)
     if result.status == "preview":
@@ -314,9 +384,11 @@ def _compress_session_history(
         raise CompressionLockHeld(result.lock_holder)
     if result.status != "compressed":
         return 0, _get_usage(agent)
+    if host_commit is not None and host_commit.supported:
+        return (result.removed if host_commit.published else 0), _get_usage(agent)
     # The model-bound summary runs without history_lock or the registry file lock. Check the
     # original route again after it returns, before committing a changed transcript.
-    if (manual_sid := session.get("_manual_compress_sid")) is not None:
+    if manual_sid is not None:
         if (ownership_refusal := _prove_active_session_slot(manual_sid, session)) is not None:
             finalize_context_engine_compression_notification(agent, committed=False)
             raise RuntimeError(ownership_refusal)
@@ -353,17 +425,25 @@ def _sync_session_key_after_compress(
     post-turn auto-compression. ``restart_slash_worker``: False only when the caller manages the worker."""
     agent = session.get("agent")
     new_session_id = getattr(agent, "session_id", None) or ""
-    old_key = session.get("session_key", "") or ""
+    guarded_old_key = session.get("_compression_route_from")
+    old_key = guarded_old_key or session.get("session_key", "") or ""
     if not new_session_id or new_session_id == old_key:
         return
-    if not _transfer_active_session_slot(sid, session, new_session_id=new_session_id):
-        logger.warning(
-            "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
-            sid, old_key, new_session_id,
-        )
-        raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE)
-    # Even if the approval module fails to import, anchor session_key on the continuation id.
-    session["session_key"] = new_session_id
+    if guarded_old_key:
+        lease = session.get("active_session_lease")
+        if (str(session.get("session_key") or "") != new_session_id
+                or str(getattr(lease, "session_id", "") or "") != new_session_id):
+            raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE)
+        session.pop("_compression_route_from", None)
+    else:
+        if not _transfer_active_session_slot(sid, session, new_session_id=new_session_id):
+            logger.warning(
+                "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
+                sid, old_key, new_session_id,
+            )
+            raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE)
+        # Even if the approval module fails to import, anchor session_key on the continuation id.
+        session["session_key"] = new_session_id
     with contextlib.suppress(Exception):
         from tools import approval
         with contextlib.suppress(Exception):

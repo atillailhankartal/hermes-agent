@@ -3673,6 +3673,7 @@ def _commit_compaction(
     new_system_prompt: str, system_message: str, compressed_user_turn_outcome: str,
     messages_before_compression: Optional[list], made_progress: bool, attempt: _Attempt,
     verbatim_tail: Optional[list] = None, carried_messages: Optional[list] = None,
+    defer_memory_commit: bool = False, prepared_candidate: Optional[tuple] = None,
 ) -> _CommitOutcome:
     """Persist the compacted transcript: memory extraction, anti-growth guard, then the
     in-place archive or the parent->child rotation.
@@ -3691,15 +3692,19 @@ def _commit_compaction(
         try:
             # Memory extraction runs in BOTH modes: pre-compaction turns are summarized
             # away whether or not the id rotates.
-            agent.commit_memory_session(messages)
+            if not defer_memory_commit:
+                agent.commit_memory_session(messages)
 
             # Pop _compaction_tail tags before the size estimate / rotation: they must not
             # inflate anti-growth or reach the provider. Track ids: salvage may subset list.
-            _tail_tagged_ids = {id(m) for m in compressed if isinstance(m, dict) and m.pop("_compaction_tail", None)}
-            compressed, _refused_sp = _salvage_or_refuse_grown_transcript(
-                agent, messages, compressed, system_message=system_message, attempt_started_at=attempt.started_at,
-                attempt_snapshot=attempt.snapshot,
-            )
+            if prepared_candidate is None:
+                _tail_tagged_ids = {id(m) for m in compressed if isinstance(m, dict) and m.pop("_compaction_tail", None)}
+                compressed, _refused_sp = _salvage_or_refuse_grown_transcript(
+                    agent, messages, compressed, system_message=system_message, attempt_started_at=attempt.started_at,
+                    attempt_snapshot=attempt.snapshot,
+                )
+            else:
+                compressed, _refused_sp, _tail_tagged_ids = prepared_candidate
             if compressed is None:
                 return _CommitOutcome(
                     compressed=messages, refused_prompt=_refused_sp, commit_started_at=commit_started_at
@@ -4066,32 +4071,17 @@ def compress_context(
     bypass_cooldown: bool = False, defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None, verbatim_tail: Optional[list] = None,
     trigger: Optional[str] = None, snapshot_is_current: Optional[Callable[[], bool]] = None,
+    host_commit: Any = None,
 ) -> Tuple[list, str]:
-    """Compress conversation context and split the session in SQLite.
-    ``force`` (manual /compress) clears the summary-failure cooldown; ``bypass_cooldown`` (provider-proven
-    overflow) skips it once, breakers still apply. ``commit_fence`` stops a timed-out worker mutating session
-    state. Returns ``(messages, system_prompt)``; on abort input is unchanged, NOT split.
+    """Summarize context and commit to SQLite; return the transcript and rebuilt prompt.
 
-    Args: agent: The owning :class:`AIAgent`. messages: Current message history (will be summarised).
-    system_message: Current system prompt; used when compression needs a rebuilt cached prompt.
-    approx_tokens: Pre-compression token estimate, logged for ops. task_id: Tool task scope (used for
-    clearing file-read dedup state). focus_topic: Optional focus string for guided compression — the
-    summariser will prioritise preserving information related to this topic. Inspired by Claude Code's
-    ``/compact <focus>``. force: If True, bypass any active summary-failure cooldown. Set by the manual
-    ``/compress`` slash command so users can retry immediately after an auto-compress abort. Auto-compress
-    callers use the default ``False``. bypass_cooldown: If True, the automatic breaker gates ignore ONLY the
-    summary-failure cooldown for this attempt (#100661). Set by the provider-proven overflow recovery path:
-    the provider already rejected the request, so deferring until the cooldown lapses wedges the session.
-    Unlike ``force`` it does not clear the cooldown, and the ineffective/structural breakers still apply; a
-    failed attempt records its cooldown normally. defer_context_engine_notification: Delay the existing
-    context-engine hook until a manual host commits its outer history transaction. commit_fence: Optional
-    cooperative fence for executor callers that may time out. It prevents a late worker from mutating
-    session state after its caller has moved on. verbatim_tail: The exchanges ``/compress here N`` keeps
-    after ``messages``; an in-place commit stores them after the compacted head and returns head + tail.
-    trigger: Why this attempt runs (``"overflow"`` for provider-rejected requests); defaults to manual/auto
-    from ``force``. Feeds attempt telemetry only.
-    snapshot_is_current: Optional host snapshot validation after durable lease admission. This protects
-    edits completed before admission; it is not a substitute for the host's final publication fence.
+    ``force`` lets manual /compress bypass the summary cooldown. ``bypass_cooldown`` skips only
+    that cooldown for provider-proven overflow, leaving structural breakers intact.
+    ``commit_fence`` rejects a timed-out worker before mutation; ``snapshot_is_current`` checks
+    the host's early snapshot. ``host_commit`` pins the host's route through the later durable
+    commit and live publication. ``defer_context_engine_notification`` postpones the hook until
+    the host publishes. ``verbatim_tail`` preserves /compress here exchanges; ``trigger`` labels
+    attempt telemetry. On abort the input transcript remains unchanged.
     """
     attempt = _begin_compression_attempt(
         agent, force=force, defer_notification=defer_context_engine_notification, trigger=trigger,
@@ -4111,6 +4101,9 @@ def compress_context(
             agent, messages, system_message, commit_fence=commit_fence, attempt=attempt, approx_tokens=approx_tokens,
             task_id=task_id, force=force,
         )
+
+    if host_commit is not None:
+        host_commit.supported = True
 
     # All automatic entrypoints honor compressor cooldown/breaker state; hygiene's
     # fresh AIAgent loads the persisted streak via bind_session_state() first.
@@ -4253,16 +4246,23 @@ def compress_context(
         _fold_todo_snapshot(agent, compressed)
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(messages, compressed)
         new_system_prompt = _rebuild_system_prompt_at_boundary(agent, system_message)
-        commit = _commit_compaction(
-            agent, messages, compressed, in_place=in_place, lease=lease, new_system_prompt=new_system_prompt,
-            system_message=system_message, compressed_user_turn_outcome=compressed_user_turn_outcome,
-            messages_before_compression=messages_before_compression, made_progress=_compression_made_progress,
-            attempt=attempt, verbatim_tail=verbatim_tail,
-            # The reinserted copy keeps the original's _row_id/timestamp (production flush stamps
-            # both); carry exactly that one row so the commit rewinds the durable original instead
-            # of archiving it compacted=1 next to a fresh twin (display would show it twice). The
-            # todo fold / user-anchor rows added above are NOT carried: they keep their own class.
-            carried_messages=[reinserted_reply] if reinserted_reply is not None else None,
+        from agent.conversation_compression_host_commit import prepare_host_candidate, run_compaction_host_commit
+        commit = run_compaction_host_commit(
+            lambda prepared: _commit_compaction(
+                agent, messages, compressed, in_place=in_place, lease=lease, new_system_prompt=new_system_prompt,
+                system_message=system_message, compressed_user_turn_outcome=compressed_user_turn_outcome,
+                messages_before_compression=messages_before_compression, made_progress=_compression_made_progress,
+                attempt=attempt, verbatim_tail=verbatim_tail, defer_memory_commit=host_commit is not None,
+                prepared_candidate=prepared,
+                # The reinserted copy keeps the original's _row_id/timestamp (production flush stamps
+                # both); carry exactly that one row so the commit rewinds the durable original instead
+                # of archiving it compacted=1 next to a fresh twin (display would show it twice). The
+                # todo fold / user-anchor rows added above are NOT carried: they keep their own class.
+                carried_messages=[reinserted_reply] if reinserted_reply is not None else None,
+            ), host_commit=host_commit, agent=agent, messages=messages,
+            prepare_fn=lambda: prepare_host_candidate(compressed, lambda candidate: _salvage_or_refuse_grown_transcript(
+                agent, messages, candidate, system_message=system_message, attempt_started_at=attempt.started_at,
+                attempt_snapshot=attempt.snapshot)),
         )
         if commit.refused_prompt is not None:
             return messages, commit.refused_prompt

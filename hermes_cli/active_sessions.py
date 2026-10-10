@@ -415,11 +415,44 @@ class ActiveSessionLease:
         release_active_session(self)
 
 
+class _ActiveSessionLeaseCommit:
+    """Registry row already verified under its file lock; transfer without re-locking it."""
+
+    def __init__(self, lease: ActiveSessionLease, state_path: Path,
+                 entries: list[dict[str, Any]], row: dict[str, Any]):
+        self.lease = lease
+        self.state_path = state_path
+        self.entries = entries
+        self.row = row
+
+    def transfer(self, session_id: str, *, metadata: Optional[dict[str, Any]] = None) -> None:
+        target = str(session_id or "")
+        if not target:
+            raise ActiveSessionRegistryError("active session transfer target is empty")
+        if self.lease.enabled:
+            if any(entry is not self.row and str(entry.get("session_id") or "") == target
+                   for entry in self.entries):
+                raise ActiveSessionRegistryError("active session transfer target is already owned")
+            previous = self.row.copy()
+            self.row["session_id"] = target
+            self.row["updated_at"] = time.time()
+            if metadata:
+                self.row["metadata"] = _clean_metadata(metadata)
+            try:
+                _write_entries(self.state_path, self.entries)
+            except Exception:
+                self.row.clear()
+                self.row.update(previous)
+                raise
+        # Borrowed compute-host tokens move locally; only the parent can retarget its real row.
+        self.lease.session_id = target
+
+
 @contextmanager
 def active_session_lease_guard(
     lease: ActiveSessionLease | None, *, session_id: str, live_session_id: str,
     registry_home: str | Path | None = None,
-) -> Iterator[None]:
+) -> Iterator[_ActiveSessionLeaseCommit]:
     """Keep a verified lease row pinned while a caller performs a short history commit.
 
     Callers must not hold this file lock across an LLM/network call. A compute-host child may
@@ -442,13 +475,14 @@ def active_session_lease_guard(
         if lease_id == str(lease.lease_id):
             raise ActiveSessionRegistryError("active session borrow has no parent lease")
     with _FileLock(lock_path):
-        row = next((entry for entry in _read_entries(state_path, strict=True)
+        entries = _read_entries(state_path, strict=True)
+        row = next((entry for entry in entries
                     if str(entry.get("lease_id") or "") == lease_id), None)
         if (row is None or str(row.get("session_id") or "") != session_id
                 or str((row.get("metadata") or {}).get("live_session_id") or "") != live_session_id
                 or (lease.enabled and _registry_pid(row.get("pid")) != os.getpid())):
             raise ActiveSessionRegistryError("active session lease is not current")
-        yield
+        yield _ActiveSessionLeaseCommit(lease, state_path, entries, row)
 
 
 def _clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
