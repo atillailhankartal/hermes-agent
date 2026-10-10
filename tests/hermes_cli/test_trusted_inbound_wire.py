@@ -2,6 +2,7 @@
 import hashlib
 import os
 import socket
+import struct
 import threading
 import time
 
@@ -9,7 +10,7 @@ import pytest
 
 from hermes_cli.trusted_inbound_wire import (
     BHI1ProtocolError, BHI1Response, BHI1UnixClient, decode_request, decode_response,
-    encode_query_request,
+    encode_query_request, encode_request,
 )
 from hermes_cli.trusted_inbound_broker import NativeCandidateSnapshot, TrustedInboundBrokerClient
 
@@ -20,6 +21,111 @@ UNKNOWN_HEX = ("424849310000006200018400011748aed488b5e1a1a1f2d39dfe37765837d777
                "9a4bebe29bab6e8be12bcbf1000000000d70726f6f665f756e6b6e6f776e"
                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
                "ffffffff00000000")
+
+
+def _wire_string(value):
+    if value is None:
+        return struct.pack(">i", -1)
+    encoded = value.encode("utf-8")
+    return struct.pack(">i", len(encoded)) + encoded
+
+
+def _response_frame(request, status, *, optionals=None, expiry=-1, proof=b""):
+    optionals = (None,) * 8 if optionals is None else optionals
+    body = (struct.pack(">HBB", 1, request[10] | 0x80, 0) + request[12:44]
+            + bytes((status,)) + _wire_string("reason")
+            + b"".join(_wire_string(value) for value in optionals)
+            + struct.pack(">qI", expiry, len(proof)) + proof)
+    return b"BHI1" + struct.pack(">I", len(body)) + body
+
+
+REQUESTS = {
+    1: ("enrollment", "delivery", "cli", "profile", "session", "native",
+        "owner", "route", "boot", "origin", "digest"),
+    2: ("delivery", "enrollment", "capability", b"x" * 32),
+    3: ("delivery", "enrollment", "candidate", "native-event"),
+    4: ("delivery", "enrollment", "native-event", True),
+}
+ADMITTED_FIELDS = (None, None, None, "candidate", "proof", "issuer", "epoch", "signature")
+
+
+@pytest.mark.parametrize("kind", (1, 2, 3, 4))
+@pytest.mark.parametrize("status", (0, 1, 2, 3, 4))
+def test_response_status_kind_matrix_matches_bee_shape(kind, status):
+    request = encode_request(kind, *REQUESTS[kind])
+    optionals = ADMITTED_FIELDS if status == 2 else (None,) * 8
+    proof = b"canonical" if status == 2 else b""
+    frame = _response_frame(request, status, optionals=optionals, proof=proof)
+    valid = status in (0, 3, 4) or (status == 2 and kind in (3, 4))
+    if valid:
+        assert decode_response(frame, request).status == status
+    else:
+        with pytest.raises(BHI1ProtocolError):
+            decode_response(frame, request)
+
+
+@pytest.mark.parametrize(("kind", "optionals", "expiry"), [
+    (1, ("enrollment", "reserved", "capability", None, None, None, None, None), 1),
+    (2, (None, None, None, "candidate", None, None, None, None), -1),
+])
+def test_queued_shapes_required_by_bee_are_accepted(kind, optionals, expiry):
+    request = encode_request(kind, *REQUESTS[kind])
+    frame = _response_frame(request, 1, optionals=optionals, expiry=expiry)
+    assert decode_response(frame, request).status == 1
+
+
+@pytest.mark.parametrize(("kind", "status", "optionals", "expiry", "proof"), [
+    (4, 0, (None, None, None, "candidate", None, None, None, None), -1, b""),
+    (4, 3, (None,) * 8, 0, b""),
+    (4, 4, (None, None, None, "candidate", None, None, None, None), -1, b""),
+    (1, 1, ("enrollment", "reserved", "capability", None, None, None, None, None), -1, b""),
+    (1, 1, ("enrollment", "reserved", "capability", "candidate", None, None, None, None), 1, b""),
+    (2, 1, (None, None, None, "candidate", None, None, None, None), 0, b""),
+    (2, 1, (None, None, None, "candidate", "proof", None, None, None), -1, b""),
+    (4, 2, ("enrollment", None, None, "candidate", "proof", "issuer", "epoch", "signature"), -1, b"canonical"),
+    (4, 2, ADMITTED_FIELDS, -1, b""),
+    (4, 2, (None, None, None, "candidate", None, "issuer", "epoch", "signature"), -1, b"canonical"),
+])
+def test_malformed_response_shapes_rejected(kind, status, optionals, expiry, proof):
+    request = encode_request(kind, *REQUESTS[kind])
+    frame = _response_frame(request, status, optionals=optionals, expiry=expiry, proof=proof)
+    with pytest.raises(BHI1ProtocolError):
+        decode_response(frame, request)
+
+
+@pytest.mark.parametrize(("kind", "index"), [
+    (kind, index) for kind, count in ((1, 11), (2, 3), (3, 4), (4, 3))
+    for index in range(count)
+])
+def test_encode_request_rejects_every_empty_required_string(kind, index):
+    fields = list(REQUESTS[kind])
+    fields[index] = ""
+    with pytest.raises(BHI1ProtocolError):
+        encode_request(kind, *fields)
+
+
+@pytest.mark.parametrize(("kind", "index"), [
+    (kind, index) for kind, count in ((1, 11), (2, 3), (3, 4), (4, 3))
+    for index in range(count)
+])
+def test_decode_request_rejects_every_empty_string_with_valid_request_id(kind, index):
+    fields = list(REQUESTS[kind])
+    fields[index] = ""
+    delivery = fields[1] if kind == 1 else fields[0]
+    enrollment = fields[0] if kind == 1 else fields[1]
+    native_event = fields[3] if kind == 3 else fields[2] if kind == 4 else ""
+    want_proof = bool(fields[3]) if kind == 4 else False
+    id_material = (b"bee-hermes-ipc-v1\0" + bytes((kind,)) + _wire_string(delivery)
+                   + _wire_string(enrollment) + _wire_string(native_event)
+                   + bytes((want_proof,)))
+    request_id = hashlib.sha256(id_material).digest()
+    string_fields = fields[:3] if kind in (2, 4) else fields
+    suffix = fields[3] if kind == 2 else bytes((want_proof,)) if kind == 4 else b""
+    body = (struct.pack(">HBB", 1, kind, 0) + request_id
+            + b"".join(_wire_string(value) for value in string_fields) + suffix)
+    frame = b"BHI1" + struct.pack(">I", len(body)) + body
+    with pytest.raises(BHI1ProtocolError):
+        decode_request(frame)
 
 
 def test_query_matches_shared_exact_byte_vector():

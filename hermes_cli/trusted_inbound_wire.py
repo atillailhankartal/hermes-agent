@@ -141,6 +141,8 @@ def encode_request(kind: int, *fields) -> bytes:
     encoded = bytearray()
     for field_type, field in zip(schema, fields):
         if field_type == "s":
+            if field == "":
+                raise BHI1ProtocolError("empty required string")
             encoded.extend(_string(field))
         elif field_type == "h":
             if not isinstance(field, bytes) or len(field) != 32:
@@ -166,7 +168,10 @@ def decode_request(frame: bytes) -> BHI1Request:
     fields = []
     for field_type in REQUEST_FIELDS[kind]:
         if field_type == "s":
-            fields.append(reader.string())
+            value = reader.string()
+            if not value:
+                raise BHI1ProtocolError("empty required string")
+            fields.append(value)
         elif field_type == "h":
             fields.append(reader.take(32))
         else:
@@ -178,6 +183,27 @@ def decode_request(frame: bytes) -> BHI1Request:
     if _request_id(kind, tuple(fields)) != request_id:
         raise BHI1ProtocolError("request ID mismatch")
     return BHI1Request(kind, request_id, tuple(fields))
+
+
+def _valid_response_shape(kind: int, status: int, optionals: tuple,
+                          expires_at: int, proof: bytes) -> bool:
+    """Mirror Bee's HermesBrokerWireV1.ValidResponseShape contract."""
+    enrollment, reserved, capability, candidate, proof_id, key_id, epoch, signature = optionals
+    if status in (0, 3, 4):
+        return all(value is None for value in optionals) and expires_at == -1 and not proof
+    if status == 1:
+        if proof or any(value is not None for value in (proof_id, key_id, epoch, signature)):
+            return False
+        if kind == 1:
+            return (all(value is not None for value in (enrollment, reserved, capability))
+                    and candidate is None and expires_at > 0)
+        if kind == 2:
+            return (candidate is not None and enrollment is None and reserved is None
+                    and capability is None and expires_at == -1)
+        return False
+    return (status == 2 and kind in (3, 4) and enrollment is None and reserved is None
+            and capability is None and all(value is not None for value in optionals[3:])
+            and bool(proof))
 
 
 def decode_response(frame: bytes, request: bytes) -> BHI1Response:
@@ -196,14 +222,12 @@ def decode_response(frame: bytes, request: bytes) -> BHI1Response:
         raise BHI1ProtocolError("empty optional field")
     expires_at = reader.integer(">q")
     proof_size = reader.integer(">I")
-    if proof_size > MAX_BODY or (proof_size and status != 2):
+    if proof_size > MAX_BODY:
         raise BHI1ProtocolError("invalid proof length")
     proof = reader.take(proof_size)
     reader.finish()
-    if status == 2 and (not proof or any(value is None for value in optionals[3:])):
-        raise BHI1ProtocolError("incomplete admitted response")
-    if expected.kind != 1 and optionals[2] is not None:
-        raise BHI1ProtocolError("capability on data channel")
+    if not _valid_response_shape(expected.kind, status, optionals, expires_at, proof):
+        raise BHI1ProtocolError("invalid response shape")
     return BHI1Response(kind, request_id, status, reason, *optionals, expires_at, proof)
 
 
