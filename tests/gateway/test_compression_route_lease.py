@@ -506,6 +506,58 @@ async def test_actual_gateway_admission_keeps_heartbeat_before_route_write_finis
 
 
 @pytest.mark.asyncio
+async def test_final_route_lookup_keeps_heartbeat_while_store_lock_is_held(tmp_path, monkeypatch):
+    runner, store, entry, _source, token = await _runner(tmp_path, monkeypatch)
+    held = threading.Event()
+    release = threading.Event()
+    heartbeat_before_release = []
+    loop = asyncio.get_running_loop()
+    original_publish = store.publish_compression_child_route
+    original_lookup = store.lookup_by_session_key
+    holder = None
+    watchdog = threading.Timer(2.1, release.set)
+
+    def hold_store_lock():
+        with store._lock:
+            held.set()
+            assert release.wait(3)
+
+    def publish_then_hold(*args, **kwargs):
+        nonlocal holder
+        committed = original_publish(*args, **kwargs)
+        if committed:
+            holder = threading.Thread(target=hold_store_lock)
+            holder.start()
+            assert held.wait(3)
+            watchdog.start()
+        return committed
+
+    def observed_lookup(session_key):
+        loop.call_soon_threadsafe(
+            lambda: heartbeat_before_release.append(not release.is_set()),
+        )
+        return original_lookup(session_key)
+
+    monkeypatch.setattr(store, "publish_compression_child_route", publish_then_hold)
+    monkeypatch.setattr(store, "lookup_by_session_key", observed_lookup)
+    publish = asyncio.create_task(runner._hmwa_publish_compression_child_route(entry, "child", "route", 1))
+    try:
+        await asyncio.wait_for(publish, 5)
+        assert heartbeat_before_release == [True]
+        assert entry.session_id == "child"
+        assert token.session_id == "child"
+        assert json.loads((tmp_path / "sessions" / "sessions.json").read_text())["route"]["session_id"] == "child"
+    finally:
+        release.set()
+        watchdog.cancel()
+        if not publish.done():
+            publish.cancel()
+        if holder is not None:
+            await asyncio.to_thread(holder.join, 3)
+        runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
 async def test_inbound_pending_sentinel_blocks_duplicate_while_route_gate_is_held(tmp_path, monkeypatch):
     from gateway.run import _AGENT_PENDING_SENTINEL
 

@@ -458,8 +458,10 @@ class GatewayAgentCacheMixin:
                 committed = write.result()
                 if cancelled:
                     raise asyncio.CancelledError
+                routed_entry = (await self.async_session_store.lookup_by_session_key(session_entry.session_key)
+                                if committed else None)
                 if (not committed or not self._is_session_run_current(session_key, run_generation)
-                        or self.session_store.lookup_by_session_key(session_entry.session_key) is not session_entry
+                        or routed_entry is not session_entry
                         or session_entry.session_id != child_session_id):
                     raise RuntimeError("compression route changed during lease handoff")
             finally:
