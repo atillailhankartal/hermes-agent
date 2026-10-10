@@ -1856,8 +1856,8 @@ class CLITuiMixin:
         self._last_ctrl_c_time = 0  # double Ctrl+C force-exit tracking
 
         # Plugins get a CLI reference so they can inject messages.
-        from hermes_cli.plugins import get_plugin_manager
-        get_plugin_manager()._cli_ref = self
+        from hermes_cli.cli_plugin_admission import install_cli_admission_host
+        install_cli_admission_host(self)
 
         # Config file watcher — detect mcp_servers changes and auto-reload.
         from hermes_cli.config import get_config_path as _get_config_path
