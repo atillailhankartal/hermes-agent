@@ -1385,8 +1385,9 @@ class SessionStore(
             if entry is None:
                 return True
             candidate = entry.to_dict()
+            recoverable = not entry.route_claim_blocked or entry.route_claim_recoverable
             candidate.update(route_epoch=new_route_epoch(), route_claim_blocked=True,
-                             route_claim_recoverable=True)
+                             route_claim_recoverable=recoverable)
             try:
                 self._save_entry(session_key, entry_data=candidate, lock_held=True)
             except Exception:
@@ -1398,7 +1399,7 @@ class SessionStore(
                 return False
             entry.route_epoch = candidate["route_epoch"]
             entry.route_claim_blocked = True
-            entry.route_claim_recoverable = True
+            entry.route_claim_recoverable = recoverable
             return True
 
     def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:

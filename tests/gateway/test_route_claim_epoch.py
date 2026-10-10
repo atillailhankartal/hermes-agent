@@ -380,6 +380,10 @@ async def test_unleased_store_level_compression_repoint_stays_closed_to_bee(tmp_
     try:
         with gateway_route_scope(runner, "route", 1, entry.origin):
             assert claim_for_tool("B") is None
+            assert store.revoke_route_claim("route") is True
+            assert entry.route_claim_blocked is True
+            assert entry.route_claim_recoverable is False
+            assert claim_for_tool("B") is None
     finally:
         runner._turn_leases.release(token)
 
