@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime
 import json
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -607,4 +608,172 @@ async def test_inbound_pending_sentinel_blocks_duplicate_while_route_gate_is_hel
         for task in (first, second, publish):
             if task is not None and not task.done():
                 task.cancel()
+        runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_inbound_wait_releases_only_its_claim_and_allows_next_turn(tmp_path, monkeypatch):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, store, entry, source, token = await _runner(tmp_path, monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    claimed = asyncio.Event()
+    original_save = store._save_entry
+    first_lease, second_lease = Mock(), Mock()
+
+    def gated_save(*args, **kwargs):
+        if kwargs.get("entry_data", {}).get("session_id") == "child":
+            entered.set()
+            assert release.wait(3)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_save_entry", gated_save)
+    event = SimpleNamespace(source=source)
+    runner._hm_admit_event = AsyncMock(return_value=(event, source, True))
+    runner._hm_estop_gate = Mock(return_value=None)
+    runner._session_key_for_source = Mock(return_value="route")
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    runner._claim_active_session_slot = Mock(side_effect=[(first_lease, None), (second_lease, None)])
+    runner._hm_rescue_orphaned_fifo = Mock(return_value=(event, source, True))
+    runner._persist_active_agents = Mock(side_effect=claimed.set)
+    runner._handle_message_with_agent = AsyncMock(return_value="done")
+    runner._hm_handle_running_session_message = AsyncMock(return_value="busy")
+    runner._run_post_turn_hooks = AsyncMock()
+    runner._clear_durable_active_turn = AsyncMock()
+
+    publish = asyncio.create_task(runner._hmwa_publish_compression_child_route(entry, "child", "route", 1))
+    first = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        first = asyncio.create_task(runner._handle_message(event))
+        await asyncio.wait_for(claimed.wait(), 3)
+        state = runner._session_state("route")
+        assert state.turn.agent is _AGENT_PENDING_SENTINEL
+        assert state.turn.event is event
+        assert state.turn.lease is first_lease
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        first_lease.release.assert_called_once_with()
+        assert state.turn.agent is None
+        assert state.turn.lease is None
+
+        release.set()
+        await asyncio.wait_for(publish, 3)
+        assert await asyncio.wait_for(runner._handle_message(event), 3) == "done"
+        assert runner._handle_message_with_agent.await_count == 1
+        second_lease.release.assert_called_once_with()
+    finally:
+        release.set()
+        if first is not None and not first.done():
+            first.cancel()
+        if not publish.done():
+            publish.cancel()
+        runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_inbound_wait_does_not_release_replacement_slot(tmp_path, monkeypatch):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, store, entry, source, token = await _runner(tmp_path, monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    claimed = asyncio.Event()
+    original_save = store._save_entry
+    first_lease, replacement_lease = Mock(), Mock()
+    first_event = SimpleNamespace(source=source)
+    replacement_event = SimpleNamespace(source=source)
+
+    def gated_save(*args, **kwargs):
+        if kwargs.get("entry_data", {}).get("session_id") == "child":
+            entered.set()
+            assert release.wait(3)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_save_entry", gated_save)
+    runner._hm_admit_event = AsyncMock(return_value=(first_event, source, True))
+    runner._hm_estop_gate = Mock(return_value=None)
+    runner._session_key_for_source = Mock(return_value="route")
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    runner._claim_active_session_slot = Mock(return_value=(first_lease, None))
+    runner._hm_rescue_orphaned_fifo = Mock(return_value=(first_event, source, True))
+    runner._persist_active_agents = Mock(side_effect=claimed.set)
+
+    publish = asyncio.create_task(runner._hmwa_publish_compression_child_route(entry, "child", "route", 1))
+    first = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        first = asyncio.create_task(runner._handle_message(first_event))
+        await asyncio.wait_for(claimed.wait(), 3)
+        state = runner._session_state("route")
+        assert runner._release_running_agent_state("route") is True  # /new or /stop slot boundary
+        state.turn.agent = _AGENT_PENDING_SENTINEL
+        state.turn.event = replacement_event
+        state.turn.lease = replacement_lease
+        state.turn.started_ts = time.time()
+        persisted_before_cancel = runner._persist_active_agents.call_count
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert state.turn.agent is _AGENT_PENDING_SENTINEL
+        assert state.turn.event is replacement_event
+        assert state.turn.lease is replacement_lease
+        assert runner._persist_active_agents.call_count == persisted_before_cancel
+        first_lease.release.assert_called_once_with()
+        replacement_lease.release.assert_not_called()
+        release.set()
+        await asyncio.wait_for(publish, 3)
+    finally:
+        release.set()
+        if first is not None and not first.done():
+            first.cancel()
+        if not publish.done():
+            publish.cancel()
+        runner._release_running_agent_state("route")
+        runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["before_state", "setup", "marker_cancel"])
+async def test_inbound_claim_released_on_setup_error_or_marker_cancellation(tmp_path, monkeypatch, failure):
+    runner, _store, _entry, source, token = await _runner(tmp_path, monkeypatch)
+    event = SimpleNamespace(source=source)
+    active_lease = Mock()
+    runner._hm_admit_event = AsyncMock(return_value=(event, source, True))
+    runner._hm_estop_gate = Mock(return_value=None)
+    runner._session_key_for_source = Mock(return_value="route")
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    runner._claim_active_session_slot = Mock(return_value=(active_lease, None))
+    runner._hm_rescue_orphaned_fifo = Mock(return_value=(event, source, True))
+    runner._persist_active_agents = Mock()
+    runner._handle_message_with_agent = AsyncMock(return_value="done")
+    runner._run_post_turn_hooks = AsyncMock()
+    if failure == "before_state":
+        runner._sessions_map().pop("route", None)
+        runner._hm_rescue_orphaned_fifo = Mock(side_effect=RuntimeError("rescue failed"))
+        expected = RuntimeError
+    elif failure == "setup":
+        monkeypatch.setattr(
+            "hermes_cli.observability.shared_metrics_gateway.start_reply_clock",
+            Mock(side_effect=RuntimeError("clock setup failed")),
+        )
+        expected = RuntimeError
+    else:
+        runner._clear_durable_active_turn = AsyncMock(side_effect=asyncio.CancelledError)
+        expected = asyncio.CancelledError
+
+    try:
+        with pytest.raises(expected):
+            await runner._handle_message(event)
+        active_lease.release.assert_called_once_with()
+        assert runner._session_state("route").turn.agent is None
+        assert runner._session_state("route").turn.lease is None
+    finally:
         runner._turn_leases.release(token)

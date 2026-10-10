@@ -1201,6 +1201,27 @@ class GatewayInboundMixin(GatewayInboundEvictionMixin, GatewayPluginInjectionMix
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
             return event, source, is_internal
 
+    def _hm_release_pre_generation_claim(
+        self, session_key: str, claim_state: Any, event: Any, active_lease: Any,
+        started_ts: Optional[float],
+    ) -> None:
+        """Release only this inbound's pending slot when generation admission did not finish."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        current = self._peek_session_state(session_key)
+        if (claim_state is not None and current is claim_state
+                and current.turn.agent is _AGENT_PENDING_SENTINEL
+                and current.turn.event is event and current.turn.lease is active_lease
+                and current.turn.started_ts == started_ts):
+            self._release_running_agent_state(session_key)
+            return
+        # Before the sentinel is published, a setup error leaves the active-session lease local.
+        # Once a replacement owns the slot, its lease belongs to that replacement instead.
+        if active_lease is not None and (claim_state is None or
+                (current is claim_state and current.turn.agent is None)):
+            if current is not None and current is claim_state and current.turn.lease is active_lease:
+                current.turn.lease = None
+            active_lease.release()
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
@@ -1264,18 +1285,28 @@ class GatewayInboundMixin(GatewayInboundEvictionMixin, GatewayPluginInjectionMix
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             return _limit_message
 
-        event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
-
-        _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
-        _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
-        _claim_state.turn.event = event
-        _claim_state.turn.started_ts = time.time()
-        from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
-        start_reply_clock(source, internal=is_internal)
-        self._persist_active_agents()
-        _run_generation = await self._begin_session_run_generation_async(_quick_key)
+        _claim_state = None
+        _claimed_event = None
+        _claim_started_ts = None
+        try:
+            event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+            _claim_state = self._session_state(_quick_key)
+            _claimed_event = event
+            _claim_started_ts = time.time()
+            if _active_session_lease is not None:
+                _claim_state.turn.lease = _active_session_lease
+            _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+            _claim_state.turn.event = event
+            _claim_state.turn.started_ts = _claim_started_ts
+            from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
+            start_reply_clock(source, internal=is_internal)
+            self._persist_active_agents()
+            _run_generation = await self._begin_session_run_generation_async(_quick_key)
+        except BaseException:
+            self._hm_release_pre_generation_claim(
+                _quick_key, _claim_state, _claimed_event, _active_session_lease, _claim_started_ts,
+            )
+            raise
 
         try:
             if not is_internal:  # fail-open plugin consume, inside the claimed slot (#129958)
@@ -1303,23 +1334,18 @@ class GatewayInboundMixin(GatewayInboundEvictionMixin, GatewayPluginInjectionMix
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
-            # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
-            self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
-            # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
-            # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
-            # clears it only once the reply is in the delivery ledger (else a kill in between
-            # left neither marker nor ledger row and the persisted reply was never sent).
-            if not getattr(event, "_turn_marker_handoff", False):
-                await self._clear_durable_active_turn(event)
-            # Release only this turn's generation. Eviction may immediately admit a replacement
-            # through the cold path; an unconditional release here would then clear the replacement
-            # sentinel/agent and lease. Reset/stop release their stale slot before installing a
-            # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
-            self._release_running_agent_state(_quick_key, run_generation=_run_generation)
-            # Turn lease is keyed by (routing key, run generation) so this unwind can only free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                # One-shot restore (/moa, /model --once) and durable marker cleanup run on every
+                # exit. A second cancellation during marker I/O must still release both leases.
+                self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
+                if not getattr(event, "_turn_marker_handoff", False):
+                    await self._clear_durable_active_turn(event)
+            finally:
+                try:
+                    # Generation guard refuses to clear a replacement admitted after /new or /stop.
+                    self._release_running_agent_state(_quick_key, run_generation=_run_generation)
+                finally:
+                    self._release_turn_lease(_quick_key, _run_generation)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
