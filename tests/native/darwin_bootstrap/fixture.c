@@ -4,7 +4,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/proc_info.h>
-#include <libproc.h>
+#include "socket_observer.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -21,7 +21,7 @@
 #define DEADLINE_MS 3000
 struct observation {
     int phase, open_mask, cloexec_mask, unexpected_fds;
-    int acceptconn, path_matches, denial_errno, option_errno, proc_bytes;
+    int acceptconn, path_matches, denial_errno, option_errno;
     uid_t uid;
 };
 static char directory[] = "/tmp/hermes-fd6-XXXXXX";
@@ -128,11 +128,26 @@ static struct observation observe(int phase, const char *path)
     if (getsockopt(6, SOL_SOCKET, SO_ACCEPTCONN, &result.acceptconn, &size) != 0)
         result.option_errno = errno;
     if (strcmp(observation_mode, "libproc-observational") == 0) {
-        struct socket_fdinfo info = {0};
-        result.proc_bytes = proc_pidfdinfo(getpid(), 6, PROC_PIDFDSOCKETINFO, &info, sizeof(info));
-        result.acceptconn = result.proc_bytes == sizeof(info) && info.psi.soi_family == AF_UNIX &&
-            info.psi.soi_type == SOCK_STREAM && info.psi.soi_kind == SOCKINFO_UN
-            ? !!(info.psi.soi_options & SO_ACCEPTCONN) : -1;
+        /* Disposable consumer owns the directory FD only during observation.
+         * This does not establish protected namespace or launch provenance. */
+        char parent[sizeof(pathname)];
+        require(strlen(path) < sizeof(parent), "observer path");
+        memcpy(parent, path, strlen(path) + 1);
+        char *leaf = strrchr(parent, '/');
+        require(leaf != NULL, "observer basename");
+        *leaf++ = '\0';
+        int directory_fd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        struct bh_socket_expectation expected = {.directory_fd = directory_fd,
+            .basename = leaf, .pathname = path, .pathname_length = strlen(path)};
+        result.acceptconn = -1;
+        if (directory_fd >= 0) {
+            if (fstatat(directory_fd, leaf, &expected.node, AT_SYMLINK_NOFOLLOW) == 0) {
+                struct bh_socket_observation measured = bh_darwin_observe_fd6(&expected);
+                if (measured.state == BH_BOUND_OBSERVED) result.acceptconn = 0;
+                if (measured.state == BH_LISTENER_OBSERVED) result.acceptconn = 1;
+            }
+            require(close(directory_fd) == 0, "close observer directory");
+        }
     }
     struct sockaddr_un name = {0};
     size = sizeof(name);
@@ -280,9 +295,9 @@ static int launch(const char *self, int source, const char *fault, int channels[
 static void print_observation(const struct observation *item)
 {
     printf("{\"phase\":%d,\"open_mask\":%d,\"cloexec_mask\":%d,"
-           "\"unexpected_fds\":%d,\"acceptconn\":%d,\"path_matches\":%d,\"getsockopt_errno\":%d,\"proc_bytes\":%d,\"uid\":%u}",
+           "\"unexpected_fds\":%d,\"acceptconn\":%d,\"path_matches\":%d,\"getsockopt_errno\":%d,\"uid\":%u}",
            item->phase, item->open_mask, item->cloexec_mask, item->unexpected_fds,
-           item->acceptconn, item->path_matches, item->option_errno, item->proc_bytes, item->uid);
+           item->acceptconn, item->path_matches, item->option_errno, item->uid);
 }
 
 int main(int argc, char **argv)

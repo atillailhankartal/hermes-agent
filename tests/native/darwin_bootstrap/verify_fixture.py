@@ -4,6 +4,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -11,6 +12,12 @@ import tempfile
 import unittest
 
 SOURCE = Path(__file__).with_name("fixture.c")
+OBSERVER = SOURCE.parents[3] / "native/trusted_inbound/darwin"
+
+
+def check_build_budget(directory):
+    assert shutil.disk_usage(directory).free > 20 * 1024**3 + 64 * 1024**2
+    assert sum(p.stat().st_size for p in Path(directory).rglob("*") if p.is_file()) < 64 * 1024**2
 
 
 def run_case(executable, slot=6, fault="none", mode="libproc-observational"):
@@ -41,16 +48,20 @@ class NativeFixtureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.build = tempfile.TemporaryDirectory(prefix="darwin-fd6-build-")
+        cls.addClassCleanup(cls.build.cleanup)
         cls.executable = Path(cls.build.name) / "fixture"
+        check_build_budget(cls.build.name)
         result = subprocess.run(
             ["/usr/bin/xcrun", "clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
-             "-pedantic", "-O1", str(SOURCE), "-o", str(cls.executable)],
+             "-pedantic", "-O1", "-I" + str(OBSERVER), str(SOURCE),
+             str(OBSERVER / "socket_observer.c"), "-o", str(cls.executable)],
             capture_output=True, text=True, timeout=30, check=False,
         )
         if result.returncode or result.stderr:
             cls.build.cleanup()
             raise AssertionError(result.stderr)
         cls.probe = Path(cls.build.name) / "socket-state-probe"
+        check_build_budget(cls.build.name)
         probe_result = subprocess.run(
             ["/usr/bin/xcrun", "clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
              "-pedantic", "-O1", str(SOURCE.with_name("socket_state_probe.c")),
@@ -60,6 +71,31 @@ class NativeFixtureTests(unittest.TestCase):
         if probe_result.returncode or probe_result.stderr:
             cls.build.cleanup()
             raise AssertionError(probe_result.stderr)
+
+        cls.observer = Path(cls.build.name) / "socket-observer-test"
+        check_build_budget(cls.build.name)
+        observer_result = subprocess.run(
+            ["/usr/bin/xcrun", "clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
+             "-pedantic", "-O1", "-I" + str(OBSERVER),
+             str(SOURCE.with_name("test_socket_observer.c")), "-o", str(cls.observer)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if observer_result.returncode or observer_result.stderr:
+            cls.build.cleanup()
+            raise AssertionError(observer_result.stderr)
+        check_build_budget(cls.build.name)
+
+    def test_dormant_observer_real_fd6_and_private_validator(self):
+        result = subprocess.run([str(self.observer)], capture_output=True, text=True,
+                                timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertLess(len(result.stdout.encode()), 16384)
+        data = json.loads(result.stdout)
+        self.assertGreaterEqual(data["checks"], 80)
+        self.assertEqual(data["failures"], 0)
+        self.assertTrue(data["cleanup"])
+        self.assertFalse(Path(data["directory"]).exists())
 
     @classmethod
     def tearDownClass(cls):

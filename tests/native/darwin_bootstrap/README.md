@@ -9,7 +9,7 @@ Run with the existing system Python and Xcode toolchain:
 python3 tests/native/darwin_bootstrap/verify_fixture.py
 ```
 
-The runner compiles two tiny native executables with `-Wall -Wextra -Werror
+The runner compiles three tiny native executables with `-Wall -Wextra -Werror
 -pedantic`, uses real spawn/exec/socket calls, checks bounded JSON, and removes its
 own build directory. Each fixture creates a unique `/tmp/hermes-fd6-*` directory,
 checks recorded pathname device/inode/type before unlink and reaps its child.
@@ -26,7 +26,8 @@ listen. The original positive path is **UNAVAILABLE**; this fixture rejects it
 before READY. A passing rejection test does not make that positive path pass.
 
 `fixture <slot> <fault> libproc-observational` is an explicitly selected candidate
-experiment. It requires exactly `sizeof(struct socket_fdinfo)` bytes from public
+experiment. It now calls the dormant `native/trusted_inbound/darwin` observer,
+retaining a no-follow directory FD during each measurement. That module requires exactly `sizeof(struct socket_fdinfo)` bytes from public
 `proc_pidfdinfo(getpid(), fd, PROC_PIDFDSOCKETINFO, ...)`, checks AF_UNIX,
 SOCK_STREAM and SOCKINFO_UN, then reads `psi.soi_options & SO_ACCEPTCONN`.
 `socket_state_probe.c` independently measures bound=0/empty-listener=1/queued-listener=1
@@ -58,7 +59,8 @@ resistance to a malicious same-UID owner capable of chmod.
 
 ## Evidence and open gates
 
-The six unittest methods include collision and failure subcases. The original
+The seven unittest methods include collision and failure subcases plus the dormant
+observer test. The original
 strict-path RED is retained separately. Source-bound Bee QA may run this runner;
 Bee C# analysis does not cover C. The Hermes pytest runner is unavailable with the
 existing system Python 3.9 (`tomllib` missing); no packages are installed here.
@@ -76,3 +78,22 @@ Primary source: Apple XNU commit
 [`socket_info.c`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/socket_info.c)
 and [`uipc_usrreq.c`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/uipc_usrreq.c).
 The pinned source is supporting provenance; the observed host is a newer kernel.
+
+## Stage A1 dormant observer
+
+The extra C test exercises actual bound/empty/queued FD6, closed/non-socket/regular/
+datagram/connected/unbound/wrong-path cases, denied/missing/no-follow metadata,
+unchanged flags and retained queue. It also calls the same private production
+validator with deterministic malformed size/field/identity records. These synthetic
+cases are parsing evidence, not physical MACF policy coverage. The test emits only
+counts, cleanup and its own disposable directory. The observer exposes only enum
+state/reason. Fixture `proc_bytes` output was removed; independent probe output
+still carries measured read lengths.
+
+The existing lifecycle fixture opens its own directory only after its descriptor
+inventory and closes it before reporting; it does not add a privileged inherited
+FD or claim namespace provenance. Its mock READY remains test-local. The independent
+Fix4 `socket_state_probe.c` is unchanged. See the native component README for exact
+ABI/runtime pins, source limits and remaining acceptance gates. Build allowance
+is 64MiB, with a 20GiB reserve checked before compilation; no environment install,
+container, shared cache cleanup or product activation is part of this runner.
