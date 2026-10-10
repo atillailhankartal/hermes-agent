@@ -70,6 +70,25 @@ async def _agent_result(runner, entry, source):
     )
 
 
+@pytest.mark.asyncio
+async def test_agent_result_in_place_compaction_mints_durable_epoch(tmp_path, monkeypatch):
+    runner, store, entry, source, token = await _runner(tmp_path, monkeypatch)
+    old_epoch = entry.route_epoch
+    runner._clear_restart_failure_count = AsyncMock()
+    try:
+        await runner._hmwa_shape_agent_response(
+            {"final_response": "done", "session_id": "old", "compacted_in_place": True,
+             "messages": [], "api_calls": 1},
+            source, _HISTORY, entry, "route", "route", 1, "old", "telegram", 0.0,
+        )
+        assert entry.session_id == "old"
+        assert entry.route_epoch != old_epoch
+        reopened = SessionStore(tmp_path / "sessions", GatewayConfig())
+        assert reopened.lookup_by_session_key("route").route_epoch == entry.route_epoch
+    finally:
+        runner._turn_leases.release(token)
+
+
 async def _run_sync_split(runner, source, monkeypatch, *, failed=False):
     """Drive the real executor body while replacing only model/progress plumbing."""
     agent = SimpleNamespace(session_id="child", _last_compaction_in_place=False)

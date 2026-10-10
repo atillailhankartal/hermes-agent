@@ -125,6 +125,30 @@ async def test_host_claim_fences_old_a_before_first_b_tool_and_allows_resumed_a(
 
 
 @pytest.mark.asyncio
+async def test_in_place_compaction_revokes_in_flight_claim_before_next_tool(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    token = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = token
+    agent = SimpleNamespace(_last_compaction_in_place=False)
+    try:
+        with gateway_route_scope(runner, "route", 1, entry.origin, agent_holder=[agent]):
+            old = claim_for_tool("A")
+            assert old is not None and old.is_current()
+            agent._last_compaction_in_place = True
+            assert old.is_current() is False
+            assert claim_for_tool("A") is None
+            assert store.publish_in_place_compaction_epoch("route", entry, "A") is True
+            assert old.is_current() is False
+    finally:
+        runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
 async def test_bee_tool_dispatch_gets_private_current_claim_not_model_args(tmp_path, monkeypatch):
     from model_tools import _CallIds, _execute_tool
     from model_tools import registry

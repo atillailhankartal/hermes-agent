@@ -1853,7 +1853,9 @@ class TurnRunner:
         """Bind one host-issued Gateway route scope for the executor and tool workers."""
         from gateway.route_claim import gateway_route_scope
         ctx = self._ctx
-        with gateway_route_scope(self._runner, ctx.session_key, ctx.run_generation, ctx.source):
+        with gateway_route_scope(
+            self._runner, ctx.session_key, ctx.run_generation, ctx.source, agent_holder=ctx.agent_holder,
+        ):
             return self._run_sync_inner()
 
     def _run_sync_inner(self):

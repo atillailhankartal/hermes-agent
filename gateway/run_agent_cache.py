@@ -467,6 +467,35 @@ class GatewayAgentCacheMixin:
             finally:
                 self._end_compression_lease_handoff(session_key, run_generation)
 
+    async def _hmwa_publish_in_place_compaction_epoch(
+        self, session_entry, session_key, run_generation,
+    ) -> None:
+        """Rotate the durable route epoch after a same-ID compaction under the held A lease."""
+        async with self._session_route_gate(session_key):
+            held = self._held_turn_lease(session_key, run_generation)
+            if not self._is_session_run_current(session_key, run_generation) or held is None:
+                raise RuntimeError("in-place compaction route lost its turn lease")
+            token = held[1].get(run_generation)
+            native_id = session_entry.session_id
+            if (token is None or token.released or token.lease.holder is not token
+                    or token.owner_key != session_key or token.session_id != native_id):
+                raise RuntimeError("in-place compaction route lost its turn lease")
+            write = asyncio.create_task(self.async_session_store.publish_in_place_compaction_epoch(
+                session_entry.session_key, session_entry, native_id,
+            ))
+            cancelled = False
+            while not write.done():
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    cancelled = True
+            committed = write.result()
+            if cancelled:
+                raise asyncio.CancelledError
+            if (not committed or not self._is_session_run_current(session_key, run_generation)
+                    or session_entry.session_id != native_id):
+                raise RuntimeError("in-place compaction route changed during publication")
+
     def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
         """THE single conversation-boundary funnel (/new, /resume, suspension replacement,
         compression-exhausted reset). New conversation-scoped dicts go in _CONVERSATION_SCOPED_STATE

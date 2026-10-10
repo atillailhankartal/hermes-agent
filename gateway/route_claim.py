@@ -49,13 +49,16 @@ class _BoundGatewayRoute:
     run_generation: int
     profile_home_key: str
     profile_matches: bool
+    agent_holder: Any = None
 
 
 _BOUND_ROUTE: ContextVar[Optional[_BoundGatewayRoute]] = ContextVar("gateway_host_route", default=None)
 
 
 @contextmanager
-def gateway_route_scope(runner: Any, session_key: str, run_generation: int, source: Any) -> Iterator[None]:
+def gateway_route_scope(
+    runner: Any, session_key: str, run_generation: int, source: Any, *, agent_holder: Any = None,
+) -> Iterator[None]:
     """Bind private host authority only for one executor turn and its copied tool contexts."""
     actual_home = hermes_home_key(get_hermes_home())
     try:
@@ -64,7 +67,7 @@ def gateway_route_scope(runner: Any, session_key: str, run_generation: int, sour
         logger.debug("Gateway route profile resolution failed", exc_info=True)
         expected_home = ""
     token = _BOUND_ROUTE.set(_BoundGatewayRoute(
-        runner, session_key, run_generation, actual_home, actual_home == expected_home,
+        runner, session_key, run_generation, actual_home, actual_home == expected_home, agent_holder,
     ))
     try:
         yield
@@ -85,6 +88,11 @@ def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
     runner, key, generation = bound.runner, bound.session_key, bound.run_generation
     store = runner.session_store
 
+    def compacted_in_place() -> bool:
+        holder = bound.agent_holder
+        agent = holder[0] if holder else None
+        return bool(agent and getattr(agent, "_last_compaction_in_place", False))
+
     def owns_turn() -> bool:
         if not runner._is_session_run_current(key, generation):
             return False
@@ -95,7 +103,7 @@ def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
         return bool(token and not token.released and token.lease.holder is token
                     and token.session_id == native_session_id)
 
-    if getattr(store, "_route_owner_retired", False) or not owns_turn():
+    if getattr(store, "_route_owner_retired", False) or compacted_in_place() or not owns_turn():
         return None
     with store._lock:
         entry = store._entry_locked(key)
@@ -114,7 +122,8 @@ def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
         return None
 
     def validate(claim: RouteClaim) -> bool:
-        if getattr(store, "_route_owner_retired", False) or not owns_turn() or claim._proof is not proof:
+        if (getattr(store, "_route_owner_retired", False) or compacted_in_place()
+                or not owns_turn() or claim._proof is not proof):
             return False
         if claim.profile_home_key != bound.profile_home_key or claim.surface != "gateway":
             return False

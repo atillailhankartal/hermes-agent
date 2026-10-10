@@ -1585,6 +1585,8 @@ class GatewayTurnMixin:
                     "moved from %s to %s before compression finished",
                     session_key or "?", _run_start_session_id, session_entry.session_id,
                 )
+        elif agent_result.get("compacted_in_place") and session_entry.session_id == _run_start_session_id:
+            await self._hmwa_publish_in_place_compaction_epoch(session_entry, _quick_key, run_generation)
         return response, _intentional_silence, agent_messages
 
     # reasoning_style → (header catalog key, per-line quote prefix for blank / non-blank lines)
