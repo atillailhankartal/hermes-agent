@@ -17,3 +17,9 @@ target_compile_options(bee_hermes_a2a PRIVATE -Wall -Wextra -Werror -pedantic)
 target_include_directories(bee_hermes_a2a PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # No install, service, CLI, Gateway, TUI or key/source admission target exists here.
+
+# Independent dormant metadata helper; deliberately not linked into A2a or a host.
+add_library(bee_hermes_a2b_fd7 STATIC broker_entry.c)
+target_compile_features(bee_hermes_a2b_fd7 PRIVATE c_std_11)
+target_compile_options(bee_hermes_a2b_fd7 PRIVATE -Wall -Wextra -Werror -pedantic)
+target_include_directories(bee_hermes_a2b_fd7 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
