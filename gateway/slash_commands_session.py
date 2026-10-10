@@ -156,7 +156,7 @@ class GatewaySessionCommandsMixin:
         """Handle /new or /reset command."""
         source = event.source
         session_key = self._session_key_for_source(source)
-        self._invalidate_session_run_generation(session_key, reason="session_reset")
+        await self._invalidate_session_run_generation_async(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped: the in-flight run's own
         # guarded release (old generation) returns False and would leave a zombie slot that silently
         # drops all later messages. Idempotent, so the run's finally calling it again is harmless.

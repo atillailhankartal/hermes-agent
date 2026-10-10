@@ -613,10 +613,10 @@ class SessionTranscriptMixin:
 
         The caller must already hold a turn lease rebound to ``child_session_id``. Keep the
         identity/CAS check, one-row durable write, and in-memory publication under the routing
-        lock. Gateway run generation changes use this same lock, so /new cannot invalidate the
-        owner between the pre-write check and live publication. No compressor or agent work runs
-        under this lock. A failed write leaves the parent route live; there is no second, fallible
-        compensation write after the child candidate has become durable.
+        lock. The Gateway caller holds its awaited per-session admission gate until the offloaded
+        write and live assignment finish, so /new cannot invalidate the owner mid-publication.
+        No compressor or agent work runs under this lock. A failed write leaves the parent route
+        live; there is no second, fallible compensation write after the child becomes durable.
         """
         if not session_key or not parent_session_id or not child_session_id:
             return False
