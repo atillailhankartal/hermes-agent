@@ -23,3 +23,13 @@ add_library(bee_hermes_a2b_fd7 STATIC broker_entry.c)
 target_compile_features(bee_hermes_a2b_fd7 PRIVATE c_std_11)
 target_compile_options(bee_hermes_a2b_fd7 PRIVATE -Wall -Wextra -Werror -pedantic)
 target_include_directories(bee_hermes_a2b_fd7 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Phase-1 mechanics executable only; no install or broker admission target.
+add_library(bee_hermes_a2c_phase1 STATIC a2c_policy.c launch_control.c)
+target_compile_features(bee_hermes_a2c_phase1 PRIVATE c_std_11)
+target_compile_options(bee_hermes_a2c_phase1 PRIVATE -Wall -Wextra -Werror -pedantic)
+target_link_libraries(bee_hermes_a2c_phase1 PUBLIC bee_hermes_a2a)
+add_executable(bee_hermes_a2c_attempt attempt_entry.c)
+target_compile_features(bee_hermes_a2c_attempt PRIVATE c_std_11)
+target_compile_options(bee_hermes_a2c_attempt PRIVATE -Wall -Wextra -Werror -pedantic)
+target_link_libraries(bee_hermes_a2c_attempt PRIVATE bee_hermes_a2c_phase1)
