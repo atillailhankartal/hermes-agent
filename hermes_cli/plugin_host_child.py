@@ -56,6 +56,41 @@ class RemoteRegistration:
         self._runtime.channel.call("dispose", {"handle": self._id})
 
 
+class RemoteRouteClaim:
+    """Public route coordinates with a callback-scoped, read-only parent check."""
+
+    __slots__ = ("_runtime", "_handle", "surface", "profile_home_key", "session_key",
+                 "native_session_id", "route_epoch", "host_owner_id")
+
+    def __init__(self, runtime: HostRuntime, handle: str, coordinates: dict[str, str]):
+        self._runtime, self._handle = runtime, handle
+        for name in ("surface", "profile_home_key", "session_key", "native_session_id",
+                     "route_epoch", "host_owner_id"):
+            setattr(self, name, coordinates[name])
+
+    def _check(self, operation: str) -> bool:
+        coordinates = {name: getattr(self, name) for name in (
+            "surface", "profile_home_key", "session_key", "native_session_id",
+            "route_epoch", "host_owner_id")}
+        try:
+            return self._runtime.channel.call("route_cap.check", {
+                "handle": self._handle, "operation": operation, "coordinates": coordinates,
+            }) is True
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    def is_current(self, *, profile_home_key: Optional[str] = None,
+                   session_key: Optional[str] = None, native_session_id: Optional[str] = None) -> bool:
+        if (profile_home_key is not None and profile_home_key != self.profile_home_key
+                or session_key is not None and session_key != self.session_key
+                or native_session_id is not None and native_session_id != self.native_session_id):
+            return False
+        return self._check("tool-current")
+
+    def is_route_current(self) -> bool:
+        return self._check("route-observe")
+
+
 class RemoteFacade:
     """``ctx.state`` / ``ctx.llm`` / ...: every method call runs on the Hermes-side facade."""
 
@@ -233,7 +268,17 @@ class HostRuntime:
         return encode(value, functools.partial(self.ref_for, plugin_key, allow_objects=False))
 
     def _decode_args(self, params: dict[str, Any]):
-        return decode(params.get("args") or [], None), decode(params.get("kwargs") or {}, None)
+        args = decode(params.get("args") or [], None)
+        kwargs = decode(params.get("kwargs") or {}, None)
+        route = kwargs.get("route_claim")
+        if (isinstance(route, dict) and set(route) == {"__route_cap__", "coordinates"}
+                and isinstance(route["__route_cap__"], str)
+                and isinstance(route["coordinates"], dict)):
+            route = kwargs["route_claim"] = RemoteRouteClaim(
+                self, route["__route_cap__"], route["coordinates"])
+            if kwargs.get("route_is_current") == {"__route_observer__": True}:
+                kwargs["route_is_current"] = route.is_route_current
+        return args, kwargs
 
     def op_hello(self, _params: dict[str, Any]) -> dict[str, Any]:
         return {"protocol": PROTOCOL_VERSION, "pid": os.getpid(), "python": sys.version.split()[0]}

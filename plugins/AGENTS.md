@@ -126,6 +126,13 @@ Invariants:
   profile's own config. Never switch them to a raw user-config read.
 - Plugins stay tenant-unaware: no new API, same `ctx`. Per-profile env comes from
   `served_profile_child_env`, so a host sees only its own profile's secrets.
+- A real Hermes CLI or Gateway `route_claim` reaches an isolated callback as public coordinates
+  and a callback-scoped, parent-held route capability. `is_current()` and lifecycle
+  `is_route_current()` ask the parent through read-only `route_cap.check`; the latter never grants
+  tool execution. The parent keeps proof, validators, manager and lifecycle guard. It revokes the
+  handle on callback return, registration disposal, unload, host restart or route/turn invalidation.
+  A child-supplied handle in `ctx.dispatch_tool()` or `ctx.inject_message_admitted()` is only data;
+  it never decodes into a parent `RouteClaim`. Inbound admission still needs its own trusted host.
 
 ## Native plugin compatibility contract (summary — canonical text in the docs page)
 

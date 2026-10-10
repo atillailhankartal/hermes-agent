@@ -28,6 +28,7 @@ import importlib
 import itertools
 import logging
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -49,6 +50,21 @@ _SHUTDOWN_GRACE_SECS = 3.0
 # that kills the host while loading is not reloaded, so one bad plugin cannot crash-loop the rest.
 _RESTART_BUDGET = 3
 _RESTART_WINDOW_SECS = 600.0
+_ROUTE_FIELDS = ("surface", "profile_home_key", "session_key", "native_session_id",
+                 "route_epoch", "host_owner_id")
+
+
+@dataclasses.dataclass
+class _RouteCapability:
+    claim: Any
+    coordinates: dict[str, str]
+    plugin_key: str
+    registration: Any
+    channel: Channel
+    generation: int
+    mode: str
+    observer: Optional[Callable[[], bool]]
+    request_id: Optional[int] = None
 
 
 class PluginHost:
@@ -62,6 +78,9 @@ class PluginHost:
         self._channel: Optional[Channel] = None
         self._contexts: dict[str, Any] = {}
         self._handles: dict[int, Any] = {}
+        self._registered_refs: dict[int, tuple[str, Any]] = {}
+        self._route_caps: dict[str, _RouteCapability] = {}
+        self._route_lock = threading.Lock()
         self._handle_ids = itertools.count(1)
         self._base_context = self._build_base_context()
         self._loading: Optional[str] = None
@@ -124,6 +143,9 @@ class PluginHost:
             threading.Thread(target=_pump_stderr, args=(proc, self._home.name), daemon=True,
                              name=f"plugin-host-{proc.pid}-stderr").start()
             self._generation += 1
+            with self._route_lock:
+                self._route_caps.clear()
+            self._registered_refs.clear()
             channel = Channel(proc.stdout, proc.stdin, self._handle,  # type: ignore[arg-type]
                               name=f"plugin-host[{proc.pid}]",
                               on_close=functools.partial(self._on_channel_close, self._generation),
@@ -150,6 +172,9 @@ class PluginHost:
                 f"its plugins automatically" if code is not None else "the plugin host is not running")
 
     def _on_channel_close(self, generation: int, reason: str) -> None:
+        with self._route_lock:
+            self._route_caps = {token: cap for token, cap in self._route_caps.items()
+                                if cap.generation != generation}
         if self._stopping or generation != self._generation:
             return  # a deliberate shutdown, or a late close from a host already replaced
         culprit = self._loading
@@ -183,6 +208,9 @@ class PluginHost:
 
     def shutdown(self) -> None:
         self._stopping = True
+        with self._route_lock:
+            self._route_caps.clear()
+        self._registered_refs.clear()
         with self._lock:
             proc, channel = self._proc, self._channel
             self._proc = self._channel = None
@@ -295,6 +323,11 @@ class PluginHost:
                                    "headers": [list(h) for h in headers], "body": encode(body)})
 
     def _unload(self, plugin_key: str) -> None:
+        with self._route_lock:
+            self._route_caps = {token: cap for token, cap in self._route_caps.items()
+                                if cap.plugin_key != plugin_key}
+        self._registered_refs = {ref: owner for ref, owner in self._registered_refs.items()
+                                 if owner[0] != plugin_key}
         self._contexts.pop(plugin_key, None)
         channel = self._channel
         if channel is None or channel.closed_reason is not None:
@@ -304,7 +337,8 @@ class PluginHost:
             logger.warning("Plugin '%s' on_unload callback failed in the plugin host: %s", plugin_key, error)
 
     # -- parent -> host -----------------------------------------------------------------------------
-    def _call(self, method: str, params: dict[str, Any], *, generation: Optional[int] = None) -> Any:
+    def _call(self, method: str, params: dict[str, Any], *, generation: Optional[int] = None,
+              on_request_id: Optional[Callable[[int], None]] = None) -> Any:
         channel = self._channel
         try:
             if channel is None:
@@ -314,7 +348,7 @@ class PluginHost:
             if self._releases:
                 released, self._releases = self._releases, []
                 channel.call("release", {"refs": released})
-            return decode(channel.call(method, params), self._resolve_ref)
+            return decode(channel.call(method, params, on_request_id=on_request_id), self._resolve_ref)
         except PluginHostUnavailable as exc:
             raise PluginHostUnavailable(self._exit_reason()) from exc
 
@@ -324,8 +358,89 @@ class PluginHost:
             self._releases.append(ref)
 
     def invoke(self, ref: int, args: tuple, kwargs: dict, *, generation: Optional[int] = None) -> Any:
-        return self._call("invoke", {"ref": ref, "args": encode(list(args)), "kwargs": encode(kwargs)},
-                          generation=generation)
+        wire_kwargs = dict(kwargs)
+        token = None
+        if "route_claim" in wire_kwargs:
+            token, route = self._issue_route_cap(ref, wire_kwargs, generation)
+            if route is not None:
+                wire_kwargs["route_claim"] = route
+                if "route_is_current" in wire_kwargs:
+                    wire_kwargs["route_is_current"] = {"__route_observer__": True}
+
+        def bind_request(request_id: int) -> None:
+            if token is not None:
+                with self._route_lock:
+                    cap = self._route_caps.get(token)
+                    if cap is not None:
+                        cap.request_id = request_id
+        try:
+            return self._call("invoke", {"ref": ref, "args": encode(list(args)),
+                                         "kwargs": encode(wire_kwargs)}, generation=generation,
+                              on_request_id=bind_request)
+        finally:
+            if token is not None:
+                with self._route_lock:
+                    self._route_caps.pop(token, None)
+
+    def _issue_route_cap(self, ref: int, kwargs: dict, generation: Optional[int]) -> tuple[Optional[str], Any]:
+        """Keep an authentic Hermes route claim in this process for one registered invocation."""
+        from gateway.route_claim import RouteClaim
+        from hermes_cli.cli_plugin_admission import CliRouteClaim
+
+        claim = kwargs["route_claim"]
+        if type(claim) not in (RouteClaim, CliRouteClaim):
+            return None, None  # other route payloads retain their existing wire behavior
+        owned = self._registered_refs.get(ref)
+        channel = self._channel
+        if owned is None or channel is None or generation != self._generation:
+            raise PluginHostUnsupported("route claim callback is no longer registered")
+        plugin_key, registration = owned
+        loaded = self._manager._plugins.get(plugin_key)
+        coordinates = {field: getattr(claim, field) for field in _ROUTE_FIELDS}
+        if (not registration.active or registration.plugin_key != plugin_key
+                or self._contexts.get(plugin_key) is None
+                or loaded is None or not loaded.enabled or loaded.error
+                or coordinates["profile_home_key"] != self._manager.scope_key
+                or not all(isinstance(value, str) and value for value in coordinates.values())):
+            raise PluginHostUnsupported("route claim is outside this plugin host scope")
+        observer = kwargs.get("route_is_current")
+        mode = "route-observe" if callable(observer) else "tool-current"
+        try:
+            current = (claim.is_route_current() is True and observer() is True if observer is not None
+                       else claim.is_current() is True)
+        except Exception:  # health: allow BLE001 -- host route validator failures must deny without logging claim data
+            current = False
+        if not current:
+            raise PluginHostUnsupported("route claim is no longer current")
+        token = secrets.token_urlsafe(32)
+        cap = _RouteCapability(claim, coordinates, plugin_key, registration, channel,
+                               self._generation, mode, observer)
+        with self._route_lock:
+            self._route_caps[token] = cap
+        return token, {"__route_cap__": token, "coordinates": coordinates}
+
+    def _check_route_cap(self, params: dict[str, Any], origin: Optional[int]) -> bool:
+        token, mode, coordinates = params.get("handle"), params.get("operation"), params.get("coordinates")
+        if not isinstance(token, str) or not isinstance(coordinates, dict):
+            return False
+        with self._route_lock:
+            cap = self._route_caps.get(token)
+        if (cap is None or origin is None or origin != cap.request_id
+                or mode != cap.mode or coordinates != cap.coordinates
+                or cap.generation != self._generation or cap.channel is not self._channel
+                or not self.alive or self._contexts.get(cap.plugin_key) is None
+                or not cap.registration.active or cap.registration.plugin_key != cap.plugin_key):
+            return False
+        loaded = self._manager._plugins.get(cap.plugin_key)
+        if loaded is None or not loaded.enabled or loaded.error or self._manager.scope_key != coordinates["profile_home_key"]:
+            return False
+        try:
+            current = (cap.claim.is_current() if mode == "tool-current" else
+                       cap.claim.is_route_current() and cap.observer is not None and cap.observer())
+        except Exception:  # health: allow BLE001 -- a route callback may fail arbitrarily; deny the observation
+            return False
+        with self._route_lock:
+            return current is True and self._route_caps.get(token) is cap
 
     def obj_invoke(self, slot: _ObjectSlot, method: str, args: tuple, kwargs: dict) -> Any:
         ref, generation = slot.live()
@@ -350,6 +465,8 @@ class PluginHost:
         return (caller or self._base_context).copy()
 
     def _handle(self, method: str, params: dict[str, Any], _origin: Optional[int]) -> Any:
+        if method == "route_cap.check":
+            return self._check_route_cap(params, _origin)
         if method == "ctx":
             return self._serve_ctx(params)
         if method == "facade":
@@ -377,10 +494,16 @@ class PluginHost:
                 or method in HOST_SKIPPED_CTX_METHODS or method in {"on_unload", "spawn_task"}):
             raise PluginHostUnsupported(f"ctx.{method}() cannot be called across the plugin host")
         base = _import_ref(HOST_OBJECT_BASES[method]) if method in HOST_OBJECT_BASES else None
-        resolve = functools.partial(self._resolve_ref, base=base)
+        resolved: list[tuple[int, Any]] = []
+        resolve = functools.partial(self._resolve_ref, base=base,
+                                    plugin_key=str(params["plugin"]), resolved=resolved)
         args = decode(params.get("args") or [], resolve)
         kwargs = decode(params.get("kwargs") or {}, resolve)
         result = getattr(ctx, method)(*args, **kwargs)
+        from hermes_cli.plugins_ledger import PluginRegistration
+        if isinstance(result, PluginRegistration):
+            for ref, _proxy in resolved:
+                self._registered_refs[ref] = (str(params["plugin"]), result)
         return self._encode_for_host(result)
 
     def _serve_facade(self, params: dict[str, Any]) -> Any:
@@ -414,9 +537,13 @@ class PluginHost:
         return encode(value, refs)
 
     # -- proxies ------------------------------------------------------------------------------------
-    def _resolve_ref(self, ref: dict[str, Any], base: Optional[type] = None) -> Any:
+    def _resolve_ref(self, ref: dict[str, Any], base: Optional[type] = None,
+                     plugin_key: str = "", resolved: Optional[list] = None) -> Any:
         if "__callable__" in ref:
-            return self._callable_proxy(ref)
+            proxy = self._callable_proxy(ref)
+            if resolved is not None:
+                resolved.append((int(ref["__callable__"]), proxy))
+            return proxy
         if "__object__" in ref:
             if base is None:
                 raise PluginHostUnsupported(f"a {ref.get('type', 'plugin')} object cannot be passed here "

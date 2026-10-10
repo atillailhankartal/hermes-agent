@@ -223,7 +223,8 @@ class Channel:
         """Caller context recorded when THIS side sent ``request_id`` (still in flight)."""
         return self._contexts.get(request_id) if request_id is not None else None
 
-    def request(self, method: str, params: dict[str, Any], *, timeout: Optional[float] = None) -> Any:
+    def request(self, method: str, params: dict[str, Any], *, timeout: Optional[float] = None,
+                on_request_id: Optional[Callable[[int], None]] = None) -> Any:
         if self._closed_reason is not None:
             raise PluginHostUnavailable(self._closed_reason)
         request_id = next(self._ids)
@@ -234,6 +235,8 @@ class Channel:
         message = {"id": request_id, "method": method, "params": params,
                    "origin": _SERVING.get()}
         try:
+            if on_request_id is not None:
+                on_request_id(request_id)
             self._send(message)
             return future.result(timeout=timeout)
         finally:
@@ -309,8 +312,10 @@ class Channel:
             raise_remote(reply["error"])
         return reply.get("result")
 
-    def call(self, method: str, params: dict[str, Any], *, timeout: Optional[float] = None) -> Any:
-        return self.result_of(self.request(method, params, timeout=timeout))
+    def call(self, method: str, params: dict[str, Any], *, timeout: Optional[float] = None,
+             on_request_id: Optional[Callable[[int], None]] = None) -> Any:
+        return self.result_of(self.request(method, params, timeout=timeout,
+                                           on_request_id=on_request_id))
 
     def _close(self, reason: str) -> None:
         with self._pending_lock:

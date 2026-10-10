@@ -62,6 +62,372 @@ def _home_with_plugins(tmp_path, monkeypatch, plugins: dict, isolation="host"):
     return home
 
 
+ROUTE_PLUGIN = '''
+import json, os, threading
+
+saved_claim = None
+
+def register(ctx):
+    def inspect_route(args, route_claim=None):
+        global saved_claim
+        saved_claim = route_claim
+        coordinates = {name: getattr(route_claim, name) for name in (
+            "surface", "profile_home_key", "session_key", "native_session_id",
+            "route_epoch", "host_owner_id")}
+        check = lambda handle, operation, coords: ctx._runtime.channel.call(
+            "route_cap.check", {"handle": handle, "operation": operation,
+                                "coordinates": coords})
+        detached_result = []
+        detached = threading.Thread(target=lambda: detached_result.append(
+            check(route_claim._handle, "tool-current", coordinates)))
+        detached.start()
+        detached.join(timeout=5)
+        return json.dumps({
+            "current": route_claim.is_current(
+                profile_home_key=route_claim.profile_home_key,
+                session_key=route_claim.session_key,
+                native_session_id=route_claim.native_session_id,
+            ),
+            "route_current": route_claim.is_route_current(),
+            "private_absent": not hasattr(route_claim, "_proof")
+                and not hasattr(route_claim, "_validate")
+                and not hasattr(route_claim, "_host"),
+            "wrong_session": route_claim.is_current(native_session_id="other"),
+            "surface": route_claim.surface,
+            "epoch": route_claim.route_epoch,
+            "nested_claim_type": ctx.dispatch_tool("route_claim_sink", {}, route_claim=route_claim),
+            "fake_token": check("forged", "tool-current", coordinates),
+            "wrong_coordinates": check(route_claim._handle, "tool-current",
+                                       {**coordinates, "route_epoch": "other"}),
+            "wrong_mode": check(route_claim._handle, "route-observe", coordinates),
+            "detached_origin": detached_result[0],
+        })
+
+    def replay_route(args):
+        coordinates = {name: getattr(saved_claim, name) for name in (
+            "surface", "profile_home_key", "session_key", "native_session_id",
+            "route_epoch", "host_owner_id")}
+        return json.dumps({"current": saved_claim.is_current(),
+                           "route_current": saved_claim.is_route_current(),
+                           "direct_replay": ctx._runtime.channel.call(
+                               "route_cap.check", {"handle": saved_claim._handle,
+                                                   "operation": "tool-current",
+                                                   "coordinates": coordinates})})
+
+    def turn_flip(args, route_claim=None):
+        before = route_claim.is_current()
+        ctx.dispatch_tool("route_flip_trigger", {})
+        return json.dumps({"before": before, "after": route_claim.is_current()})
+
+    def hold_route(args, route_claim=None):
+        before = route_claim.is_current()
+        ctx.dispatch_tool("route_hold_gate", {})
+        return json.dumps({"before": before, "after": route_claim.is_current()})
+
+    def check_foreign(args):
+        return json.dumps({"accepted": ctx._runtime.channel.call("route_cap.check", {
+            "handle": args["handle"], "operation": "tool-current",
+            "coordinates": args["coordinates"]})})
+
+    def crash_route(args, route_claim=None):
+        ctx.dispatch_tool("route_token_capture", {"handle": route_claim._handle})
+        os._exit(3)
+
+    schema = {"name": "route_inspect", "description": "route probe",
+              "parameters": {"type": "object", "properties": {}}}
+    ctx.register_tool(name="route_inspect", toolset="routeprobe", schema=schema,
+                      handler=inspect_route)
+    ctx.register_tool(name="route_replay", toolset="routeprobe", schema=schema,
+                      handler=replay_route)
+    ctx.register_tool(name="route_turn_flip", toolset="routeprobe", schema=schema,
+                      handler=turn_flip)
+    ctx.register_tool(name="route_hold", toolset="routeprobe", schema=schema,
+                      handler=hold_route)
+    ctx.register_tool(name="route_check_foreign", toolset="routeprobe", schema=schema,
+                      handler=check_foreign)
+    ctx.register_tool(name="route_crash", toolset="routeprobe", schema=schema,
+                      handler=crash_route)
+'''
+
+
+ROUTE_LIFECYCLE_PLUGIN = '''
+import json
+
+observed = {}
+
+def register(ctx):
+    def on_reset(route_claim=None, route_is_current=None, **kwargs):
+        global observed
+        observed = {"current": route_claim.is_current(),
+                    "route_current": route_claim.is_route_current(),
+                    "guard_current": route_is_current(),
+                    "private_absent": not hasattr(route_claim, "_proof")}
+
+    ctx.register_hook("on_session_reset", on_reset)
+    ctx.register_tool(name="route_lifecycle_seen", toolset="routeprobe",
+                      schema={"name": "route_lifecycle_seen", "description": "route probe",
+                              "parameters": {"type": "object", "properties": {}}},
+                      handler=lambda args: json.dumps(observed))
+'''
+
+
+@pytest.mark.platforms("any")
+def test_default_in_process_route_claim_keeps_native_identity(tmp_path, monkeypatch):
+    from gateway.route_claim import RouteClaim
+    from tools.registry import registry
+
+    body = '''
+import json
+
+def register(ctx):
+    ctx.register_tool(name="route_native_identity", toolset="routeprobe",
+                      schema={"name": "route_native_identity", "description": "route probe",
+                              "parameters": {"type": "object", "properties": {}}},
+                      handler=lambda args, route_claim=None: json.dumps({
+                          "native": type(route_claim).__name__ == "RouteClaim",
+                          "proof_visible": hasattr(route_claim, "_proof"),
+                          "current": route_claim.is_current()}))
+'''
+    home = _home_with_plugins(tmp_path, monkeypatch, {"routeprobe": body}, isolation="in_process")
+    (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": ["routeprobe"]}}),
+                                       encoding="utf-8")
+    manager = PluginManager()
+    manager.discover_and_load()
+    claim = RouteClaim("gateway", manager.scope_key, "route", "native", "epoch-1", "owner-1",
+                       object(), lambda _claim: True, lambda _claim: True)
+    try:
+        assert json.loads(registry.dispatch("route_native_identity", {}, scope=manager.scope_key,
+                                            route_claim=claim)) == {
+            "native": True, "proof_visible": True, "current": True}
+    finally:
+        manager.unload()
+
+
+@pytest.mark.platforms("any")
+def test_host_route_claim_is_read_only_current_and_revoked_after_callback(tmp_path, monkeypatch):
+    from gateway.route_claim import RouteClaim
+    from tools.registry import registry
+
+    _home_with_plugins(tmp_path, monkeypatch, {"routeprobe": ROUTE_PLUGIN})
+    manager = PluginManager()
+    manager.discover_and_load()
+    state = {"current": True}
+    proof = object()
+    claim = RouteClaim("gateway", manager.scope_key, "route", "native", "epoch-1", "owner-1",
+                       proof, lambda _claim: state["current"],
+                       lambda _claim: state["current"])
+    registry.register(name="route_claim_sink", toolset="routeprobe",
+                      schema={"name": "route_claim_sink", "description": "sink",
+                              "parameters": {"type": "object", "properties": {}}},
+                      handler=lambda _args, route_claim=None: type(route_claim).__name__,
+                      scope=manager.scope_key)
+    try:
+        result = json.loads(registry.dispatch("route_inspect", {}, scope=manager.scope_key,
+                                              route_claim=claim))
+        assert result == {"current": True, "route_current": False, "private_absent": True,
+                          "wrong_session": False, "surface": "gateway", "epoch": "epoch-1",
+                          "nested_claim_type": "Opaque", "fake_token": False,
+                          "wrong_coordinates": False, "wrong_mode": False,
+                          "detached_origin": False}
+        # The child retains a Python object, but the parent-held handle expires with this call.
+        assert json.loads(registry.dispatch("route_replay", {}, scope=manager.scope_key)) == {
+            "current": False, "route_current": False, "direct_replay": False}
+        state["current"] = False
+        stale = registry.dispatch("route_inspect", {}, scope=manager.scope_key,
+                                  route_claim=claim)
+        assert "route claim is no longer current" in stale
+        state["current"] = True
+        registry.register(name="route_flip_trigger", toolset="routeprobe",
+                          schema={"name": "route_flip_trigger", "description": "flip",
+                                  "parameters": {"type": "object", "properties": {}}},
+                          handler=lambda _args: state.__setitem__("current", False) or "ok",
+                          scope=manager.scope_key)
+        assert json.loads(registry.dispatch("route_turn_flip", {}, scope=manager.scope_key,
+                                            route_claim=claim)) == {"before": True, "after": False}
+    finally:
+        registry.deregister("route_flip_trigger", scope=manager.scope_key)
+        registry.deregister("route_claim_sink", scope=manager.scope_key)
+        manager.unload()
+        manager._plugin_host().shutdown()
+
+
+@pytest.mark.platforms("any")
+def test_host_lifecycle_uses_local_observer_without_promoting_tool_authority(tmp_path, monkeypatch):
+    from gateway.route_claim import RouteClaim
+    from tools.registry import registry
+
+    _home_with_plugins(tmp_path, monkeypatch, {"routeprobe": ROUTE_LIFECYCLE_PLUGIN})
+    manager = PluginManager()
+    manager.discover_and_load()
+    owner = object()
+    manager.set_keyed_lifecycle_host("gateway", owner, "owner-1")
+    current = {"route": True}
+    proof = object()
+    claim = RouteClaim("gateway", manager.scope_key, "route", "native", "epoch-1", "owner-1",
+                       proof, lambda _claim: False, lambda _claim: current["route"])
+    try:
+        assert manager.notify_keyed_session_reset(
+            "gateway", owner, session_key="route", session_id="native", route_epoch="epoch-1",
+            old_session_id="old", old_route_epoch="epoch-0", route_claim=claim,
+            route_is_current=lambda: current["route"],
+        ) is True
+        assert json.loads(registry.dispatch("route_lifecycle_seen", {}, scope=manager.scope_key)) == {
+            "current": False, "route_current": True, "guard_current": True,
+            "private_absent": True}
+        current["route"] = False
+        assert manager.notify_keyed_session_reset(
+            "gateway", owner, session_key="route", session_id="native", route_epoch="epoch-1",
+            old_session_id="old", old_route_epoch="epoch-0", route_claim=claim,
+            route_is_current=lambda: current["route"],
+        ) is False
+    finally:
+        manager.unload()
+        manager._plugin_host().shutdown()
+
+
+@pytest.mark.platforms("any")
+def test_host_cli_route_claim_uses_parent_validator_and_hides_host_proof(tmp_path, monkeypatch):
+    from hermes_cli.cli_plugin_admission import CliRouteClaim
+    from tools.registry import registry
+
+    _home_with_plugins(tmp_path, monkeypatch, {"routeprobe": ROUTE_PLUGIN})
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    class NativeOwner:
+        active = True
+
+        def tool_claim_current(self, _claim):
+            return self.active
+
+        def route_current(self, _claim):
+            return self.active
+
+    owner = NativeOwner()
+    claim = CliRouteClaim("cli", manager.scope_key, "native", "native", "epoch-cli", "owner-cli",
+                          owner, object())
+    registry.register(name="route_claim_sink", toolset="routeprobe",
+                      schema={"name": "route_claim_sink", "description": "sink",
+                              "parameters": {"type": "object", "properties": {}}},
+                      handler=lambda _args, route_claim=None: type(route_claim).__name__,
+                      scope=manager.scope_key)
+    try:
+        result = json.loads(registry.dispatch("route_inspect", {}, scope=manager.scope_key,
+                                              route_claim=claim))
+        assert result["current"] is True and result["private_absent"] is True
+        assert result["surface"] == "cli" and result["epoch"] == "epoch-cli"
+        owner.active = False
+        assert "route claim is no longer current" in registry.dispatch(
+            "route_inspect", {}, scope=manager.scope_key, route_claim=claim)
+    finally:
+        registry.deregister("route_claim_sink", scope=manager.scope_key)
+        manager.unload()
+        manager._plugin_host().shutdown()
+
+
+@pytest.mark.platforms("any")
+def test_route_cap_rejects_other_profile_and_unload_during_callback(tmp_path, monkeypatch):
+    import threading
+    from gateway.route_claim import RouteClaim
+    from tools.registry import registry
+
+    first_dir, second_dir = tmp_path / "first", tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first_home = _home_with_plugins(first_dir, monkeypatch, {"routeprobe": ROUTE_PLUGIN})
+    first = PluginManager()
+    first.discover_and_load()
+    _home_with_plugins(second_dir, monkeypatch, {"routeprobe": ROUTE_PLUGIN})
+    second = PluginManager()
+    second.discover_and_load()
+    monkeypatch.setenv("HERMES_HOME", str(first_home))
+    entered, release = threading.Event(), threading.Event()
+    state = {"current": True}
+    claim = RouteClaim("gateway", first.scope_key, "route", "native", "epoch-1", "owner-1",
+                       object(), lambda _claim: state["current"],
+                       lambda _claim: state["current"])
+
+    def gate(_args):
+        entered.set()
+        assert release.wait(10)
+        return "ok"
+
+    registry.register(name="route_hold_gate", toolset="routeprobe",
+                      schema={"name": "route_hold_gate", "description": "gate",
+                              "parameters": {"type": "object", "properties": {}}},
+                      handler=gate, scope=first.scope_key)
+    result = []
+    worker = threading.Thread(target=lambda: result.append(
+        registry.dispatch("route_hold", {}, scope=first.scope_key, route_claim=claim)))
+    try:
+        worker.start()
+        assert entered.wait(10)
+        host = first._plugin_host()
+        with host._route_lock:
+            token, cap = next(iter(host._route_caps.items()))
+        assert host._check_route_cap({"handle": token, "operation": "tool-current",
+                                      "coordinates": cap.coordinates}, cap.request_id) is True
+        foreign = json.loads(registry.dispatch(
+            "route_check_foreign", {"handle": token, "coordinates": cap.coordinates},
+            scope=second.scope_key))
+        assert foreign == {"accepted": False}
+        assert first.unload("routeprobe") is True
+        assert host._check_route_cap({"handle": token, "operation": "tool-current",
+                                      "coordinates": cap.coordinates}, cap.request_id) is False
+    finally:
+        release.set()
+        worker.join(timeout=10)
+        registry.deregister("route_hold_gate", scope=first.scope_key)
+        first.unload()
+        second.unload()
+        first._plugin_host().shutdown()
+        second._plugin_host().shutdown()
+    assert not worker.is_alive()
+    assert json.loads(result[0]) == {"before": True, "after": False}
+
+
+@pytest.mark.platforms("posix")
+def test_route_cap_from_crashed_host_cannot_be_replayed_after_restart(tmp_path, monkeypatch):
+    from gateway.route_claim import RouteClaim
+    from tools.registry import registry
+
+    _home_with_plugins(tmp_path, monkeypatch, {"routeprobe": ROUTE_PLUGIN})
+    manager = PluginManager()
+    manager.discover_and_load()
+    claim = RouteClaim("gateway", manager.scope_key, "route", "native", "epoch-1", "owner-1",
+                       object(), lambda _claim: True, lambda _claim: True)
+    captured = []
+    registry.register(name="route_token_capture", toolset="routeprobe",
+                      schema={"name": "route_token_capture", "description": "capture",
+                              "parameters": {"type": "object", "properties": {}}},
+                      handler=lambda args: captured.append(args["handle"]) or "ok",
+                      scope=manager.scope_key)
+    host = manager._plugin_host()
+    try:
+        assert "plugin host" in registry.dispatch("route_crash", {}, scope=manager.scope_key,
+                                                   route_claim=claim)
+        assert len(captured) == 1
+        coordinates = {name: getattr(claim, name) for name in (
+            "surface", "profile_home_key", "session_key", "native_session_id",
+            "route_epoch", "host_owner_id")}
+        assert host._check_route_cap({"handle": captured[0], "operation": "tool-current",
+                                      "coordinates": coordinates}, None) is False
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            replay = registry.dispatch("route_inspect", {}, scope=manager.scope_key,
+                                       route_claim=claim)
+            if '"current": true' in replay:
+                break
+            time.sleep(0.2)
+        assert '"current": true' in replay
+        assert host._check_route_cap({"handle": captured[0], "operation": "tool-current",
+                                      "coordinates": coordinates}, None) is False
+    finally:
+        registry.deregister("route_token_capture", scope=manager.scope_key)
+        manager.unload()
+        host.shutdown()
+
+
 @pytest.mark.platforms("posix")  # os._exit / SIGKILL process semantics
 def test_plugin_runs_out_of_process_with_ctx_round_trips_and_survives_host_crash(tmp_path, monkeypatch):
     from agent import image_gen_registry
