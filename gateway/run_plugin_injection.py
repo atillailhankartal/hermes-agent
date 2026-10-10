@@ -299,11 +299,7 @@ class GatewayPluginInjectionMixin:
         if not self._plugin_injection_accepting():
             return
         queue = self._native_plugin_queue()
-        rows = queue.queued(getattr(self, "_native_plugin_scan_cursor", 0))
-        if not rows:
-            rows = queue.queued()
-        self._native_plugin_scan_cursor = rows[-1]["sequence"] if rows else 0
-        for row in rows:
+        for row in queue.next_queued_page():
             key = row["session_key"]
             async with self._session_route_gate(key):
                 entry = self.session_store.lookup_by_session_key(key)

@@ -579,3 +579,37 @@ async def test_status_requires_payload_binding(tmp_path, monkeypatch):
     await admit(runner, manager, claim)
     with pytest.raises(TypeError):
         runner._query_native_plugin_admission(manager=manager, route_claim=claim, delivery_id="delivery")
+
+
+@pytest.mark.asyncio
+async def test_busy_route_gets_next_cycle_despite_sustained_new_arrivals(tmp_path, monkeypatch):
+    runner, adapter, manager, target = host(tmp_path, monkeypatch)
+    await admit(runner, manager, target, "target")
+    adapter._active_sessions[target.session_key] = asyncio.Event()
+
+    async def arrival(index, busy=False):
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id=str(2000 + index), user_id="42")
+        entry = runner.session_store.get_or_create_session(source)
+        claim = claim_for_route(runner, entry, source)
+        await admit(runner, manager, claim, str(index))
+        if busy:
+            adapter._active_sessions[entry.session_key] = asyncio.Event()
+
+    # One cycle needs two pages; new routes must not extend that cycle forever.
+    for index in range(100):
+        await arrival(index, busy=True)
+    await runner._drain_native_plugin_candidates_once()
+    adapter._start_session_processing.assert_not_called()
+    adapter._active_sessions.pop(target.session_key)
+    first_target_poll = None
+    for poll in range(8):
+        await arrival(100 + poll)
+        await runner._drain_native_plugin_candidates_once()
+        keys = [call.args[1] for call in adapter._start_session_processing.call_args_list]
+        if target.session_key in keys and first_target_poll is None:
+            first_target_poll = poll
+    assert first_target_poll is not None and first_target_poll <= 1
+    assert keys.count(target.session_key) == 1
+    row = runner._native_plugin_queue().lookup(manager.scope_key, target.route_epoch, "target")
+    assert row["execution"] == "dispatching"
+    assert row["state"] == "unknown"  # Scheduling still cannot prove slot/turn admission.

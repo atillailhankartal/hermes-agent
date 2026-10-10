@@ -104,14 +104,34 @@ class NativePluginQueue:
         # Return only after the context manager committed successfully.
         return dict(row)
 
-    def queued(self, after=0):
-        # Rotate a bounded page over route heads, including when earlier routes stay busy.
+    def queued(self, after=0, through=None):
+        # A fixed cycle boundary prevents new arrivals from postponing earlier busy heads.
         with self._connection() as db:
             rows = [dict(row) for row in db.execute(
                 """SELECT * FROM candidates WHERE sequence IN (
                     SELECT MIN(sequence) FROM candidates WHERE execution='queued'
-                    GROUP BY profile, session_key) AND sequence > ? ORDER BY sequence LIMIT 100""",
-                (after,))]
+                    GROUP BY profile, session_key) AND sequence > ?
+                    AND (? IS NULL OR sequence <= ?) ORDER BY sequence LIMIT 100""",
+                (after, through, through))]
+        return rows
+
+    def next_queued_page(self):
+        """Visit a finite snapshot of route heads before starting another scan cycle.
+
+        New candidates wait for the next cycle. Previously busy heads are revisited
+        after at most the remaining pages, even if arrivals continue on every poll.
+        The cursor is only a wake-loop optimization; restart safely starts at zero.
+        """
+        after = getattr(self, "_scan_after", 0)
+        through = getattr(self, "_scan_through", None)
+        if through is None:
+            with self._connection() as db:
+                through = db.execute("SELECT COALESCE(MAX(sequence), 0) FROM candidates").fetchone()[0]
+        rows = self.queued(after, through)
+        if len(rows) < 100 or rows[-1]["sequence"] >= through:
+            self._scan_after, self._scan_through = 0, None
+        else:
+            self._scan_after, self._scan_through = rows[-1]["sequence"], through
         return rows
 
     def settle(self, candidate: str) -> bool:
