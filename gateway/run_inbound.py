@@ -1223,6 +1223,11 @@ class GatewayInboundMixin(GatewayInboundEvictionMixin, GatewayPluginInjectionMix
             active_lease.release()
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        if (getattr(event, "metadata", None) or {}).get("hermes_native_candidate_id"):
+            return await self._handle_native_plugin_candidate(event)
+        return await self._handle_message_admitted(event)
+
+    async def _handle_message_admitted(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -1256,6 +1261,10 @@ class GatewayInboundMixin(GatewayInboundEvictionMixin, GatewayPluginInjectionMix
         if self._is_session_running(_quick_key):
             await self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
+            if (getattr(event, "metadata", None) or {}).get("hermes_native_candidate_id"):
+                # A human may have claimed the slot after the native queue wake. Never merge,
+                # steer or overwrite this exact durable candidate into another turn.
+                return None
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
@@ -1289,7 +1298,8 @@ class GatewayInboundMixin(GatewayInboundEvictionMixin, GatewayPluginInjectionMix
         _claimed_event = None
         _claim_started_ts = None
         try:
-            event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+            if not (getattr(event, "metadata", None) or {}).get("hermes_native_candidate_id"):
+                event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
             _claim_state = self._session_state(_quick_key)
             _claimed_event = event
             _claim_started_ts = time.time()
@@ -1308,6 +1318,10 @@ class GatewayInboundMixin(GatewayInboundEvictionMixin, GatewayPluginInjectionMix
             )
             raise
 
+        return await self._hm_execute_claimed_turn(event, source, is_internal, _quick_key, _run_generation)
+
+    async def _hm_execute_claimed_turn(self, event, source, is_internal, _quick_key, _run_generation):
+        """Execute and release an already claimed turn, including every cancellation path."""
         try:
             if not is_internal:  # fail-open plugin consume, inside the claimed slot (#129958)
                 from gateway.run_inbound_consumer import run_post_admission_hook
@@ -1331,7 +1345,7 @@ class GatewayInboundMixin(GatewayInboundEvictionMixin, GatewayPluginInjectionMix
                     agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
                 )
             except Exception as _goal_exc:
-                logger.debug("post-turn hook failed: %s", _goal_exc)
+                logger.debug("post-turn hook failed: %s", _goal_exc, exc_info=True)
             return _agent_result
         finally:
             try:
