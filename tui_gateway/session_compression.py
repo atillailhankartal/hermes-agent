@@ -263,9 +263,8 @@ def _manual_compress_turn(sid: str, session: dict):
         with session["history_lock"]:
             unchanged = (session.get("session_key") == old_key
                          and session.get("history_version") == old_version)
-        if not had_lease and unchanged:
-            _release_active_session_slot(session)
-        with session["history_lock"]:
+            if not had_lease and unchanged:
+                _release_active_session_slot(session)
             session.pop("_manual_compress_sid", None)
             session.pop("_manual_compress_active", None)
             session["running"] = False

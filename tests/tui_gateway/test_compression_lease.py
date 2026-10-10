@@ -154,6 +154,46 @@ def test_short_history_noop_compress_releases_new_slot_before_prompt_drain(home,
     next_owner.release()
 
 
+def test_noop_release_fences_concurrent_compute_route_change(home, monkeypatch):
+    session = _session()
+    release_entered = threading.Event()
+    frame_attempted = threading.Event()
+    frame_done = threading.Event()
+    frame_results = []
+    observed_during_release = []
+    real_release = server._release_active_session_slot
+
+    def watched_release(record):
+        release_entered.set()
+        assert frame_attempted.wait(5)
+        observed_during_release.append(frame_done.wait(2))
+        return real_release(record)
+
+    def adopt_frame():
+        assert release_entered.wait(10)
+        frame_attempted.set()
+        with session["history_lock"]:
+            frame_results.append(server._compute_host_adopt_frame_meta(
+                session, {"sid": "ui", "session_key": "B", "history_version": 1}))
+        frame_done.set()
+
+    monkeypatch.setattr(server, "_release_active_session_slot", watched_release)
+    worker = threading.Thread(target=adopt_frame, daemon=True)
+    worker.start()
+    try:
+        with server._manual_compress_turn("ui", session):
+            assert server._compress_session_history(session)[0] == 0
+        assert frame_done.wait(5)
+        assert observed_during_release == [False]
+        assert frame_results == [False]
+        assert session["session_key"] == "A" and _entries(home) == []
+    finally:
+        release_entered.set()
+        worker.join(timeout=5)
+        if session.get("active_session_lease") is not None:
+            session["active_session_lease"].release()
+
+
 def test_real_compaction_keeps_lease_after_in_place_history_commit(home, monkeypatch):
     from agent import conversation_compression_manual as manual
 
