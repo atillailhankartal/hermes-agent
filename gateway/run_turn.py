@@ -1132,10 +1132,9 @@ class GatewayTurnMixin:
                 _hyg_rotated = False
                 _hyg_in_place = False
             else:
-                session_entry.session_id = _hyg_new_sid
-                # The held turn lease follows the rotation (alias keys still serialize on this turn).
-                self._rebind_turn_lease(_quick_key, run_generation, _hyg_new_sid)
-                await self.async_session_store._save()
+                await self._hmwa_publish_compression_child_route(
+                    session_entry, _hyg_new_sid, _quick_key, run_generation,
+                )
                 await asyncio.to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="hygiene-compression",
                 )
@@ -1571,10 +1570,9 @@ class GatewayTurnMixin:
         # if the binding still points at the session this run was launched against.
         if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
             if session_entry.session_id == _run_start_session_id:
-                session_entry.session_id = agent_result["session_id"]
-                # The held turn lease follows the rotation (persistence writes to the NEW id).
-                self._rebind_turn_lease(_quick_key, run_generation, session_entry.session_id)
-                await self.async_session_store._save()
+                await self._hmwa_publish_compression_child_route(
+                    session_entry, agent_result["session_id"], _quick_key, run_generation,
+                )
                 await self.async_session_store._record_gateway_session_peer(
                     session_entry.session_id, session_key, source,
                 )

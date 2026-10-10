@@ -605,6 +605,34 @@ class SessionTranscriptMixin:
         return (self.is_published_compression_child(parent_session_id, child_session_id)
                 or self.rewrite_transcript(child_session_id, messages))
 
+    def publish_compression_child_route(
+        self, session_key: str, expected_entry: "SessionEntry", parent_session_id: str,
+        child_session_id: str, *, still_current=None,
+    ) -> bool:
+        """Persist a compression repoint before exposing it through the live routing entry.
+
+        The caller must already hold a turn lease rebound to ``child_session_id``. Keep the
+        identity/CAS check, one-row durable write, and in-memory publication under the routing
+        lock so /new cannot interleave between those steps. No compressor or agent work runs under
+        this lock. A displaced generation is checked again after the write; its candidate is
+        restored to the parent before the lock is released.
+        """
+        if not session_key or not parent_session_id or not child_session_id:
+            return False
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if (current is not expected_entry or current.session_id != parent_session_id
+                    or (still_current is not None and not still_current())):
+                return False
+            candidate = current.to_dict()
+            candidate["session_id"] = child_session_id
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            if still_current is not None and not still_current():
+                self._save_entry(session_key, entry_data=current.to_dict(), lock_held=True)
+                return False
+            current.session_id = child_session_id
+            return True
+
     def has_input_owner(self, session_id: str, owner: str) -> bool:
         """Find this accepted input on the canonical live continuation and its ancestors.
 

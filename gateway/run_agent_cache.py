@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import threading
@@ -336,6 +337,10 @@ class GatewayAgentCacheMixin:
         current = int(state.persistent.run_generation or 0)
         tokens = state.turn.lease_tokens
         for gen in [g for g in tokens if int(g) < current]:
+            handoff = self.__dict__.get("_compression_lease_handoffs", {}).get((session_key, gen))
+            if handoff is not None:
+                handoff["release_deferred"] = True
+                continue
             token = tokens.pop(gen)
             try:
                 registry.release(token)
@@ -360,6 +365,10 @@ class GatewayAgentCacheMixin:
         held = self._held_turn_lease(session_key, run_generation)
         if held is None:
             return False
+        handoff = self.__dict__.get("_compression_lease_handoffs", {}).get((session_key, run_generation))
+        if handoff is not None:
+            handoff["release_deferred"] = True
+            return True
         registry, tokens = held
         token = tokens.pop(run_generation)
         try:
@@ -381,6 +390,67 @@ class GatewayAgentCacheMixin:
         except Exception:
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False
+
+    def _begin_compression_lease_handoff(self, session_key: str, run_generation: int, child_id: str) -> bool:
+        """Reserve the child alias and pin its lease across the offloaded route write.
+
+        /new may release the old turn while persistence is in flight. Its release is deferred
+        until the route CAS finishes, so a child can never be published with an unlocked lease.
+        """
+        held = self._held_turn_lease(session_key, run_generation)
+        if held is None or (session_key, run_generation) in self.__dict__.get("_compression_lease_handoffs", {}):
+            return False
+        registry, tokens = held
+        token = tokens[run_generation]
+        if not self._rebind_turn_lease(session_key, run_generation, child_id):
+            return False
+        self.__dict__.setdefault("_compression_lease_handoffs", {})[(session_key, run_generation)] = {
+            "registry": registry, "token": token, "release_deferred": False,
+        }
+        return True
+
+    def _end_compression_lease_handoff(self, session_key: str, run_generation: int) -> None:
+        handoff = self.__dict__.get("_compression_lease_handoffs", {}).pop((session_key, run_generation), None)
+        if handoff is None or not handoff["release_deferred"]:
+            return
+        held = self._held_turn_lease(session_key, run_generation)
+        if held is not None:
+            held[1].pop(run_generation, None)
+        handoff["registry"].release(handoff["token"])
+
+    async def _hmwa_publish_compression_child_route(
+        self, session_entry, child_session_id, session_key, run_generation,
+    ) -> None:
+        """Transfer the live turn lease before making a compression child routable."""
+        if not self._is_session_run_current(session_key, run_generation):
+            raise RuntimeError("compression route changed before lease handoff")
+        parent_session_id = session_entry.session_id
+        if not self._begin_compression_lease_handoff(session_key, run_generation, child_session_id):
+            raise RuntimeError("compression lease handoff refused")
+        try:
+            write = asyncio.create_task(
+                self.async_session_store.publish_compression_child_route(
+                    session_entry.session_key, session_entry, parent_session_id, child_session_id,
+                    still_current=lambda: self._is_session_run_current(session_key, run_generation),
+                )
+            )
+            cancelled = False
+            # asyncio.to_thread keeps running after its awaiter is cancelled. Keep both A and B
+            # leased until the offloaded CAS/write actually settles; then honor cancellation.
+            while not write.done():
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    cancelled = True
+            committed = write.result()
+            if cancelled:
+                raise asyncio.CancelledError
+            if (not committed or not self._is_session_run_current(session_key, run_generation)
+                    or self.session_store.lookup_by_session_key(session_entry.session_key) is not session_entry
+                    or session_entry.session_id != child_session_id):
+                raise RuntimeError("compression route changed during lease handoff")
+        finally:
+            self._end_compression_lease_handoff(session_key, run_generation)
 
     def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
         """THE single conversation-boundary funnel (/new, /resume, suspension replacement,
