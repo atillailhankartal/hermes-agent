@@ -73,7 +73,7 @@ class GatewayPluginInjectionMixin:
                 and hermes_home_key(manager.home_path) == manager.scope_key)
 
     def _query_native_plugin_admission(
-        self, *, manager, route_claim, delivery_id, route_epoch=None, expected_session_id=None, expected_content=None,
+        self, *, manager, route_claim, delivery_id, expected_content, route_epoch=None, expected_session_id=None,
     ):
         """Private same-ID readback; does not schedule, reinsert or require a current epoch.
 
@@ -82,8 +82,8 @@ class GatewayPluginInjectionMixin:
         After restart a fresh host claim for the same profile/key can select the
         retained epoch/native pair explicitly. Selectors are correlation, not authority.
         This reports the ORIGINAL owner's admission, never a new-owner insertion.
-        A bridge settling a payload must supply expected_content and retain the original
-        attempt's owner/route fingerprint. A status-only read proves no new payload.
+        Settlement requires expected_content and the original attempt's owner/route
+        fingerprint. There is no status-only receipt path.
         Missing status is unknown, never permission to reinsert.
         """
         from hermes_cli.plugins_injection import AdmissionReceipt
@@ -97,7 +97,7 @@ class GatewayPluginInjectionMixin:
             row = queue.lookup(manager.scope_key, epoch, delivery_id)
             if (row and row["session_key"] == route_claim.session_key
                     and row["native_id"] == native):
-                if expected_content is not None and row["payload_digest"] != queue.payload_digest(expected_content):
+                if not isinstance(expected_content, str) or row["payload_digest"] != queue.payload_digest(expected_content):
                     return queue.receipt(queue.conflict(row))
                 return queue.receipt(row)
         except (OSError, sqlite3.Error):
@@ -206,6 +206,53 @@ class GatewayPluginInjectionMixin:
         epoch = metadata.get("gateway_route_epoch")
         return not epoch or (entry.route_epoch == epoch and not entry.route_claim_blocked)
 
+    async def _hmwa_acquire_native_turn_lease(self, event, key, generation, entry, env_tokens):
+        await self._hmwa_acquire_turn_lease(key, generation, entry, env_tokens)
+        if not (getattr(event, "metadata", None) or {}).get("hermes_native_candidate_id"):
+            return
+        try:
+            async with self._session_route_gate(key):
+                if self._settle_native_plugin_turn(event, key, generation, entry):
+                    return
+        except (OSError, sqlite3.Error):
+            logger.warning("Native turn settlement unavailable")
+        self._clear_session_env(env_tokens)
+        from gateway.turn_lease import TurnLeaseTimeoutError
+        raise TurnLeaseTimeoutError(entry.session_id, owner_key=key, generation=generation, wait_seconds=0)
+
+    def _settle_native_plugin_turn(self, event, key, generation, entry):
+        from hermes_cli.active_sessions import active_session_lease_guard, ActiveSessionRegistryError
+        from hermes_constants import hermes_home_key
+        state = self._peek_session_state(key)
+        held = self._held_turn_lease(key, generation)
+        if state is None or held is None or state.turn.event is not event:
+            return False
+        if state.persistent.run_generation != generation:
+            return False
+        token = held[1][generation]
+        if (token.released or token.lease.holder is not token or token.session_id != entry.session_id
+                or token.owner_key != key or token.generation != generation):
+            return False
+        metadata = event.metadata
+        profile_home = self._resolve_profile_home_for_source(event.source)
+        queue = self._native_plugin_queue()
+        with self.session_store._lock:
+            live = self.session_store._entry_locked(key)
+            if not self._strict_plugin_session_matches(live, entry.session_id, metadata):
+                return False
+            row = queue.lookup(hermes_home_key(profile_home), live.route_epoch, metadata["hermes_delivery_id"])
+            if (not row or row["candidate"] != metadata["hermes_native_candidate_id"]
+                    or row["session_key"] != key or row["native_id"] != live.session_id
+                    or row["content"] != event.text
+                    or getattr(event, "_native_plugin_proof", None) is not self.session_store._route_claim_proof):
+                return False
+            try:
+                with active_session_lease_guard(state.turn.lease, session_id=key,
+                                               live_session_id=key, registry_home=profile_home):
+                    return queue.settle(row["candidate"])
+            except ActiveSessionRegistryError:
+                return False
+
     async def _handle_native_plugin_candidate(self, event):
         """One native dequeue can enter the ordinary Gateway handler at most once."""
         from hermes_constants import hermes_home_key
@@ -252,7 +299,11 @@ class GatewayPluginInjectionMixin:
         if not self._plugin_injection_accepting():
             return
         queue = self._native_plugin_queue()
-        for row in queue.queued():
+        rows = queue.queued(getattr(self, "_native_plugin_scan_cursor", 0))
+        if not rows:
+            rows = queue.queued()
+        self._native_plugin_scan_cursor = rows[-1]["sequence"] if rows else 0
+        for row in rows:
             key = row["session_key"]
             async with self._session_route_gate(key):
                 entry = self.session_store.lookup_by_session_key(key)
@@ -281,7 +332,7 @@ class GatewayPluginInjectionMixin:
                 })
                 event._native_plugin_proof = self.session_store._route_claim_proof
                 # Persist before crossing the scheduler boundary. If the process dies after this
-                # CAS, automatic replay could execute twice. Preserve the admission but never retry.
+                # CAS, automatic replay could execute twice. Preserve the status but never retry.
                 if not queue.transition(row["candidate"], "queued", "dispatching"):
                     continue
                 try:

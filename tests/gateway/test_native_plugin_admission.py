@@ -61,7 +61,7 @@ async def admit(runner, manager, claim, delivery="delivery", content="one"):
 async def test_exact_commit_duplicate_and_restart_readback(tmp_path, monkeypatch):
     runner, adapter, manager, claim = host(tmp_path, monkeypatch)
     first = await admit(runner, manager, claim)
-    assert first.state == "admitted" and first.candidate_id
+    assert first.state == "unknown" and first.candidate_id is None
     second = await admit(runner, manager, claim, content="one")
     assert second == first
     adapter._start_session_processing.assert_not_called()
@@ -70,7 +70,7 @@ async def test_exact_commit_duplicate_and_restart_readback(tmp_path, monkeypatch
     assert new_claim.host_owner_id != claim.host_owner_id
     assert await admit(restarted, restarted_manager, new_claim) == first
     status = restarted._query_native_plugin_admission(
-        manager=restarted_manager, route_claim=new_claim, delivery_id="delivery")
+        manager=restarted_manager, route_claim=new_claim, delivery_id="delivery", expected_content="one")
     assert status == first
     assert len(restarted._native_plugin_queue().queued()) == 1
     row = restarted._native_plugin_queue().lookup(manager.scope_key, claim.route_epoch, "delivery")
@@ -93,7 +93,8 @@ async def test_busy_candidates_stay_distinct_and_drain_on_real_adapter_path(tmp_
     adapter._active_sessions[claim.session_key] = asyncio.Event()
     first = await admit(runner, manager, claim, "one", "first")
     second = await admit(runner, manager, claim, "two", "second")
-    assert first.candidate_id != second.candidate_id
+    assert first.state == second.state == "unknown"
+    assert len({runner._native_plugin_queue().lookup(manager.scope_key, claim.route_epoch, d)["candidate"] for d in ("one", "two")}) == 2
     await runner._drain_native_plugin_candidates_once()
     adapter._start_session_processing.assert_not_called()
     adapter._active_sessions.clear()
@@ -105,7 +106,7 @@ async def test_busy_candidates_stay_distinct_and_drain_on_real_adapter_path(tmp_
     adapter._start_session_processing.side_effect = start
     await runner._drain_native_plugin_candidates_once()
     assert [e.text for e in events] == ["first"]
-    assert events[0].metadata["hermes_native_candidate_id"] == first.candidate_id
+    assert events[0].metadata["hermes_native_candidate_id"] == runner._native_plugin_queue().lookup(manager.scope_key, claim.route_epoch, "one")["candidate"]
     adapter._active_sessions.clear()
     await runner._drain_native_plugin_candidates_once()
     assert [e.text for e in events] == ["first", "second"]
@@ -122,7 +123,7 @@ async def test_stale_epoch_never_drains_after_aba(tmp_path, monkeypatch):
     await runner._drain_native_plugin_candidates_once()
     adapter._start_session_processing.assert_not_called()
     assert runner._query_native_plugin_admission(manager=manager, route_claim=claim,
-        delivery_id="delivery") == first
+        delivery_id="delivery", expected_content="one") == first
     assert runner._native_plugin_queue().queued() == []
 
 
@@ -139,7 +140,7 @@ async def test_post_commit_error_same_id_readback_and_no_second_candidate(tmp_pa
     assert receipt.state in ("admitted", "unknown")
     monkeypatch.setattr(queue, "admit", original)
     retry = await admit(runner, manager, claim)
-    assert retry.state == "admitted"
+    assert retry.state == "unknown"
     assert len(queue.queued()) == 1
 
 
@@ -190,7 +191,7 @@ async def test_real_adapter_to_gateway_handler_once_and_pending_human_preserved(
     await task
     runner._handle_message_admitted.assert_awaited_once()
     event = runner._handle_message_admitted.await_args.args[0]
-    assert event.metadata["hermes_native_candidate_id"] == receipt.candidate_id
+    assert event.metadata["hermes_native_candidate_id"] == runner._native_plugin_queue().lookup(manager.scope_key, claim.route_epoch, "delivery")["candidate"]
     assert event.text == "one" and event.allow_gateway_control is False
     # Even replay of the exact in-process event cannot re-enter the Gateway handler.
     await runner._handle_message(event)
@@ -204,7 +205,7 @@ async def test_real_adapter_to_gateway_handler_once_and_pending_human_preserved(
 async def test_cap_rejection_is_durable_and_distinct_candidates_never_merge(tmp_path, monkeypatch):
     runner, _, manager, claim = host(tmp_path, monkeypatch)
     for i in range(100):
-        assert (await admit(runner, manager, claim, str(i), "text")).state == "admitted"
+        assert (await admit(runner, manager, claim, str(i), "text")).state == "unknown"
     rejected = await admit(runner, manager, claim, "overflow", "last")
     assert rejected.state == "rejected" and rejected.reason == "native_queue_full"
     assert rejected.candidate_id is None
@@ -252,9 +253,9 @@ async def test_public_typed_callback_publisher_and_late_readback(tmp_path, monke
     try:
         receipt = await asyncio.to_thread(context.inject_message_admitted, "hello", surface="gateway",
             route_claim=claim, expected_session_id=claim.native_session_id, delivery_id="public")
-        assert receipt.state == "admitted"
+        assert receipt.state == "unknown"
         assert runner._query_native_plugin_admission(manager=manager, route_claim=claim,
-                                                     delivery_id="public") == receipt
+                                                     delivery_id="public", expected_content="hello") == receipt
     finally:
         runner._clear_plugin_message_injector()
         await asyncio.gather(runner._native_plugin_drain_task, return_exceptions=True)
@@ -274,7 +275,7 @@ async def test_boundaries_revoke_queued_execution_but_keep_admission(tmp_path, m
     await runner._drain_native_plugin_candidates_once()
     adapter._start_session_processing.assert_not_called()
     assert runner._query_native_plugin_admission(manager=manager, route_claim=claim,
-                                                delivery_id="delivery") == receipt
+                                                delivery_id="delivery", expected_content="one") == receipt
 
 
 @pytest.mark.asyncio
@@ -286,9 +287,9 @@ async def test_restart_status_of_old_epoch_with_new_host_owned_claim(tmp_path, m
     assert current.native_session_id == "B"
     assert restarted._query_native_plugin_admission(manager=manager, route_claim=current,
         delivery_id="delivery", route_epoch=claim.route_epoch,
-        expected_session_id=claim.native_session_id) == receipt
+        expected_session_id=claim.native_session_id, expected_content="one") == receipt
     assert restarted._query_native_plugin_admission(manager=manager, route_claim=claim,
-        delivery_id="delivery").state == "unknown"  # prior owner's proof has no authority
+        delivery_id="delivery", expected_content="one").state == "unknown"  # prior owner's proof has no authority
 
 
 @pytest.mark.asyncio
@@ -306,11 +307,11 @@ async def test_timeout_then_late_commit_is_queryable_without_second_insertion(tm
         assert unknown.state == "unknown" and unknown.reason == "admission_timeout"
         assert runner._native_plugin_queue().queued() == []
     for _ in range(100):
-        status = runner._query_native_plugin_admission(manager=manager, route_claim=claim, delivery_id="late")
-        if status.state == "admitted":
+        status = runner._query_native_plugin_admission(manager=manager, route_claim=claim, delivery_id="late", expected_content="late")
+        if status.reason == "native_queue_pending":
             break
         await asyncio.sleep(0.01)
-    assert status.state == "admitted"
+    assert status.state == "unknown"
     assert await admit(runner, manager, claim, "late", "late") == status
     adapter._start_session_processing.assert_not_called()
 
@@ -325,13 +326,14 @@ async def test_gate_rechecks_grant_profile_and_slot_absence(tmp_path, monkeypatc
     (tmp_path / "config.yaml").write_text("plugins:\n  entries:\n    bee:\n      allow_gateway_injection: true\n")
     assert await admit(runner, manager, claim) == rejected
     assert runner._query_native_plugin_admission(manager=manager, route_claim=claim,
-                                                delivery_id="delivery") == rejected
+                                                delivery_id="delivery", expected_content="one") == rejected
 
 
 @pytest.mark.asyncio
 async def test_restarted_queued_candidate_enters_real_gateway_native_wrapper(tmp_path, monkeypatch):
     runner, _, manager, claim = host(tmp_path, monkeypatch)
     receipt = await admit(runner, manager, claim)
+    assert receipt.state == "unknown"
     restarted, adapter, _, _ = host(tmp_path, monkeypatch)
     restarted._handle_message_admitted = AsyncMock(return_value=None)
     events = []
@@ -343,13 +345,14 @@ async def test_restarted_queued_candidate_enters_real_gateway_native_wrapper(tmp
     assert len(events) == 1
     await restarted._handle_message(events[0])
     restarted._handle_message_admitted.assert_awaited_once_with(events[0])
-    assert events[0].metadata["hermes_native_candidate_id"] == receipt.candidate_id
+    assert events[0].metadata["hermes_native_candidate_id"] == runner._native_plugin_queue().lookup(manager.scope_key, claim.route_epoch, "delivery")["candidate"]
 
 
 @pytest.mark.asyncio
 async def test_execution_cancelled_after_claim_never_replays(tmp_path, monkeypatch):
     runner, adapter, manager, claim = host(tmp_path, monkeypatch)
     receipt = await admit(runner, manager, claim)
+    assert receipt.state == "unknown" and receipt.candidate_id is None
     events = []
     adapter._start_session_processing.side_effect = lambda event, key: events.append(event) or True
     await runner._drain_native_plugin_candidates_once()
@@ -365,7 +368,8 @@ async def test_execution_cancelled_after_claim_never_replays(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, monkeypatch):
+@pytest.mark.parametrize("missing", [None, "slot", "turn_lease"])
+async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, monkeypatch, missing):
     """Only the external model call is replaced; route, leases, history and adapter are real."""
     import gateway.run as gateway_run
     from gateway.platforms.base import BasePlatformAdapter, PlatformConfig, SendResult
@@ -403,20 +407,37 @@ async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, mo
     manager.set_admission_host("gateway", runner, runner._admit_plugin_message, claim.host_owner_id)
     observed = []
     async def model(message, context_prompt, history, source, session_id, **kwargs):
+        status = runner._query_native_plugin_admission(manager=manager, route_claim=claim,
+            delivery_id="first" if message == "first native" else "second", expected_content=message)
+        assert status.state == "admitted" and status.candidate_id
         observed.append((message, session_id))
         return {"final_response": "", "messages": [], "tools": [], "history_offset": len(history),
                 "last_prompt_tokens": 0}
     runner._run_agent_inner = model
+    if missing == "slot":
+        runner._claim_active_session_slot = lambda *args: (None, None)
+    elif missing == "turn_lease":
+        runner._turn_leases.acquire = AsyncMock(return_value=None)
     first = await admit(runner, manager, claim, "first", "first native")
     second = await admit(runner, manager, claim, "second", "second native")
-    assert first.state == second.state == "admitted"
+    assert first.state == second.state == "unknown"
     for _ in range(2):
         await runner._drain_native_plugin_candidates_once()
         await adapter._session_tasks[entry.session_key]
+    if missing:
+        assert observed == []
+        assert (await admit(runner, manager, claim, "first", "first native")).state == "unknown"
+        assert len(runner._native_plugin_queue().queued()) == 0
+        return
     assert observed == [("first native", entry.session_id), ("second native", entry.session_id)]
-    assert (await admit(runner, manager, claim, "first", "first native")).candidate_id == first.candidate_id
+    assert (await admit(runner, manager, claim, "first", "first native")).state == "admitted"
     await runner._drain_native_plugin_candidates_once()
     assert len(observed) == 2
+    restarted, _, restarted_manager, restarted_claim = host(tmp_path, monkeypatch)
+    assert restarted._query_native_plugin_admission(manager=restarted_manager, route_claim=restarted_claim,
+        delivery_id="first", expected_content="first native").state == "admitted"
+    assert restarted._query_native_plugin_admission(manager=restarted_manager, route_claim=restarted_claim,
+        delivery_id="first", expected_content="wrong").state == "unknown"
 
 
 def test_process_dies_after_commit_receipt_and_candidate_survive(tmp_path):
@@ -461,6 +482,7 @@ async def test_replaced_publisher_cannot_commit_old_owner_request(tmp_path, monk
 async def test_slot_rejection_after_durable_admission_never_merges_or_reinserts(tmp_path, monkeypatch):
     runner, adapter, manager, claim = host(tmp_path, monkeypatch)
     receipt = await admit(runner, manager, claim)
+    assert receipt.state == "unknown" and receipt.candidate_id is None
     events = []
     adapter._start_session_processing.side_effect = lambda event, key: events.append(event) or True
     await runner._drain_native_plugin_candidates_once()
@@ -516,8 +538,8 @@ def test_sqlite_racing_payload_conflict_cannot_reuse_positive_receipt(tmp_path):
                            owner="o", plugin="bee", content=body)
     with ThreadPoolExecutor(max_workers=2) as pool:
         rows = list(pool.map(put, ["one", "two"]))
-    assert sorted(row["state"] for row in rows) == ["admitted", "unknown"]
-    assert next(row for row in rows if row["state"] == "unknown")["candidate"] is None
+    assert sorted(row["state"] for row in rows) == ["unknown", "unknown"]
+    assert next(row for row in rows if row["reason"] == "native_delivery_conflict")["candidate"] is None
     assert len(queue.queued()) == 1
 
 
@@ -530,6 +552,30 @@ async def test_same_delivery_wrong_native_or_key_never_reuses_admitted_receipt(t
     assert conflict.state == "unknown" and conflict.reason == "native_delivery_conflict"
     assert conflict.candidate_id is None
     assert runner._query_native_plugin_admission(manager=manager, route_claim=claim,
-        delivery_id="delivery", expected_session_id="other").state == "unknown"
+        delivery_id="delivery", expected_session_id="other", expected_content="one").state == "unknown"
     assert runner._query_native_plugin_admission(manager=manager, route_claim=claim,
-        delivery_id="delivery") == first
+        delivery_id="delivery", expected_content="one") == first
+
+
+@pytest.mark.asyncio
+async def test_busy_page_does_not_starve_idle_route(tmp_path, monkeypatch):
+    runner, adapter, manager, _ = host(tmp_path, monkeypatch)
+    for i in range(101):
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id=str(1000+i), user_id="42")
+        entry = runner.session_store.get_or_create_session(source)
+        claim = claim_for_route(runner, entry, source)
+        await admit(runner, manager, claim, str(i))
+        if i < 100:
+            adapter._active_sessions[entry.session_key] = asyncio.Event()
+    await runner._drain_native_plugin_candidates_once()
+    await runner._drain_native_plugin_candidates_once()
+    adapter._start_session_processing.assert_called_once()
+    assert adapter._start_session_processing.call_args.args[1] == entry.session_key
+
+
+@pytest.mark.asyncio
+async def test_status_requires_payload_binding(tmp_path, monkeypatch):
+    runner, _, manager, claim = host(tmp_path, monkeypatch)
+    await admit(runner, manager, claim)
+    with pytest.raises(TypeError):
+        runner._query_native_plugin_admission(manager=manager, route_claim=claim, delivery_id="delivery")

@@ -1,6 +1,6 @@
 """Durable Gateway-native candidates and their immutable admission receipts.
 
-Admission is the SQLite commit of the *candidate*, including its prompt. Execution
+Candidates begin unknown; admission additionally requires the native slot and turn lease. Execution
 is separate: a dispatch CAS is written before crossing into the adapter. An
 interrupted dispatch is never replayed automatically (the turn may have started).
 Rows are retained indefinitely: deleting a receipt would authorize a duplicate.
@@ -59,7 +59,7 @@ class NativePluginQueue:
     @staticmethod
     def receipt(row) -> AdmissionReceipt:
         return AdmissionReceipt(row["state"], row["reason"], row["delivery"],
-                                row["epoch"], row["candidate"])
+                                row["epoch"], row["candidate"] if row["state"] == "admitted" else None)
 
     def lookup(self, profile: str, epoch: str, delivery: str):
         with self._connection() as db:
@@ -90,7 +90,7 @@ class NativePluginQueue:
                 return dict(row)
             depth = db.execute("""SELECT COUNT(*) FROM candidates WHERE profile=? AND session_key=?
                                AND execution='queued'""", (profile, session_key)).fetchone()[0]
-            state, reason, candidate, execution = "admitted", "native_queue_committed", uuid.uuid4().hex, "queued"
+            state, reason, candidate, execution = "unknown", "native_queue_pending", uuid.uuid4().hex, "queued"
             if rejection_reason or depth >= cap:
                 state, reason, candidate, execution = ("rejected", rejection_reason or "native_queue_full",
                                                         None, "not_inserted")
@@ -104,12 +104,22 @@ class NativePluginQueue:
         # Return only after the context manager committed successfully.
         return dict(row)
 
-    def queued(self):
+    def queued(self, after=0):
+        # Rotate a bounded page over route heads, including when earlier routes stay busy.
         with self._connection() as db:
-            return [dict(row) for row in db.execute(
+            rows = [dict(row) for row in db.execute(
                 """SELECT * FROM candidates WHERE sequence IN (
                     SELECT MIN(sequence) FROM candidates WHERE execution='queued'
-                    GROUP BY profile, session_key) ORDER BY sequence LIMIT 100""")]
+                    GROUP BY profile, session_key) AND sequence > ? ORDER BY sequence LIMIT 100""",
+                (after,))]
+        return rows
+
+    def settle(self, candidate: str) -> bool:
+        """Called only while the real native slot, turn lease and route gate are held."""
+        with self._connection() as db:
+            changed = db.execute("""UPDATE candidates SET state='admitted', reason='native_turn_admitted'
+                WHERE candidate=? AND state='unknown' AND execution='running'""", (candidate,)).rowcount
+        return changed == 1
 
     def transition(self, candidate: str, expected: str, execution: str) -> bool:
         with self._connection() as db:
