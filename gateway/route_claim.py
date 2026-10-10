@@ -29,6 +29,7 @@ class RouteClaim:
     host_owner_id: str
     _proof: object = field(repr=False, compare=False)
     _validate: Callable[["RouteClaim"], bool] = field(repr=False, compare=False)
+    _validate_route: Callable[["RouteClaim"], bool] = field(repr=False, compare=False)
 
     def is_current(
         self, *, profile_home_key: Optional[str] = None, session_key: Optional[str] = None,
@@ -40,6 +41,14 @@ class RouteClaim:
                 or native_session_id is not None and native_session_id != self.native_session_id):
             return False
         return self._validate(self)
+
+    def is_route_current(self) -> bool:
+        """Validate a delayed delivery binding after its issuing turn lease has ended.
+
+        This does not grant admission; the host must acquire a fresh lease/slot and settle an
+        exact delivery receipt under its own route gate. Never use this as a tool join check.
+        """
+        return self._validate_route(self)
 
 
 @dataclass(frozen=True)
@@ -121,11 +130,13 @@ def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
     if not owns_turn():
         return None
 
-    def validate(claim: RouteClaim) -> bool:
+    def validate_route(claim: RouteClaim) -> bool:
         if (getattr(store, "_route_owner_retired", False) or compacted_in_place()
-                or not owns_turn() or claim._proof is not proof):
+                or claim._proof is not proof):
             return False
-        if claim.profile_home_key != bound.profile_home_key or claim.surface != "gateway":
+        if (claim.surface != "gateway" or claim.profile_home_key != bound.profile_home_key
+                or claim.session_key != key or claim.native_session_id != native_session_id
+                or claim.route_epoch != epoch or claim.host_owner_id != owner):
             return False
         with store._lock:
             current = store._entry_locked(key)
@@ -134,7 +145,10 @@ def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
                          and not current.route_claim_blocked
                          and store._route_owner_id == owner
                          and store._route_claim_proof is proof)
-        return valid and owns_turn()
+        return valid
+
+    def validate(claim: RouteClaim) -> bool:
+        return owns_turn() and validate_route(claim) and owns_turn()
 
     return RouteClaim("gateway", bound.profile_home_key, key, native_session_id, epoch,
-                      owner, proof, validate)
+                      owner, proof, validate, validate_route)

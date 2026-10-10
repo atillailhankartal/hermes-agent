@@ -139,18 +139,34 @@ class GatewaySessionCommandsMixin:
                 "Agent resource cleanup for session %s failed during /new reset: %s (#35994)",
                 session_key, cleanup_exc)
 
-    async def _fire_session_reset_hooks(self, source: SessionSource, session_key: str, old_sid,
-                                        new_sid) -> None:
+    async def _fire_session_reset_hooks(self, source: SessionSource, session_key: str, old_entry,
+                                        new_entry) -> None:
         """Session-boundary hooks: plugin finalize (off-loop + bounded — trace exports can block
         arbitrarily), then session:end and session:reset."""
+        from gateway.route_lifecycle import emit_route_lifecycle, route_lifecycle_payload
+
         platform_value = source.platform.value if source.platform else ""
-        with contextlib.suppress(Exception):
+        old_sid = old_entry.session_id if old_entry else None
+        new_sid = new_entry.session_id if new_entry else None
+        if old_entry is not None:
+            old_route = route_lifecycle_payload(self, old_entry, source)
             await self._finalize_session_off_loop(
-                session_id=old_sid, platform=platform_value, reason="new_session",
-                old_session_id=old_sid, new_session_id=new_sid)
+                session_id=old_sid, platform=platform_value, reason="new_session", session_key=session_key,
+                old_session_id=old_sid, new_session_id=new_sid,
+                route_epoch=old_route["route_epoch"], host_owner_id=old_route["host_owner_id"],
+                profile_home_key=old_route["profile_home_key"], native_session_id=old_sid,
+                route_is_current=old_route["route_is_current"], surface="gateway",
+            )
         hook_payload = {"platform": platform_value, "user_id": source.user_id, "session_key": session_key}
         await self.hooks.emit("session:end", dict(hook_payload))
         await self.hooks.emit("session:reset", dict(hook_payload))
+        if new_entry is not None:
+            new_route = route_lifecycle_payload(self, new_entry, source)
+            await emit_route_lifecycle(self, "on_session_reset", {
+                **new_route, "reason": "new_session", "old_session_id": old_sid,
+                "old_route_epoch": old_entry.route_epoch if old_entry else None,
+                "new_session_id": new_sid, "user_id": source.user_id,
+            })
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
@@ -166,7 +182,7 @@ class GatewaySessionCommandsMixin:
         # release (run_generation=old) will return False and leave its dead agent behind; clearing here
         # keeps the slot from becoming a zombie that silently drops all later messages (#28686). Idempotent,
         # so the run's finally calling it again is harmless.
-        old_entry = self.session_store._entries.get(session_key)
+        old_entry = await self.async_session_store.lookup_by_session_key(session_key)
         await self._cleanup_old_agent_for_reset(session_key)
         self._evict_cached_agent(session_key)
         # Conversation boundary: ALL conversation-scoped per-session state + security state in one
@@ -181,19 +197,20 @@ class GatewaySessionCommandsMixin:
         _reset_process_scoped_tool_state()
 
         new_entry = await self.async_session_store.reset_session(session_key)
+        was_reset = new_entry is not None
+        if new_entry is None:
+            new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
         _old_sid = old_entry.session_id if old_entry else None
-        await self._fire_session_reset_hooks(source, session_key, _old_sid,
-                                             new_entry.session_id if new_entry else None)
+        await self._fire_session_reset_hooks(source, session_key, old_entry, new_entry)
         # Scoped to the profile serving this source so a multiplexed /new banner reports the
         # profile's model, not the base config's.
         try:
             session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
         except Exception:
             session_info = ""
-        if new_entry:
+        if was_reset:
             default_header = t("gateway.reset.header_default")
         else:  # no existing session: create one
-            new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
             default_header = t("gateway.reset.header_new")
         header = await asyncio.to_thread(self._telegram_topic_new_header, source) or default_header
         _title_arg = event.get_command_args().strip()
@@ -207,14 +224,6 @@ class GatewaySessionCommandsMixin:
             except Exception:
                 logger.debug("Failed to rebind Telegram topic after /new", exc_info=True)
         _new_sid = new_entry.session_id if new_entry else None
-        # Plugin on_session_reset hook (new session guaranteed to exist); best-effort.
-        try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _invoke_hook("on_session_reset", session_id=_new_sid, reason="new_session",
-                         platform=source.platform.value if source.platform else "",
-                         old_session_id=_old_sid, new_session_id=_new_sid)
-        except Exception:
-            pass
         try:
             from hermes_cli.tips import get_random_tip
             _tip_line = t("gateway.reset.tip", tip=get_random_tip())
@@ -991,6 +1000,7 @@ class GatewaySessionCommandsMixin:
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
         old_sid = current_entry.session_id
+        old_epoch = current_entry.route_epoch
         # Freeze generation invalidation and the durable route CAS under the same per-key gate.
         # Cancellation drains the offloaded write before another /new or turn can enter.
         async with self._session_route_gate(session_key):
@@ -1016,6 +1026,14 @@ class GatewaySessionCommandsMixin:
         # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
         # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
         self._clear_conversation_scope(session_key, reason="resume")
+        # The route is durable now. Publish an immutable keyed transition before slow banner
+        # reads; a delayed observer can see a later /new and reject this exact epoch.
+        from gateway.route_lifecycle import emit_route_lifecycle, route_lifecycle_payload
+        await emit_route_lifecycle(self, "on_session_resumed", {
+            **route_lifecycle_payload(self, new_entry, source), "reason": "resume",
+            "old_session_id": old_sid, "old_route_epoch": old_epoch,
+            "new_session_id": new_entry.session_id, "user_id": source.user_id,
+        })
         # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
         # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
         # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
