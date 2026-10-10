@@ -175,6 +175,11 @@ class TuiPluginHostMixin:
         if route_claim is not None:
             kwargs["route_claim"] = dict(route_claim)
         try:
+            # The process-published TUI host is shared by all profile managers.
+            # Only that host opts in to receiving the calling manager, so it can
+            # prove the target record belongs to the profile that granted access.
+            if getattr(registered[1], "_tui_manager_aware", False) is True:
+                kwargs["manager"] = self
             return registered[1](**kwargs) is True
         except Exception:  # health: allow BLE001 -- third-party host failures deny ingress without logging message text
             # Host exceptions may contain prompt text; never copy their detail into logs.

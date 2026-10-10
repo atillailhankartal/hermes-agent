@@ -15,6 +15,7 @@ def test_no_arg_startup_cannot_restamp_after_successor_publication(tmp_path, mon
     late_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(launch_home))
     manager = plugins.get_plugin_manager()
+    monkeypatch.setattr(manager, "_tui_injection_allowed", lambda _plugin_id: True)
     monkeypatch.setattr(tui_host, "_atexit_registered", True)
 
     owner_a = tui_host._TUI_INJECT_OWNER
@@ -50,6 +51,7 @@ def test_no_arg_startup_cannot_restamp_after_successor_publication(tmp_path, mon
                 token = set_hermes_home_override(str(late_home))
                 try:
                     late_manager = plugins.get_plugin_manager()
+                    monkeypatch.setattr(late_manager, "_tui_injection_allowed", lambda _plugin_id: True)
                 finally:
                     reset_hermes_home_override(token)
             finally:
@@ -61,13 +63,14 @@ def test_no_arg_startup_cannot_restamp_after_successor_publication(tmp_path, mon
         assert late_manager._tui_message_injector[0] is owner_b
 
         tui_host.clear_tui_message_injector()
-        assert manager.inject_tui_message(content="probe") is True
-        assert late_manager.inject_tui_message(content="probe") is True
+        probe = dict(session_key="route", expected_session_id="native", content="probe", plugin_id="owner-test")
+        assert manager.inject_tui_message(**probe) is True
+        assert late_manager.inject_tui_message(**probe) is True
         assert calls[-2:] == ["B", "B"]
 
         plugins.clear_published_tui_message_host(owner_b)
-        assert manager.inject_tui_message(content="probe") is False
-        assert late_manager.inject_tui_message(content="probe") is False
+        assert manager.inject_tui_message(**probe) is False
+        assert late_manager.inject_tui_message(**probe) is False
         assert manager.inject_gateway_message(content="probe") is True
         assert late_manager.inject_gateway_message(content="probe") is True
         assert calls[-2:] == ["gateway", "gateway"]

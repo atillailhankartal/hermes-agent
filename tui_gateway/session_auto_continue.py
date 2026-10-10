@@ -149,7 +149,9 @@ def _ac_inflight_original(session: dict) -> str:
 
 
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
-                    turn_author: dict | None = None) -> dict | None:
+                    turn_author: dict | None = None, plugin_origin: str | None = None,
+                    plugin_candidate_id: str | None = None,
+                    plugin_delivery_id: str | None = None) -> dict | None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
@@ -162,13 +164,20 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     _drop_queued_duplicates_of_inflight_user(session)
     text_only = not image_paths and isinstance(text, str)
     # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
-    if text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
+    if (text_only and not turn_author and not plugin_origin
+            and text.strip() == _ac_inflight_original(session) != ""):
         return None
-    queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {}),
-              **({"turn_author": turn_author} if turn_author else {})}
+    queued = {"text": text, "transport": transport,
+              **({"image_paths": image_paths} if image_paths or plugin_origin else {}),
+              **({"turn_author": turn_author} if turn_author else {}),
+              **({"plugin_origin": plugin_origin} if plugin_origin else {}),
+              **({"plugin_candidate_id": plugin_candidate_id} if plugin_candidate_id else {}),
+              **({"plugin_delivery_id": plugin_delivery_id} if plugin_delivery_id else {})}
     existing = session.get("queued_prompt")
-    if (existing and text_only and not turn_author and isinstance(existing.get("text"), str)
+    if (existing and text_only and not turn_author and not plugin_origin
+            and isinstance(existing.get("text"), str)
             and not existing.get("image_paths") and not existing.get("turn_author")
+            and not existing.get("plugin_origin")
             and not session.get("queued_prompts")):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -192,7 +201,8 @@ def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict |
     if not isinstance(entry, dict):
         return None
     text = entry.get("text")
-    if not original or entry.get("image_paths") or entry.get("turn_author") or not isinstance(text, str):
+    if (not original or entry.get("image_paths") or entry.get("turn_author")
+            or entry.get("plugin_origin") or not isinstance(text, str)):
         return entry
     # A lossless text-merge may have glued the live original onto a later follow-up: keep the remainder.
     rest = next((text[len(original + sep):] for sep in ("\n\n", "\n") if text.startswith(original + sep)), text).strip()
@@ -485,7 +495,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     kwargs: dict = {"queued_prompt_generation": queue_generation}
-    if queued.get("image_paths"):
+    if queued.get("plugin_origin"):
+        kwargs["image_paths"] = []
+    elif "image_paths" in queued:
         kwargs["image_paths"] = queued["image_paths"]
     # Re-place the accept-time rows (if any) at the transcript END before the turn's rows follow
     # them, and slot the dispatching envelope's fresh row for adoption. EVERY queued envelope is
