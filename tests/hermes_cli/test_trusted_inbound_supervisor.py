@@ -153,6 +153,16 @@ def _linux_uid_fixture():
         os.setgid(uid)
         os.setuid(uid)
 
+    def malformed_connection(body):
+        import struct
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(3)
+            conn.connect(str(path))
+            conn.sendall(struct.pack('>I', len(body)) + body)
+            conn.shutdown(socket.SHUT_WR)
+            assert conn.recv(1) == b''
+
     def denied_connection(expected_pid):
         import hashlib
         from dataclasses import asdict
@@ -202,6 +212,8 @@ def _linux_uid_fixture():
                                             host_pid=os.getpid(), broker=broker, queue=queue,
                                             current_binding=lambda: value)
             assert forged.receive(value) is None
+            malformed_connection(b'[' * 1100 + b'0' + b']' * 1100)
+            malformed_connection(b'{"broken":')
             assert receiver.receive(value) is not None
             assert receiver.receive(value) is None
             receiver.close_before_model()
@@ -222,7 +234,8 @@ def _linux_uid_fixture():
             )).state == 'unknown'
             os.write(result_write, json.dumps({'host_uid': os.getuid(), 'host_pid': os.getpid(),
                                               'model_pid': model_pid, 'replay': 'denied',
-                                              'closed_receiver': 'denied', 'cas': 'one event'}).encode())
+                                              'closed_receiver': 'denied', 'cas': 'one event',
+                                              'malformed_frames': 'rejected; listener survived'}).encode())
             os._exit(0)
         except BaseException:
             import traceback
@@ -237,12 +250,25 @@ def _linux_uid_fixture():
             import hashlib
             value = replace(value, payload_sha256=hashlib.sha256(b'payload').hexdigest())
             service, _, transport = supervisor(value)
+            import hermes_cli.trusted_inbound_grant_ipc as ipc
+            receive = ipc._receive
+            parse_calls = []
+
+            def counted_receive(conn):
+                parse_calls.append(True)
+                return receive(conn)
+
+            ipc._receive = counted_receive
             with PreModelGrantServer(path, supervisor=service, timeout=10) as server:
                 os.write(ready_write, b'1')
                 assert server.serve_once() is False  # model UID
                 assert server.serve_once() is False  # same UID, wrong PID
+                assert parse_calls == []  # unauthorized peers cannot reach JSON parsing
                 assert server.serve_once() is False  # host rejects unpinned issuer
-                assert server.serve_once() is True   # exact host
+                assert server.serve_once() is False  # authenticated excessive nesting
+                assert server.serve_once() is False  # authenticated malformed JSON
+                assert not transport.requests
+                assert server.serve_once() is True   # listener survives for exact host
             assert [r.kind for r in transport.requests] == [1]
             os._exit(0)
         except BaseException:
@@ -317,3 +343,34 @@ def test_grant_frames_reject_ambiguous_payload(body):
         left.shutdown(socket.SHUT_WR)
         with pytest.raises(ValueError):
             _receive(right)
+
+
+@pytest.mark.parametrize('body', [b'[' * 9 + b'0' + b']' * 9,
+                                 b'[' * 1100 + b'0' + b']' * 1100,
+                                 b'{"nested":' * 1100 + b'0' + b'}' * 1100,
+                                 ('[' * 1100 + '0' + ']' * 1100).encode('utf-16')],
+                         ids=['depth-nine', 'deep-array', 'deep-object', 'deep-utf16'])
+def test_grant_frames_reject_excessive_nesting(body):
+    import socket
+    import struct
+    from hermes_cli.trusted_inbound_grant_ipc import _receive
+
+    left, right = socket.socketpair()
+    with left, right:
+        left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+        left.settimeout(3)
+        left.sendall(struct.pack('>I', len(body)) + body)
+        left.shutdown(socket.SHUT_WR)
+        with pytest.raises(ValueError):
+            _receive(right)
+
+
+def test_grant_frame_string_delimiters_do_not_count_as_nesting():
+    import socket
+    from hermes_cli.trusted_inbound_grant_ipc import _receive, _send
+
+    value = {'binding': {'session_key': '[{\\"' * 20}}
+    left, right = socket.socketpair()
+    with left, right:
+        _send(left, value)
+        assert _receive(right) == value

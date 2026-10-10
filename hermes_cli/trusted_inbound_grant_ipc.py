@@ -22,6 +22,7 @@ from hermes_cli.trusted_inbound_broker import PreModelBrokerGrant
 from hermes_cli.trusted_inbound_supervisor import DeliveryBinding, current_uid
 
 _MAX_FRAME = 65536
+_MAX_JSON_DEPTH = 8
 
 
 def _peer(conn):
@@ -50,11 +51,35 @@ def _unique(pairs):
     return result
 
 
+def _bounded_json(body):
+    # Match json.loads' byte decoding so UTF-16/32 cannot bypass the depth limit.
+    text = body.decode(json.detect_encoding(body), 'surrogatepass')
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in '[{':
+            depth += 1
+            if depth > _MAX_JSON_DEPTH:
+                raise ValueError('grant JSON nesting limit exceeded')
+        elif char in ']}':
+            depth -= 1
+    return json.loads(text, object_pairs_hook=_unique)
+
+
 def _receive(conn):
     size = struct.unpack('>I', _exact(conn, 4))[0]
     if not 1 <= size <= _MAX_FRAME:
         raise ValueError('invalid grant frame size')
-    value = json.loads(_exact(conn, size), object_pairs_hook=_unique)
+    value = _bounded_json(_exact(conn, size))
     if conn.recv(1):
         raise ValueError('trailing grant data')
     return value
