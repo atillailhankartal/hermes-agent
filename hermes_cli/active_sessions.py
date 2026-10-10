@@ -415,6 +415,42 @@ class ActiveSessionLease:
         release_active_session(self)
 
 
+@contextmanager
+def active_session_lease_guard(
+    lease: ActiveSessionLease | None, *, session_id: str, live_session_id: str,
+    registry_home: str | Path | None = None,
+) -> Iterator[None]:
+    """Keep a verified lease row pinned while a caller performs a short history commit.
+
+    Callers must not hold this file lock across an LLM/network call. A compute-host child may
+    present its inert ``borrowed:<parent-id>`` token, but only the parent's real row proves it.
+    """
+    home = _registry_home(registry_home)
+    expected_state, expected_lock = _lease_paths(registry_home=home)
+    if lease is None or lease.released or not session_id or not live_session_id:
+        raise ActiveSessionRegistryError("active session lease is not current")
+    if lease.enabled:
+        state_path, lock_path = _lease_paths(lease)
+        if (lease.state_path is None or lease.lock_path is None
+                or state_path.resolve() != expected_state.resolve()
+                or lock_path.resolve() != expected_lock.resolve()):
+            raise ActiveSessionRegistryError("active session lease belongs to another profile")
+        lease_id = str(lease.lease_id)
+    else:
+        state_path, lock_path = expected_state, expected_lock
+        lease_id = str(lease.lease_id).removeprefix("borrowed:")
+        if lease_id == str(lease.lease_id):
+            raise ActiveSessionRegistryError("active session borrow has no parent lease")
+    with _FileLock(lock_path):
+        row = next((entry for entry in _read_entries(state_path, strict=True)
+                    if str(entry.get("lease_id") or "") == lease_id), None)
+        if (row is None or str(row.get("session_id") or "") != session_id
+                or str((row.get("metadata") or {}).get("live_session_id") or "") != live_session_id
+                or (lease.enabled and _registry_pid(row.get("pid")) != os.getpid())):
+            raise ActiveSessionRegistryError("active session lease is not current")
+        yield
+
+
 def _clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return {str(k): v for k, v in metadata.items() if isinstance(k, str)}
 
