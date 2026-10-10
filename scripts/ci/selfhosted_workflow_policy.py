@@ -29,10 +29,15 @@ REQUIRED_JOBS = {
     "stable-release-publication.yml": {"reconcile"},
     "ci-review-comment.yml": {"comment"},
     "install-e2e-red.yml": {"track"},
+    "install-e2e-macos-run.yml": {"e2e"},
     "deploy-site.yml": {"deploy-vercel", "deploy-docs"},
     "docker.yml": {"build", "publish"},
 }
-REQUIRED_CALLER_RUNNERS = {("install-e2e-macos-run.yml", "e2e"): "hermes-macos-arm64"}
+REQUIRED_CALLERS = {
+    ("install-e2e-macos-run.yml", "e2e"): (
+        "./.github/workflows/install-e2e-run.yml", "hermes-macos-arm64"
+    ),
+}
 EXPRESSION = re.compile(r"^\$\{\{\s*(.*?)\s*\}\}$")
 LITERAL = re.compile(r"'([^']*)'|\"([^\"]*)\"")
 
@@ -115,6 +120,7 @@ def check(root: Path, manifest: dict) -> list[str]:
         errors.append(f"workflow file set changed: missing={sorted(set(expected)-set(files))}, new={sorted(set(files)-set(expected))}")
     job_count = 0
     seen_jobs = {}
+    job_definitions = {}
     for filename, path in sorted(files.items()):
         try:
             doc = yaml.load(path.read_text(), Loader=UniqueBaseLoader)
@@ -129,6 +135,10 @@ def check(root: Path, manifest: dict) -> list[str]:
         job_count += len(doc["jobs"])
         for name, job in doc["jobs"].items():
             key = f"{filename}:{name}"
+            if not isinstance(job, dict):
+                errors.append(f"{key}: job must be a mapping")
+                continue
+            job_definitions[(filename, name)] = job
             called = job.get("uses")
             if called is not None:
                 if not isinstance(called, str) or called not in {f"./.github/workflows/{n}" for n in files}:
@@ -140,11 +150,6 @@ def check(root: Path, manifest: dict) -> list[str]:
                     runner_input = call_inputs["runner"]
                     if not isinstance(runner_input, str) or runner_input not in PLATFORMS:
                         errors.append(f"{key}: unapproved caller runner input: {runner_input}")
-                    expected_runner = REQUIRED_CALLER_RUNNERS.get((filename, name))
-                    if expected_runner and runner_input != expected_runner:
-                        errors.append(f"{key}: caller runner changed from required {expected_runner}")
-                elif (filename, name) in REQUIRED_CALLER_RUNNERS:
-                    errors.append(f"{key}: required caller runner input missing")
                 if "runs-on" in job:
                     errors.append(f"{key}: callable job also declares runs-on")
                 continue
@@ -175,6 +180,17 @@ def check(root: Path, manifest: dict) -> list[str]:
         missing = required - seen_jobs.get(filename, set())
         if missing:
             errors.append(f"{filename}: required jobs missing: {sorted(missing)}")
+    for (filename, name), (target, runner_label) in REQUIRED_CALLERS.items():
+        job = job_definitions.get((filename, name))
+        if job is None:
+            errors.append(f"{filename}:{name}: required caller missing")
+            continue
+        if job.get("uses") != target:
+            errors.append(f"{filename}:{name}: required caller target changed from {target}")
+        call_inputs = job.get("with")
+        actual_runner = call_inputs.get("runner") if isinstance(call_inputs, dict) else None
+        if actual_runner != runner_label:
+            errors.append(f"{filename}:{name}: required caller runner changed from {runner_label}")
     return errors
 
 

@@ -87,6 +87,32 @@ def test_actual_macos_caller_cannot_switch_reusable_target(tmp_path):
     assert check(tmp_path, manifest)
 
 
+def test_renamed_macos_caller_with_linux_runner_fails_after_digest_refresh(tmp_path):
+    workflows, manifest = real_tree(tmp_path)
+    caller = workflows / "install-e2e-macos-run.yml"
+    mutate(caller, "  e2e:\n", "  script-e2e:\n")
+    mutate(caller, "runner: hermes-macos-arm64", "runner: hermes-linux-x64")
+    refresh_digest(manifest, caller)
+    assert any("required caller" in issue for issue in check(tmp_path, manifest))
+
+
+def test_switched_macos_caller_target_fails_after_digest_refresh(tmp_path):
+    workflows, manifest = real_tree(tmp_path)
+    caller = workflows / "install-e2e-macos-run.yml"
+    mutate(caller, "uses: ./.github/workflows/install-e2e-run.yml",
+           "uses: ./.github/workflows/install-e2e-windows-run.yml")
+    refresh_digest(manifest, caller)
+    assert any("required caller" in issue for issue in check(tmp_path, manifest))
+
+
+def test_removed_macos_caller_identity_fails_with_job_count_preserved(tmp_path):
+    workflows, manifest = real_tree(tmp_path)
+    caller = workflows / "install-e2e-macos-run.yml"
+    mutate(caller, "  e2e:\n", "  replacement:\n")
+    refresh_digest(manifest, caller)
+    assert any("required caller" in issue for issue in check(tmp_path, manifest))
+
+
 def test_unapproved_caller_runner_is_rejected_even_when_digest_is_refreshed(tmp_path):
     workflows, manifest = real_tree(tmp_path)
     caller = workflows / "install-e2e-macos-run.yml"
@@ -105,7 +131,7 @@ def test_macos_caller_cannot_use_approved_linux_runner_with_refreshed_digest(tmp
 
 def test_empty_workflow_set_and_empty_manifest_fail_closed(tmp_path):
     (tmp_path / ".github" / "workflows").mkdir(parents=True)
-    assert check(tmp_path, {"workflows": {}})
+    assert any("minimum" in issue for issue in check(tmp_path, {"schemaVersion": 2, "workflows": {}}))
 
 
 def test_required_ci_policy_job_cannot_be_removed_with_refreshed_digest(tmp_path):
