@@ -92,7 +92,7 @@ class NativeFixtureTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertLess(len(result.stdout.encode()), 16384)
         data = json.loads(result.stdout)
-        self.assertGreaterEqual(data["checks"], 80)
+        self.assertGreaterEqual(data["checks"], 162)
         self.assertEqual(data["failures"], 0)
         self.assertTrue(data["cleanup"])
         self.assertFalse(Path(data["directory"]).exists())

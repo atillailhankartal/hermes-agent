@@ -12,6 +12,8 @@ struct bh_socket_observation {
 };
 /* Caller retains directory_fd and FD6 exclusively throughout the call.
  * Strings and node metadata are consistency inputs, never a trusted manifest.
+ * pathname must use the exact canonical parent spelling returned by F_GETPATH;
+ * aliases (including /tmp for /private/tmp) are not normalized.
  * pathname_length excludes NUL; pathname must contain that many readable bytes.
  * basename is NUL terminated within 104 bytes. No descriptor is consumed. */
 struct bh_socket_expectation {

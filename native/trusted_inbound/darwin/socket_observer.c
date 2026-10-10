@@ -1,6 +1,7 @@
 /* Dormant local measurement only; no runtime admission consumer. */
 #include "socket_observer.h"
 #include <sys/socket.h>
+#include <sys/param.h>
 #include <sys/un.h>
 #include <sys/proc_info.h>
 #include <sys/sysctl.h>
@@ -32,7 +33,13 @@ _Static_assert(SO_ACCEPTCONN == 0x0002 && PROC_PIDFDSOCKETINFO == 3, "unsupporte
 _Static_assert(AF_UNIX == 1 && SOCK_STREAM == 1 && SOCKINFO_UN == 3, "unsupported SDK socket kinds");
 _Static_assert(sizeof(((struct socket_info *)0)->soi_options) == 2, "unsupported option width");
 
+_Static_assert(SOI_S_NBIO == 0x0100 && SOI_S_ASYNC == 0x0200, "unsupported SDK state modes");
+_Static_assert(sizeof(((struct socket_info *)0)->soi_state) == 2 &&
+               sizeof(((struct socket_info *)0)->soi_error) == 2, "unsupported state/error width");
+#define ALLOWED_STATE ((uint16_t)(SOI_S_NBIO | SOI_S_ASYNC))
+
 struct direct_snapshot {
+    char directory_path[MAXPATHLEN];
     struct stat descriptor, node, directory;
     struct sockaddr_un address;
     socklen_t address_length;
@@ -78,17 +85,29 @@ static bool valid_address(const struct sockaddr_un *a, size_t length,
         !memcmp(a->sun_path, e->pathname, e->pathname_length) &&
         (available == e->pathname_length || a->sun_path[e->pathname_length] == '\0');
 }
+/* F_GETPATH has no size argument: storage must be at least MAXPATHLEN.
+ * Canonical means this OS path view, not firmlink-independent provenance. */
+static bool parent_matches(const char directory_path[MAXPATHLEN], const struct bh_socket_expectation *e)
+{
+    size_t length = strnlen(directory_path, MAXPATHLEN);
+    size_t prefix = e->pathname_length - strlen(e->basename) - 1;
+    if (prefix == 0) return length == 1 && directory_path[0] == '/';
+    /* Reject //basename rather than normalizing the root spelling. */
+    return prefix != 1 && length == prefix && length < MAXPATHLEN &&
+        !memcmp(directory_path, e->pathname, length);
+}
 static bool valid_direct(const struct direct_snapshot *d, const struct bh_socket_expectation *e)
 {
     return d->complete && d->descriptor_flags >= 0 && d->status_flags >= 0 &&
-        d->type == SOCK_STREAM && S_ISSOCK(d->descriptor.st_mode) && S_ISDIR(d->directory.st_mode) &&
+        parent_matches(d->directory_path, e) && d->type == SOCK_STREAM && S_ISSOCK(d->descriptor.st_mode) && S_ISDIR(d->directory.st_mode) &&
         same_path_metadata(&d->node, &e->node) && valid_address(&d->address, d->address_length, e);
 }
 static bool same_direct(const struct direct_snapshot *a, const struct direct_snapshot *b)
 {
     return same_node(&a->descriptor, &b->descriptor) && same_path_metadata(&a->node, &b->node) &&
         same_node(&a->directory, &b->directory) && a->descriptor_flags == b->descriptor_flags &&
-        a->status_flags == b->status_flags && a->address_length == b->address_length;
+        a->status_flags == b->status_flags && a->address_length == b->address_length &&
+        !strcmp(a->directory_path, b->directory_path);
 }
 static struct direct_snapshot read_direct(const struct bh_socket_expectation *e)
 {
@@ -101,6 +120,7 @@ static struct direct_snapshot read_direct(const struct bh_socket_expectation *e)
     socklen_t peer_length = sizeof(peer);
     if (d.descriptor_flags < 0 || d.status_flags < 0 || fstat(6, &d.descriptor) ||
         fstat(e->directory_fd, &d.directory) ||
+        fcntl(e->directory_fd, F_GETPATH, d.directory_path) == -1 ||
         fstatat(e->directory_fd, e->basename, &d.node, AT_SYMLINK_NOFOLLOW) ||
         getsockopt(6, SOL_SOCKET, SO_TYPE, &d.type, &type_length) || type_length != sizeof(d.type) ||
         getsockname(6, (struct sockaddr *)&d.address, &d.address_length)) return d;
@@ -139,7 +159,8 @@ static bool valid_record(const struct socket_sample *s, const struct bh_socket_e
         valid_address(&i->soi_proto.pri_un.unsi_addr.ua_sun,
                       i->soi_proto.pri_un.unsi_addr.ua_sun.sun_len, e) &&
         i->soi_proto.pri_un.unsi_addr.ua_sun.sun_len == s->before.address_length &&
-        !(i->soi_state & SOI_S_ISCONNECTED) && !i->soi_proto.pri_un.unsi_conn_so &&
+        i->soi_error == 0 && !((uint16_t)i->soi_state & (uint16_t)~ALLOWED_STATE) &&
+        !i->soi_proto.pri_un.unsi_conn_so &&
         !i->soi_proto.pri_un.unsi_conn_pcb;
 }
 /* Private, deterministic production validator. Tests include this translation unit;
@@ -160,6 +181,7 @@ static struct bh_socket_observation validate_samples(const struct socket_sample 
     }
     const struct socket_info *a = &samples[0].record.psi, *b = &samples[1].record.psi;
     if (a->soi_so != b->soi_so || a->soi_pcb != b->soi_pcb ||
+        (uint16_t)a->soi_state != (uint16_t)b->soi_state ||
         ((uint16_t)a->soi_options & SO_ACCEPTCONN) != ((uint16_t)b->soi_options & SO_ACCEPTCONN)) return result;
     result.state = ((uint16_t)a->soi_options & SO_ACCEPTCONN) ? BH_LISTENER_OBSERVED : BH_BOUND_OBSERVED;
     result.reason = BH_OBSERVED;

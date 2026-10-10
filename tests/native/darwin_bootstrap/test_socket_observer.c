@@ -35,6 +35,29 @@ static void pure_matrix(const struct bh_socket_expectation *e)
         good[k].after = read_direct(e);
     }
     check(validate_samples(good, e).state == BH_BOUND_OBSERVED, "pure bound seed");
+    const uint16_t forbidden[] = {SOI_S_NOFDREF, SOI_S_ISCONNECTED, SOI_S_ISCONNECTING,
+        SOI_S_ISDISCONNECTING, SOI_S_CANTSENDMORE, SOI_S_CANTRCVMORE, SOI_S_RCVATMARK,
+        SOI_S_PRIV, SOI_S_INCOMP, SOI_S_COMP, SOI_S_ISDISCONNECTED, SOI_S_DRAINING, 0x8000};
+    for (unsigned k = 0; k < 2; k++) {
+        struct socket_sample error[2]; memcpy(error, good, sizeof(error));
+        error[k].record.psi.soi_error = EIO;
+        check(validate_samples(error, e).state == BH_UNKNOWN, "socket error in either record");
+        for (size_t n = 0; n < sizeof(forbidden) / sizeof(forbidden[0]); n++) {
+            struct socket_sample bad[2]; memcpy(bad, good, sizeof(bad));
+            bad[k].record.psi.soi_state = (short)forbidden[n];
+            check(validate_samples(bad, e).state == BH_UNKNOWN, "hazardous or unknown state in either record");
+            bad[1-k].record.psi.soi_state = (short)forbidden[n];
+            check(validate_samples(bad, e).state == BH_UNKNOWN, "stable hazardous state in both records");
+        }
+        const short allowed[] = {SOI_S_NBIO, SOI_S_ASYNC, SOI_S_NBIO | SOI_S_ASYNC};
+        for (size_t n = 0; n < sizeof(allowed) / sizeof(allowed[0]); n++) {
+            struct socket_sample bad[2]; memcpy(bad, good, sizeof(bad));
+            bad[k].record.psi.soi_state = allowed[n];
+            check(validate_samples(bad, e).state == BH_UNKNOWN, "mode transition");
+            bad[1-k].record.psi.soi_state = allowed[n];
+            check(validate_samples(bad, e).state == BH_BOUND_OBSERVED, "stable allowed modes");
+        }
+    }
     /* Fully initialized native records: scalar size is independently adversarial. */
     int sizes[] = {0, -1, 1, 791, 793, 2147483647};
     for (unsigned k = 0; k < 2; k++) {
@@ -80,6 +103,16 @@ static void pure_matrix(const struct bh_socket_expectation *e)
     REJECT(bad[1].after.node.st_gid++);
     REJECT(bad[1].after.descriptor_flags ^= FD_CLOEXEC);
     REJECT(bad[1].after.status_flags ^= O_NONBLOCK);
+    REJECT(bad[0].before.directory_path[0] = '?');
+    REJECT(bad[0].after.directory_path[0] = '\0');
+    REJECT(bad[1].before.directory_path[0] = '?');
+    REJECT(memset(bad[1].after.directory_path, 'x', MAXPATHLEN));
+    struct bh_socket_expectation root = *e;
+    root.pathname = "/socket"; root.pathname_length = strlen(root.pathname);
+    char root_path[MAXPATHLEN] = "/";
+    check(valid_input(&root) && parent_matches(root_path, &root), "root parent exact");
+    root.pathname = "//socket"; root.pathname_length = strlen(root.pathname);
+    check(!parent_matches(root_path, &root), "double slash not normalized");
 #undef REJECT
     good[0].record.psi.soi_qlen++;
     good[1].record.psi.soi_rcv.sbi_cc++;
@@ -88,7 +121,7 @@ static void pure_matrix(const struct bh_socket_expectation *e)
 int main(int argc, char **argv)
 {
     require(geteuid() != 0 && fcntl(6, F_GETFD) < 0 && errno == EBADF, "unprivileged unused FD6");
-    char directory[] = "/tmp/hermes-observer-XXXXXX";
+    char directory[] = "/private/tmp/hermes-observer-XXXXXX";
     require(mkdtemp(directory) != NULL, "owned directory");
     int dir = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
     require(dir >= 0 && dir != 6, "retained directory");
@@ -104,7 +137,28 @@ int main(int argc, char **argv)
         check(bh_darwin_observe_fd6(&e).reason == BH_RUNTIME, "runtime reason");
     } else {
         state(&e, BH_BOUND_OBSERVED, "actual bound FD6");
+        struct bh_socket_expectation alias_parent = e;
+        alias_parent.pathname = address.sun_path + strlen("/private");
+        alias_parent.pathname_length = strlen(alias_parent.pathname);
+        state(&alias_parent, BH_UNKNOWN, "tmp alias is not canonical");
         pure_matrix(&e);
+        require(mkdirat(dir, "other", 0700) == 0, "other directory");
+        int other_dir = openat(dir, "other", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        struct sockaddr_un other_address = {.sun_family = AF_UNIX, .sun_len = sizeof(other_address)};
+        require(snprintf(other_address.sun_path, sizeof(other_address.sun_path), "%s/other/socket", directory) < (int)sizeof(other_address.sun_path), "other address");
+        int other_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+        require(other_dir >= 0 && other_socket >= 0 &&
+            bind(other_socket, (struct sockaddr *)&other_address, sizeof(other_address)) == 0, "other bind");
+        struct bh_socket_expectation unrelated = e; unrelated.directory_fd = other_dir;
+        require(fstatat(other_dir, "socket", &unrelated.node, AT_SYMLINK_NOFOLLOW) == 0, "other node");
+        state(&unrelated, BH_UNKNOWN, "unrelated directory and node");
+        struct stat other_node, other_parent, parent_after;
+        require(fstat(other_dir, &other_parent) == 0 &&
+            fstatat(other_dir, "socket", &other_node, AT_SYMLINK_NOFOLLOW) == 0 &&
+            same_node(&other_node, &unrelated.node) && unlinkat(other_dir, "socket", 0) == 0 &&
+            close(other_socket) == 0 && close(other_dir) == 0 &&
+            fstatat(dir, "other", &parent_after, AT_SYMLINK_NOFOLLOW) == 0 &&
+            same_node(&other_parent, &parent_after) && unlinkat(dir, "other", AT_REMOVEDIR) == 0, "other cleanup");
         struct bh_socket_expectation bad = e; bad.directory_fd = -1;
         state(&bad, BH_UNKNOWN, "missing directory");
         bad = e; bad.node.st_ino++; state(&bad, BH_UNKNOWN, "wrong expected inode");

@@ -8,7 +8,11 @@ The caller exclusively retains descriptor 6 and a directory descriptor throughou
 one bounded call. A basename, exact pathname bytes and expected node stat are
 consistency inputs, not a trusted manifest. The observer reads OS identity itself,
 then brackets each of two self-PID `proc_pidfdinfo` calls with direct FD/type/name,
-no-peer, retained-directory and no-follow pathname checks. It never changes flags,
+no-peer, retained-directory and no-follow pathname checks. Every direct snapshot
+reads F_GETPATH into a MAXPATHLEN buffer (the syscall has no size argument),
+requires bounded NUL termination, and compares its exact bytes with the expected
+pathname parent. Inputs must use that OS path view; aliases are rejected,
+not normalized. This does not resolve firmlink provenance or rename-away/back ABA. It never changes flags,
 opens/closes a descriptor, listens, accepts, connects, retries or deletes a path.
 The result contains only state/reason enums; records, handles and path bytes stay
 private. Snapshot equality cannot exclude ABA replacement by a concurrent writer.
@@ -31,7 +35,10 @@ stat is checked for socket type and stable device/inode/type across all four
 snapshots. Filesystem socket stat remains a separate identity, with exact expected
 device/inode/mode/owner/group. Libproc agrees with direct family/type and bounded
 address, and nonzero opaque handles remain equal between exact-sized reads.
-Queue/counter fields and address padding are not identity.
+Queue/counter fields and address padding are not identity. Both records must have
+zero socket error and only the pinned NBIO/ASYNC state bits. Their mode bits must
+match between records. All other state bits, including unknown future bits,
+fail closed; queued-listener physical controls remain positive.
 
 ## Verification
 

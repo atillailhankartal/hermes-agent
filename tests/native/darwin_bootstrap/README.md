@@ -11,7 +11,7 @@ python3 tests/native/darwin_bootstrap/verify_fixture.py
 
 The runner compiles three tiny native executables with `-Wall -Wextra -Werror
 -pedantic`, uses real spawn/exec/socket calls, checks bounded JSON, and removes its
-own build directory. Each fixture creates a unique `/tmp/hermes-fd6-*` directory,
+own build directory. Each fixture creates a unique `/private/tmp/hermes-fd6-*` directory,
 checks recorded pathname device/inode/type before unlink and reaps its child.
 Unknown child lifetime or replacement leaves the entry intact. The replacement
 negative control records and separately removes only its own replacement inode.
@@ -97,3 +97,17 @@ Fix4 `socket_state_probe.c` is unchanged. See the native component README for ex
 ABI/runtime pins, source limits and remaining acceptance gates. Build allowance
 is 64MiB, with a 20GiB reserve checked before compilation; no environment install,
 container, shared cache cleanup or product activation is part of this runner.
+
+### A1 Fix1 regression oracle
+
+Tests now reject EIO and every named hazardous socket state in either record,
+plus an unknown future bit; stable NBIO/ASYNC combinations stay positive while
+one-sided changes are UNKNOWN. The physical unrelated-directory negative binds
+a second socket with the same basename and supplies its metadata alongside the
+original FD6 pathname. F_GETPATH must bind the retained directory to that exact
+parent. Positive lifecycle/observer sockets bind under `/private/tmp` explicitly;
+no observer alias normalization is performed. Pure parent tests cover root `/`,
+`//socket` rejection, changed/empty/unterminated directory paths. These pure cases
+are not claims of physical filesystem policy denial. Closed-directory and ordinary
+lookup-denial negatives remain physical controls. The independent Fix4 probe is
+unchanged and deliberately retains its own path and observation implementation.

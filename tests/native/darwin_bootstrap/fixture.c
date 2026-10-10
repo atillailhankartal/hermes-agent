@@ -24,7 +24,7 @@ struct observation {
     int acceptconn, path_matches, denial_errno, option_errno;
     uid_t uid;
 };
-static char directory[] = "/tmp/hermes-fd6-XXXXXX";
+static char directory[] = "/private/tmp/hermes-fd6-XXXXXX";
 static char pathname[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static int parent_dir = -1;
 static pid_t owned_child = -1;
