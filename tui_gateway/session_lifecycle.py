@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 import contextlib
+import threading
 
 from .method_ctx import bind_module
 
@@ -118,19 +119,30 @@ def _install_borrowed_lease(sid: str, session: dict, frame: dict) -> None:
         surface=str(frame.get("source") or "desktop"), enabled=False)
 
 
-def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
+def _ensure_active_session_slot(sid: str, session: dict, *, created_leases: list | None = None) -> str | None:
     """Claim this session's cap slot on its first real turn; None when ok. session.create/resume deliberately
     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
     that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible. An
-    inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream."""
-    if session.get("active_session_lease") is not None:
-        return None
-    key = str(session.get("session_key") or "")
-    lease, limit_message = _claim_active_session_slot(
-        key, live_session_id=sid, surface=_session_source(session), profile_home=session.get("profile_home"))
-    if limit_message is None:
-        _attach_lease(session, lease)
-        return None
+    inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream.
+
+    All TUI claimants share this per-session lock. `created_leases`, when supplied,
+    receives only the exact registry lease created and attached by this call; an
+    observed pre-existing lease is never reported as this caller's acquisition.
+    """
+    claim_lock = session.setdefault("_active_session_slot_claim_lock", threading.Lock())
+    with claim_lock:
+        if session.get("active_session_lease") is not None:
+            return None
+        key = str(session.get("session_key") or "")
+        lease, limit_message = _claim_active_session_slot(
+            key, live_session_id=sid, surface=_session_source(session), profile_home=session.get("profile_home"))
+        if limit_message is None:
+            _attach_lease(session, lease)
+            if created_leases is not None:
+                created_leases.append(lease)
+            return None
+    # Detached-runtime takeover can interrupt an old turn. That callback must
+    # run after the short claim lock is released.
     from hermes_cli.active_sessions import SESSION_NOT_OWNED
     if getattr(limit_message, "reason", None) == SESSION_NOT_OWNED and _take_over_detached_runtime_lease(sid, session, key):
         return None

@@ -120,11 +120,12 @@ def _admit_tui_candidate(
             return
     # Session slot acquisition may wait on another process. It happens outside
     # the record/history locks; the route is checked again at the insertion point.
-    held_lease = session.get("active_session_lease")
-    if _ensure_active_session_slot(sid, session) is not None:
+    created_leases = []
+    if _ensure_active_session_slot(sid, session, created_leases=created_leases) is not None:
         finish("rejected", "lease_refused")
         return
     claimed_lease = session.get("active_session_lease")
+    created_lease = created_leases[0] if created_leases else None
     accepted = False
     candidate = None
     insertion_started = False
@@ -183,10 +184,15 @@ def _admit_tui_candidate(
         logger.warning("TUI plugin admission failed for plugin %s", plugin_id)
         finish("unknown", "admission_exception")
     finally:
-        if (held_lease is None and not accepted and not insertion_started
-                and session.get("active_session_lease") is claimed_lease
-                and not session.get("running")):
-            _release_active_session_slot(session)
+        if created_lease is not None and created_lease is claimed_lease and not accepted and not insertion_started:
+            # A borrower (human or plugin) may have queued a candidate since
+            # this admission acquired the lease. Keep that candidate's fence.
+            with session["history_lock"]:
+                if (session.get("active_session_lease") is claimed_lease
+                        and not session.get("running")
+                        and not session.get("queued_prompt")
+                        and not session.get("queued_prompts")):
+                    _release_active_session_slot(session)
 
 
 def admit_tui_session_message(

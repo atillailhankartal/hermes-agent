@@ -180,9 +180,9 @@ def test_stale_or_foreign_route_never_gets_candidate(runtime, monkeypatch, chang
     if change == "generation":
         original = server._ensure_active_session_slot
 
-        def rotate_during_claim(sid, target):
+        def rotate_during_claim(sid, target, **kwargs):
             session["_queued_prompt_generation"] = 1
-            return original(sid, target)
+            return original(sid, target, **kwargs)
 
         monkeypatch.setattr(server, "_ensure_active_session_slot", rotate_during_claim)
     else:
@@ -341,3 +341,204 @@ def test_enqueue_exception_after_possible_mutation_is_unknown(runtime, monkeypat
     receipt = _receipt(manager)
     assert (receipt.status, receipt.reason) == ("unknown", "admission_exception")
     assert session["queued_prompt"]["text"] == "possibly inserted"
+
+
+def _direct_admit(manager, candidate_id, publish):
+    server._admit_tui_candidate(
+        manager=manager, session_key="key-a", expected_session_id="native-a",
+        content=candidate_id, plugin_id="notify-plugin", route_claim=None,
+        candidate_id=candidate_id, delivery_id=f"delivery-{candidate_id}", publish=publish,
+    )
+
+
+def _assert_candidate_can_drain(monkeypatch, session, candidate_id):
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    lease = session["active_session_lease"]
+    fired = {}
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda _rid, sid, _session, text, **kw:
+                        fired.update(sid=sid, text=text, images=kw.get("image_paths")))
+    assert server._drain_queued_prompt("race-drain", "ui-a", session) is True
+    assert fired == {"sid": "ui-a", "text": candidate_id, "images": []}
+    assert session["active_session_lease"] is lease and not lease.released
+    assert any(row["lease_id"] == lease.lease_id for row in
+               active_session_registry_snapshot(session["profile_home"], strict=True))
+    assert server._release_active_session_slot(session) is True
+    assert lease.released
+    assert not any(row["lease_id"] == lease.lease_id for row in
+                   active_session_registry_snapshot(session["profile_home"], strict=True))
+
+
+def test_rejected_waiter_cannot_release_admitted_candidates_lease(runtime, monkeypatch):
+    """The waiter snapshots no lease, but must not own the lease another turn creates."""
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    _context, manager, session = runtime
+    session["running"] = False
+    monkeypatch.setattr(server, "_start_session_work", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(server, "_persist_queued_user_row", lambda *_args, **_kwargs: None)
+    real_ensure = server._ensure_active_session_slot
+    real_grant = manager._tui_injection_allowed
+    waiter_at_ensure, release_waiter, accepted = threading.Event(), threading.Event(), threading.Event()
+    receipts = {"accepted": [], "waiter": []}
+    waiter_grants = []
+
+    def gated_ensure(sid, target, **kwargs):
+        if threading.current_thread().name == "race-waiter":
+            waiter_at_ensure.set()
+            assert release_waiter.wait(5), "release the waiting admission"
+        return real_ensure(sid, target, **kwargs)
+
+    def grant(plugin_id):
+        if threading.current_thread().name == "race-waiter":
+            waiter_grants.append(plugin_id)
+            return len(waiter_grants) == 1
+        return real_grant(plugin_id)
+
+    monkeypatch.setattr(server, "_ensure_active_session_slot", gated_ensure)
+    monkeypatch.setattr(manager, "_tui_injection_allowed", grant)
+    waiter = threading.Thread(target=lambda: _direct_admit(manager, "waiter", receipts["waiter"].append),
+                              name="race-waiter")
+    first = threading.Thread(target=lambda: _direct_admit(
+        manager, "accepted", lambda receipt: (receipts["accepted"].append(receipt), accepted.set())),
+        name="race-accepted")
+    try:
+        waiter.start()
+        assert waiter_at_ensure.wait(5)
+        assert session.get("active_session_lease") is None
+        first.start()
+        # The reviewed implementation admits `first` during this wait. A fixed
+        # implementation may serialize acquisition, so release the waiter at
+        # the bound even when `first` has not yet completed.
+        accepted.wait(2)
+    finally:
+        release_waiter.set()
+        waiter.join(10)
+        if first.ident is not None:
+            first.join(10)
+
+    assert not waiter.is_alive() and not first.is_alive()
+    assert (receipts["accepted"][0].status, receipts["waiter"][0].status) == ("admitted", "rejected")
+    assert receipts["waiter"][0].reason == "route_changed_before_insert"
+    assert session["queued_prompt"]["plugin_candidate_id"] == "accepted"
+    lease = session.get("active_session_lease")
+    assert lease is not None and not lease.released
+    assert any(row["lease_id"] == lease.lease_id and row["session_id"] == "key-a"
+               for row in active_session_registry_snapshot(manager.home_path, strict=True))
+    _assert_candidate_can_drain(monkeypatch, session, "accepted")
+
+
+def test_rejected_lease_creator_cannot_release_borrowers_candidate(runtime, monkeypatch):
+    """A creator rejected after a borrower admits must keep the borrower's fence."""
+    from hermes_cli import input_sanitize
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    _context, manager, session = runtime
+    session["running"] = False
+    monkeypatch.setattr(server, "_start_session_work", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(server, "_persist_queued_user_row", lambda *_args, **_kwargs: None)
+    real_sanitize = input_sanitize.sanitize_user_prompt_text
+    creator_at_sanitize, release_creator = threading.Event(), threading.Event()
+    receipts = {"creator": [], "borrower": []}
+
+    def gated_sanitize(content):
+        if threading.current_thread().name == "race-creator":
+            creator_at_sanitize.set()
+            assert release_creator.wait(5), "release the original lease claimant"
+        return real_sanitize(content)
+
+    monkeypatch.setattr(input_sanitize, "sanitize_user_prompt_text", gated_sanitize)
+    creator = threading.Thread(target=lambda: _direct_admit(manager, "creator", receipts["creator"].append),
+                               name="race-creator")
+    creator.start()
+    try:
+        assert creator_at_sanitize.wait(5)
+        lease = session["active_session_lease"]
+        _direct_admit(manager, "borrower", receipts["borrower"].append)
+        assert receipts["borrower"][0].status == "admitted"
+        assert session["queued_prompt"]["plugin_candidate_id"] == "borrower"
+        # This changes the exact native route after the creator observed it.
+        session["agent"].session_id = "native-b"
+    finally:
+        release_creator.set()
+        creator.join(10)
+        session["agent"].session_id = "native-a"
+
+    assert not creator.is_alive()
+    assert (receipts["creator"][0].status, receipts["creator"][0].reason) == (
+        "rejected", "route_changed_before_insert")
+    assert session.get("active_session_lease") is lease and not lease.released
+    assert any(row["lease_id"] == lease.lease_id and row["session_id"] == "key-a"
+               for row in active_session_registry_snapshot(manager.home_path, strict=True))
+    _assert_candidate_can_drain(monkeypatch, session, "borrower")
+
+
+def test_human_slot_claim_and_plugin_admission_share_one_exact_lease(runtime, monkeypatch):
+    """A human claimant cannot replace a paused plugin's same-writer registry row."""
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    _context, manager, session = runtime
+    session["running"] = False
+    monkeypatch.setattr(server, "_start_session_work", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(server, "_persist_queued_user_row", lambda *_args, **_kwargs: None)
+    real_claim = server._claim_active_session_slot
+    plugin_at_claim, release_plugin, human_done = threading.Event(), threading.Event(), threading.Event()
+    plugin_receipts, human_results = [], []
+
+    def gated_claim(*args, **kwargs):
+        if threading.current_thread().name == "race-plugin":
+            plugin_at_claim.set()
+            assert release_plugin.wait(5), "release the plugin's registry claim"
+        return real_claim(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_claim_active_session_slot", gated_claim)
+    plugin = threading.Thread(target=lambda: _direct_admit(manager, "plugin", plugin_receipts.append),
+                              name="race-plugin")
+
+    def human_claim():
+        human_results.append(server._ensure_active_session_slot("ui-a", session))
+        human_results.append(session.get("active_session_lease"))
+        human_done.set()
+
+    human = threading.Thread(target=human_claim, name="race-human")
+    try:
+        plugin.start()
+        assert plugin_at_claim.wait(5)
+        human.start()
+        human_done.wait(2)
+    finally:
+        release_plugin.set()
+        plugin.join(10)
+        if human.ident is not None:
+            human.join(10)
+
+    assert not plugin.is_alive() and not human.is_alive()
+    assert plugin_receipts[0].status == "admitted"
+    assert human_results[0] is None
+    lease = session["active_session_lease"]
+    assert human_results[1] is lease and not lease.released
+    assert any(row["lease_id"] == lease.lease_id and row["session_id"] == "key-a"
+               for row in active_session_registry_snapshot(manager.home_path, strict=True))
+    assert session["queued_prompt"]["plugin_candidate_id"] == "plugin"
+    _assert_candidate_can_drain(monkeypatch, session, "plugin")
+
+
+def test_detached_takeover_interrupt_runs_outside_slot_claim_lock(runtime, monkeypatch):
+    """A refused claim may interrupt an old turn only after releasing its claim lock."""
+    from hermes_cli.active_sessions import SESSION_NOT_OWNED
+
+    _context, _manager, session = runtime
+    monkeypatch.setattr(server, "_claim_active_session_slot",
+                        lambda *_args, **_kwargs: (None, SimpleNamespace(reason=SESSION_NOT_OWNED)))
+    observed = []
+
+    def takeover(_sid, target, _key):
+        observed.append(not target["_active_session_slot_claim_lock"].locked())
+        return True
+
+    monkeypatch.setattr(server, "_take_over_detached_runtime_lease", takeover)
+    created_leases = []
+    assert server._ensure_active_session_slot("ui-a", session, created_leases=created_leases) is None
+    assert observed == [True]
+    assert created_leases == []
