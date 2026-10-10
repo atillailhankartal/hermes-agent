@@ -54,6 +54,20 @@ concurrency:
   cancel-in-progress: ${{ inputs.release != true && github.event_name == 'pull_request' }}
 
 jobs:
+  runner-policy:
+    name: Self-hosted runner policy
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install policy parser
+        run: python -m pip install PyYAML==6.0.3
+      - name: Enforce workflow runner policy
+        run: python scripts/ci/selfhosted_workflow_policy.py
+
   # ─────────────────────────────────────────────────────────────────────
   # detect: run the classifier once. Every downstream job reads its outputs
   # to decide whether to run. On push/dispatch the classifier fails open
@@ -66,7 +80,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 1
     outputs:
       python: ${{ steps.gate-lanes.outputs.python }}
@@ -335,8 +349,9 @@ jobs:
   # the live comment poller can list failed jobs in the PR comment.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
-    name: All required checks pass (v2)
+    name: All required checks pass (v3)
     needs:
+      - runner-policy
       - detect
       - tests
       - tests-os
@@ -368,7 +383,7 @@ jobs:
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 10
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
@@ -384,7 +399,9 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           RELEASE: ${{ inputs.release }}
+          POLICY_RESULT: ${{ needs.runner-policy.result }}
         run: |
+          test "$POLICY_RESULT" = success
           args=()
           if [ "$RELEASE" = true ]; then args+=(--release); fi
           printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py "${args[@]}"
@@ -403,7 +420,7 @@ jobs:
     name: CI timing report
     needs: [all-checks-pass]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 10
     steps:
       - name: Checkout code

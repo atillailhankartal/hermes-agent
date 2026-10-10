@@ -60,7 +60,7 @@ concurrency:
 jobs:
   check:
     name: python -m pm.build_env --source . --check-lock
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 5
     outputs:
       review_status: ${{ steps.verify.outputs.review_status }}

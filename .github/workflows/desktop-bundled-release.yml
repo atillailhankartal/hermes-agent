@@ -206,7 +206,7 @@ jobs:
     # One dispatch: in disposable mode the allocation steps run first (the
     # channel pin comes from them), then admission validates the build source.
     # A failed allocation fails this job and skips everything downstream.
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     # Public root is an environment variable, not a repository variable. No
     # secret is injected into admission; downstream jobs consume its outputs.
     environment: release-signing
@@ -445,7 +445,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && inputs.build_commit == '' && inputs.channel == ''
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: [self-hosted, "${{ matrix.target.runner }}", hermes-publish]
     environment: release-signing
     cache-mode: write
     timeout-minutes: 900
@@ -454,7 +454,7 @@ jobs:
       matrix:
         target:
           - label: win32-x64
-            runner: windows-latest-32-core
+            runner: hermes-windows-x64
     env: &win32-env
       CHANNEL_BUILD: ${{ needs.validate.outputs.channel-build }}
       HERMES_DESKTOP_VARIANT: bundled
@@ -743,7 +743,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && inputs.build_commit == '' && inputs.channel == ''
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: [self-hosted, "${{ matrix.target.runner }}", hermes-publish]
     environment: release-signing
     cache-mode: write
     timeout-minutes: 900
@@ -752,7 +752,7 @@ jobs:
       matrix:
         target:
           - label: win32-arm64
-            runner: windows-latest-32-arm-core
+            runner: hermes-windows-arm64
     env: *win32-env
     steps: *win32-steps
 
@@ -764,7 +764,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || inputs.channel != '')
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: [self-hosted, "${{ matrix.target.runner }}", hermes-publish]
     environment: release-signing
     cache-mode: read
     timeout-minutes: 900
@@ -780,7 +780,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || inputs.channel != '')
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: [self-hosted, "${{ matrix.target.runner }}", hermes-publish]
     environment: release-signing
     cache-mode: read
     timeout-minutes: 900
@@ -799,7 +799,7 @@ jobs:
     # The trust-branch legs are read through needs.*.result below, so they must
     # stay in the list — the result job gates on their outcomes, not its own.
     needs: [validate, build-win32-x64-release, build-win32-x64-commit]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     permissions: {}
     timeout-minutes: 5
     env:
@@ -826,7 +826,7 @@ jobs:
     # The trust-branch legs are read through needs.*.result below, so they must
     # stay in the list — the result job gates on their outcomes, not its own.
     needs: [validate, build-win32-arm64-release, build-win32-arm64-commit]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     permissions: {}
     timeout-minutes: 5
     env:
@@ -853,7 +853,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && inputs.build_commit == '' && inputs.channel == ''
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: [self-hosted, "${{ matrix.target.runner }}", hermes-publish]
     environment: release-signing
     cache-mode: write
     timeout-minutes: 360
@@ -862,7 +862,7 @@ jobs:
       matrix:
         target:
           - label: darwin-arm64
-            runner: macos-15
+            runner: hermes-macos-arm64
     env: &darwin-env
       CHANNEL_BUILD: ${{ needs.validate.outputs.channel-build }}
       HERMES_DESKTOP_VARIANT: bundled
@@ -1159,7 +1159,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && inputs.build_commit == '' && inputs.channel == ''
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: [self-hosted, "${{ matrix.target.runner }}", hermes-publish]
     environment: release-signing
     cache-mode: write
     timeout-minutes: 360
@@ -1168,7 +1168,7 @@ jobs:
       matrix:
         target:
           - label: darwin-x64
-            runner: macos-15-intel
+            runner: hermes-macos-x64
     env: *darwin-env
     steps: *darwin-steps
 
@@ -1180,7 +1180,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || inputs.channel != '')
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: [self-hosted, "${{ matrix.target.runner }}", hermes-publish]
     environment: release-signing
     cache-mode: read
     timeout-minutes: 360
@@ -1196,7 +1196,7 @@ jobs:
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || inputs.channel != '')
     needs: [validate]
-    runs-on: ${{ matrix.target.runner }}
+    runs-on: [self-hosted, "${{ matrix.target.runner }}", hermes-publish]
     environment: release-signing
     cache-mode: read
     timeout-minutes: 360
@@ -1215,7 +1215,7 @@ jobs:
     # The trust-branch legs are read through needs.*.result below, so they must
     # stay in the list — the result job gates on their outcomes, not its own.
     needs: [validate, build-darwin-arm64-release, build-darwin-arm64-commit]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     permissions: {}
     timeout-minutes: 5
     env:
@@ -1235,7 +1235,7 @@ jobs:
     # The trust-branch legs are read through needs.*.result below, so they must
     # stay in the list — the result job gates on their outcomes, not its own.
     needs: [validate, build-darwin-x64-release, build-darwin-x64-commit]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     permissions: {}
     timeout-minutes: 5
     env:
@@ -1249,7 +1249,7 @@ jobs:
     name: bundled linux-x64 (disabled for now)
     if: needs.validate.outputs.linux-x64 == 'true'
     needs: validate
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 5
     steps:
       - name: Disabled
@@ -1260,7 +1260,7 @@ jobs:
     name: bundled linux-arm64 (disabled for now)
     if: needs.validate.outputs.linux-arm64 == 'true'
     needs: validate
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 5
     steps:
       - name: Disabled
@@ -1278,7 +1278,7 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.darwin-arm64 == 'true'
       && needs.build-darwin-arm64.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     environment: release-signing
     timeout-minutes: 15
     outputs:
@@ -1312,7 +1312,7 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.darwin-x64 == 'true'
       && needs.build-darwin-x64.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     environment: release-signing
     timeout-minutes: 15
     outputs:
@@ -1475,7 +1475,7 @@ jobs:
       && (needs.validate.outputs.win32-arm64 != 'true' || needs.build-win32-arm64.result == 'success')
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '' || inputs.channel != '')
-    runs-on: windows-latest-32-core
+    runs-on: [self-hosted, Windows, X64, hermes-publish]
     environment: release-signing
     cache-mode: read
     timeout-minutes: 45
@@ -1678,7 +1678,7 @@ jobs:
       && needs.assemble-win32-bundle.result == 'success'
       && needs.smoke-darwin-arm64.result == 'success' && needs.smoke-darwin-x64.result == 'success'
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     environment: release-signing
     cache-mode: read
     timeout-minutes: 45
@@ -1727,7 +1727,7 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.assemble-win32-bundle.result == 'success'
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     environment: release-signing
     timeout-minutes: 15
     concurrency:
@@ -1807,7 +1807,7 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.build-darwin-arm64.result == 'success' && needs.build-darwin-x64.result == 'success'
       && needs.smoke-darwin-arm64.result == 'success' && needs.smoke-darwin-x64.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     environment: release-signing
     timeout-minutes: 15
     concurrency:
@@ -1869,7 +1869,7 @@ jobs:
     name: Build + publish the termux .deb (aarch64)
     needs: [validate]
     if: inputs.channel == '' && inputs.disposable_channel == '' && needs.validate.outputs.termux == 'true' && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '')
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, Linux, ARM64, hermes-publish]
     environment: release-signing
     timeout-minutes: 90
     env:
@@ -2238,7 +2238,7 @@ jobs:
     needs: validate
     # Pairs with builds-table: a pending page nothing finalizes must not be written.
     if: inputs.build_commit == '' && inputs.upload_release == true && needs.validate.outputs.all-jobs == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
@@ -2283,7 +2283,7 @@ jobs:
       always() && inputs.build_commit == '' && inputs.channel == '' && inputs.upload_release == true && inputs.release-phase == ''
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.all-jobs == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     environment: release-signing
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -2341,7 +2341,7 @@ jobs:
       always() && inputs.build_commit != '' && inputs.channel == '' && inputs.disposable_channel == ''
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.all-jobs == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     environment: release-signing
     permissions:
       contents: write
@@ -2401,7 +2401,7 @@ jobs:
     name: Verify published candidate files
     needs: validate
     if: inputs.release-phase == 'publish'
-    runs-on: ubuntu-latest-32-core
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     environment: release-signing
     timeout-minutes: 90
     env:
@@ -2426,7 +2426,7 @@ jobs:
     name: Submit the verified Store package
     needs: [validate, stable-publish]
     if: inputs.release-phase == 'publish'
-    runs-on: windows-latest-32-core
+    runs-on: [self-hosted, Windows, X64, hermes-publish]
     environment: release-signing
     timeout-minutes: 60
     env:
@@ -2481,7 +2481,7 @@ jobs:
         stable-publish,
         stable-store
       ]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
@@ -2541,7 +2541,7 @@ jobs:
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
       && needs.publish-win32-updater.result == 'success'
       && needs.publish-darwin-updater.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     environment: release-signing
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1

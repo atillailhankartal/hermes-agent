@@ -41,7 +41,7 @@ env:
 jobs:
   windows-x64:
     name: Hermes-Setup.exe (windows x64, signed)
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, hermes-publish]
     environment: release-signing
     timeout-minutes: 90
     steps:
@@ -151,7 +151,7 @@ jobs:
 
   macos-arm64:
     name: Hermes-Setup.dmg (macos arm64, signed + notarized)
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64, hermes-publish]
     environment: release-signing
     timeout-minutes: 90
     steps:

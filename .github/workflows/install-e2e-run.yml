@@ -68,7 +68,7 @@ on:
         description: 'Runner label.'
         required: false
         type: string
-        default: ubuntu-latest
+        default: hermes-linux-x64
       timeout-minutes:
         description: 'Job timeout. A cold run installs real toolchains twice, and app-update legs add a full Electron build + launch.'
         required: false
@@ -90,7 +90,7 @@ jobs:
         || (inputs.install-method == 'installer-script+desktop' && inputs.tag-has-desktop))
       && (contains(fromJSON('["hermes-update", "installer-script"]'), inputs.update-method)
         || (contains(fromJSON('["installer-script+desktop", "hermes-desktop-app-update"]'), inputs.update-method) && inputs.tag-has-desktop))
-    runs-on: ${{ inputs.runner }}
+    runs-on: [self-hosted, "${{ inputs.runner }}", hermes-ci]
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     steps:

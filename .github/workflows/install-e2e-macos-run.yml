@@ -62,7 +62,7 @@ on:
         type: string
         default: ''
       bundle-arch:
-        description: 'Architecture of the bundled pair: arm64 (macos-15) or x64 (macos-15-intel).'
+        description: 'Architecture of the bundled pair: arm64 (hermes-macos-arm64) or x64 (hermes-macos-x64).'
         required: false
         type: string
         default: arm64
@@ -92,7 +92,7 @@ jobs:
       update-ref: ${{ inputs.update-ref }}
       tag-has-desktop: ${{ inputs.tag-has-desktop }}
       leg-id: ${{ inputs.leg-id }}
-      runner: macos-latest
+      runner: hermes-macos-arm64
       timeout-minutes: ${{ inputs.timeout-minutes }}
 
   # ---- arm 2: the published dmg, then Playwright drives the app ------------
@@ -103,7 +103,7 @@ jobs:
     if: >-
       inputs.install-method == 'desktop-installer@latest' && inputs.tag-has-desktop
       && contains(fromJSON('["open-app-update", "hermes-desktop-app-update", "hermes-update", "installer-script", "installer-script+desktop"]'), inputs.update-method)
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64, hermes-ci]
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     steps:
@@ -204,7 +204,7 @@ jobs:
   bundled-e2e:
     name: packaged bundle (open-app-update)
     if: inputs.install-method == 'packaged-app' && inputs.update-method == 'open-app-update'
-    runs-on: ${{ inputs.bundle-arch == 'x64' && 'macos-15-intel' || 'macos-15' }}
+    runs-on: [self-hosted, "${{ inputs.bundle-arch == 'x64' && 'hermes-macos-x64' || 'hermes-macos-arm64' }}", hermes-ci]
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     steps:
