@@ -545,9 +545,6 @@ class GatewaySessionCommandsMixin:
             return await self._compress_codex_app_server_session(session_key, session_entry.session_id)
         if not runtime_kwargs.get("api_key"):
             return t("gateway.compress.no_provider")
-        # FULL transcript (tool results included), like auto-compress: user/assistant-only starves
-        # tool-result pruning and can trip the protect-first/last early-return.
-        msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
         # Assign, not setdefault (a resolver value would be a stale placeholder); platform only when
         # known so None -> "cli" holds.
         if platform_key is not None:
@@ -557,26 +554,60 @@ class GatewaySessionCommandsMixin:
         # the transport applies its default effort — a 400 on non-reasoning models.
         runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
 
-        tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
+        # Claim A before reading the transcript or invoking the compressor. A different routing
+        # key may own the same native ID; a stale pre-lease read must never become a new child.
+        async with self._session_route_gate(session_key):
+            generation = self._current_session_run_generation(session_key)
+            current = await self.async_session_store.lookup_by_session_key(session_key)
+            if current is not session_entry or current.session_id != session_entry.session_id:
+                raise RuntimeError("manual compression route changed before admission")
+            token = await self._turn_leases.acquire(
+                session_entry.session_id, owner_key=session_key, generation=generation, timeout=0.05,
+            )
+            if token is None:
+                raise RuntimeError("manual compression lease unavailable")
         try:
-            # Not a bare run_in_executor: the profile secret scope is a contextvar the default
-            # executor hop would drop, failing aux-client credential resolution closed.
-            result = await self._run_in_executor_with_context(
-                lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
-                                     task_id=session_entry.session_id or "default"))
-            if result.status == "nothing_to_do":
-                return t("gateway.compress.nothing_to_do")
-            if result.status != "compressed":
-                return "\n".join(render_compress_result(result))
-            await self._persist_manual_compression(tmp_agent, session_entry, source, result.after_messages)
-            finalize_context_engine_compression_notification(tmp_agent, committed=True)
-            compressor = tmp_agent.context_compressor
-            summary = result.summary
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+            from agent.conversation_compression_manual import MIN_MESSAGES
+            if len(history) < MIN_MESSAGES:
+                return t("gateway.compress.not_enough")
+            # FULL transcript (tool results included), like auto-compress: user/assistant-only
+            # starves tool-result pruning and can trip the protect-first/last early-return.
+            msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
+            tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
+            try:
+                # The context-preserving executor hop may continue running after task cancellation.
+                # Drain it before releasing A's lease; a child write can happen in that worker.
+                worker = asyncio.create_task(self._run_in_executor_with_context(
+                    lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
+                                         task_id=session_entry.session_id or "default")))
+                cancelled = False
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                if cancelled:
+                    raise asyncio.CancelledError
+                result = worker.result()
+                if result.status == "nothing_to_do":
+                    return t("gateway.compress.nothing_to_do")
+                if result.status != "compressed":
+                    return "\n".join(render_compress_result(result))
+                await self._persist_manual_compression(
+                    tmp_agent, session_entry, source, result.after_messages,
+                    lease_token=token, expected_generation=generation,
+                )
+                finalize_context_engine_compression_notification(tmp_agent, committed=True)
+                compressor = tmp_agent.context_compressor
+                summary = result.summary
+            finally:
+                finalize_context_engine_compression_notification(tmp_agent, committed=False)
+                self._evict_cached_agent(session_key)  # next turn rebuilds the prompt from current files
+                # Off-loop + bounded: teardown can block on subprocess/network/SQLite.
+                await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
         finally:
-            finalize_context_engine_compression_notification(tmp_agent, committed=False)
-            self._evict_cached_agent(session_key)  # next turn rebuilds the prompt from current files
-            # Off-loop + bounded: teardown can block on subprocess/network/SQLite.
-            await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
+            self._turn_leases.release(token)
         return "\n".join(_manual_compression_reply_lines(summary, compressor, request.focus_topic))
 
     async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
@@ -619,26 +650,83 @@ class GatewaySessionCommandsMixin:
         tmp_agent._end_session_on_close = False
         return tmp_agent
 
-    async def _persist_manual_compression(self, tmp_agent, session_entry, source, compressed) -> None:
+    async def _persist_manual_compression(
+        self, tmp_agent, session_entry, source, compressed, *, lease_token=None, expected_generation=None,
+    ) -> None:
         """Commit a manual /compress result to the session store.  Rotation (new continuation id)
         makes the NEW session durable (already published, else rewritten) so the original stays searchable;
         persist BEFORE repointing so a failed write is fatal and old history stays reachable.
         In-place compaction already archived + inserted rows, and a rewrite would DELETE the
         archive; an unchanged id without in-place means rotation FAILED."""
-        new_session_id = tmp_agent.session_id
-        if new_session_id != session_entry.session_id:
-            # Published child is already durable; a rewrite would drop rows cloned at publish.
-            if not await self.async_session_store.persist_rotated_compression_child(
-                    session_entry.session_id, new_session_id, compressed):
-                raise RuntimeError(f"failed to persist compressed transcript for session {new_session_id}")
-            session_entry.session_id = new_session_id
-            await self.async_session_store._save()
+        key = session_entry.session_key
+        parent_id, new_session_id = session_entry.session_id, tmp_agent.session_id
+        async with self._session_route_gate(key):
+            current = await self.async_session_store.lookup_by_session_key(key)
+            if current is not session_entry or current.session_id != parent_id:
+                raise RuntimeError("manual compression route changed before publication")
+            # A manual command has no running-agent turn token. Claim A itself, then require a
+            # conflict-free B rebind before the child can become routable. Short contention
+            # budget while the gate is held avoids blocking a live turn that needs this gate.
+            generation = self._current_session_run_generation(key)
+            if expected_generation is not None and generation != expected_generation:
+                raise RuntimeError("manual compression generation changed before publication")
+            owned_here = lease_token is None
+            token = lease_token or await self._turn_leases.acquire(
+                parent_id, owner_key=key, generation=generation, timeout=0.05,
+            )
+            if token is None:
+                raise RuntimeError("manual compression lease unavailable")
+            try:
+                if (token.released or token.lease.holder is not token or token.owner_key != key
+                        or token.generation != generation or token.session_id != parent_id):
+                    raise RuntimeError("manual compression lease changed before publication")
+                if new_session_id != parent_id:
+                    if not self._turn_leases.rebind(token, new_session_id):
+                        raise RuntimeError("manual compression child lease handoff refused")
+                    persist = asyncio.create_task(self.async_session_store.persist_rotated_compression_child(
+                        parent_id, new_session_id, compressed,
+                    ))
+                    cancelled = False
+                    while not persist.done():
+                        try:
+                            await asyncio.shield(persist)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    persisted = persist.result()
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    if not persisted:
+                        raise RuntimeError(f"failed to persist compressed transcript for session {new_session_id}")
+                    write = asyncio.create_task(self.async_session_store.publish_compression_child_route(
+                        key, session_entry, parent_id, new_session_id,
+                    ))
+                elif getattr(tmp_agent, "_last_compaction_in_place", False):
+                    write = asyncio.create_task(self.async_session_store.publish_in_place_compaction_epoch(
+                        key, session_entry, parent_id,
+                    ))
+                else:
+                    logger.warning(
+                        "Manual /compress: session rotation did not occur (session_id unchanged) and in-place "
+                        "mode is off — preserving original transcript instead of overwriting it (#44794).")
+                    write = None
+                if write is not None:
+                    cancelled = False
+                    while not write.done():
+                        try:
+                            await asyncio.shield(write)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    committed = write.result()
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    if not committed:
+                        raise RuntimeError("manual compression route changed during publication")
+            finally:
+                if owned_here:
+                    self._turn_leases.release(token)
+        if new_session_id != parent_id:
             await asyncio.to_thread(self._sync_telegram_topic_binding, source, session_entry,
                                     reason="compress-command")
-        elif not getattr(tmp_agent, "_last_compaction_in_place", False):
-            logger.warning(
-                "Manual /compress: session rotation did not occur (session_id unchanged) and in-place "
-                "mode is off — preserving original transcript instead of overwriting it (#44794).")
         await self.async_session_store.update_session(session_entry.session_key, last_prompt_tokens=0)
 
     # ------------------------------------------------------------------------ /topic

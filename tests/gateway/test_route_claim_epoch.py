@@ -1,14 +1,17 @@
 """A Gateway route epoch changes only with a durable structural publication."""
 
+import asyncio
+import threading
 from datetime import datetime
 from dataclasses import replace
 import json
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, SessionStore
 from gateway.route_claim import claim_for_tool, gateway_route_scope
 from gateway.run import GatewayRunner
 from gateway.turn_lease import SessionTurnLeaseRegistry
@@ -181,3 +184,133 @@ async def test_unleased_store_level_compression_repoint_stays_closed_to_bee(tmp_
             assert claim_for_tool("B") is None
     finally:
         runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
+async def test_manual_compression_refuses_child_when_alias_lease_is_held(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._sync_telegram_topic_binding = Mock()
+    blocker = await runner._turn_leases.acquire("B", owner_key="alias", generation=1, timeout=1)
+    try:
+        with pytest.raises(RuntimeError, match="lease|compression route"):
+            await runner._persist_manual_compression(
+                type("Agent", (), {"session_id": "B", "_last_compaction_in_place": False})(),
+                entry, entry.origin, [],
+            )
+        assert entry.session_id == "A"
+        assert _durable(tmp_path)["session_id"] == "A"
+    finally:
+        runner._turn_leases.release(blocker)
+
+
+@pytest.mark.asyncio
+async def test_manual_in_place_compression_mints_new_epoch(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    old_epoch = entry.route_epoch
+    await runner._persist_manual_compression(
+        type("Agent", (), {"session_id": "A", "_last_compaction_in_place": True})(),
+        entry, entry.origin, [],
+    )
+    assert entry.route_epoch != old_epoch
+    assert _durable(tmp_path)["route_epoch"] == entry.route_epoch
+
+
+@pytest.mark.asyncio
+async def test_manual_compression_holds_a_lease_until_cancelled_worker_drains(tmp_path, monkeypatch):
+    """Cancellation cannot expose A to an alias while the offloaded compressor still writes."""
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._session_key_for_source = lambda _source: "route"
+    runner._resolve_session_agent_runtime = lambda **_kw: ("model", {"api_key": "test"})
+    runner._resolve_session_reasoning_config = lambda **_kw: None
+    agent = MagicMock()
+    agent.session_id = "A"
+    runner._build_manual_compression_agent = AsyncMock(return_value=agent)
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+    runner._evict_cached_agent = Mock()
+
+    async def offload(fn):
+        return await asyncio.to_thread(fn)
+
+    runner._run_in_executor_with_context = offload
+    monkeypatch.setattr(store, "load_transcript", Mock(return_value=[
+        {"role": "user", "content": str(i)} for i in range(8)
+    ]))
+    started, release = threading.Event(), threading.Event()
+
+    def blocked_compressor(*_a, **_kw):
+        started.set()
+        assert release.wait(2), "test worker was not released"
+        return SimpleNamespace(status="nothing_to_do")
+
+    monkeypatch.setattr("agent.conversation_compression_manual.compress_now", blocked_compressor)
+    task = asyncio.create_task(runner._run_manual_compression(entry.origin, entry, [], SimpleNamespace()))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        assert runner._turn_leases._leases["A"].holder is not None
+        task.cancel()
+        await asyncio.sleep(0)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.01, heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), 0.1)
+        assert not task.done()
+        with pytest.raises(TimeoutError):
+            await runner._turn_leases.acquire("A", owner_key="alias", generation=1, timeout=0.05)
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runner._turn_leases._leases["A"].holder is None
+    successor = await runner._turn_leases.acquire("A", owner_key="alias", generation=1, timeout=0.1)
+    assert successor is not None
+    runner._turn_leases.release(successor)
+
+
+@pytest.mark.asyncio
+async def test_manual_child_persist_cancellation_drains_before_releasing_lease(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._sync_telegram_topic_binding = Mock()
+    started, release = threading.Event(), threading.Event()
+    real_persist = store.persist_rotated_compression_child
+
+    def blocked_persist(*args, **kwargs):
+        started.set()
+        assert release.wait(2), "test writer was not released"
+        return real_persist(*args, **kwargs)
+
+    monkeypatch.setattr(store, "persist_rotated_compression_child", blocked_persist)
+    task = asyncio.create_task(runner._persist_manual_compression(
+        SimpleNamespace(session_id="B"), entry, entry.origin,
+        [{"role": "assistant", "content": "summary"}],
+    ))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.01, heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), 0.1)
+        assert not task.done()
+        assert runner._turn_leases._leases["A"].holder is not None
+        assert entry.session_id == "A" and _durable(tmp_path)["session_id"] == "A"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert entry.session_id == "A" and _durable(tmp_path)["session_id"] == "A"
+    assert runner._turn_leases._leases["A"].holder is None

@@ -652,6 +652,22 @@ class SessionTranscriptMixin:
             current.route_claim_blocked = False
             return True
 
+    def publish_in_place_compaction_epoch(
+        self, session_key: str, expected_entry: "SessionEntry", session_id: str,
+    ) -> bool:
+        """Publish a fresh epoch for a committed compaction that retained its native ID."""
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if current is not expected_entry or current.session_id != session_id:
+                return False
+            candidate = current.to_dict()
+            candidate["route_epoch"] = new_route_epoch()
+            candidate["route_claim_blocked"] = False
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            current.route_epoch = candidate["route_epoch"]
+            current.route_claim_blocked = False
+            return True
+
     def has_input_owner(self, session_id: str, owner: str) -> bool:
         """Find this accepted input on the canonical live continuation and its ancestors.
 

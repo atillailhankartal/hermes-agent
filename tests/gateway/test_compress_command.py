@@ -11,6 +11,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.turn_lease import SessionTurnLeaseRegistry
 
 
 def _make_source() -> SessionSource:
@@ -53,10 +54,19 @@ def _make_runner(history: list[dict[str, str]]):
     )
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.lookup_by_session_key.return_value = session_entry
     runner.session_store.load_transcript.return_value = history
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner.session_store._save = MagicMock()
+    runner._turn_leases = SessionTurnLeaseRegistry()
+
+    def _publish_child(_key, _entry, _parent, child):
+        session_entry.session_id = child
+        return True
+
+    runner.session_store.publish_compression_child_route.side_effect = _publish_child
+    runner.session_store.publish_in_place_compaction_epoch.return_value = True
     runner._session_db = None
     return runner
 
@@ -376,6 +386,9 @@ async def test_compress_command_multiplexed_runs_under_profile_secret_scope(tmp_
         "OPENROUTER_BASE_URL=https://scoped.example/v1\n"
     )
     runner._resolve_profile_home_for_source = MagicMock(return_value=profile_home)
+    runner._session_key_for_source = MagicMock(
+        return_value=runner.session_store.get_or_create_session.return_value.session_key,
+    )
 
     agent_instance = MagicMock()
     agent_instance.shutdown_memory_provider = MagicMock()
@@ -532,7 +545,7 @@ def test_rotated_compress_keeps_atomically_published_foreign_tail(tmp_path, monk
     ``profiles/fitness/state.db`` before the routing index knows the child id.
     """
     import hermes_state
-    from gateway.slash_commands_session import GatewaySessionCommandsMixin
+    from gateway.run import GatewayRunner
     from gateway.session import AsyncSessionStore, SessionStore
 
     root = tmp_path / "hermes"
@@ -548,6 +561,8 @@ def test_rotated_compress_keeps_atomically_published_foreign_tail(tmp_path, monk
         platform=Platform.DISCORD, chat_type="thread",
     )
     store._entries[entry.session_key] = entry
+    store._loaded = True
+    store._save_entries()
     db = store._db_for_key(entry.session_key)
     db.create_session(parent, "discord")
     db.append_message(parent, "assistant", "old turn")
@@ -565,14 +580,14 @@ def test_rotated_compress_keeps_atomically_published_foreign_tail(tmp_path, monk
         raise AssertionError("published child must not be rewritten")
     store.rewrite_transcript = _destructive_rewrite
 
-    runner = SimpleNamespace(
-        async_session_store=AsyncSessionStore(store),
-        _sync_telegram_topic_binding=MagicMock(),
-    )
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._sync_telegram_topic_binding = MagicMock()
     agent = SimpleNamespace(session_id=child)
     try:
-        asyncio.run(GatewaySessionCommandsMixin._persist_manual_compression(
-            runner, agent, entry, _make_source(), handoff))
+        asyncio.run(runner._persist_manual_compression(agent, entry, _make_source(), handoff))
         assert entry.session_id == child
         assert [m["content"] for m in db.get_messages(child)] == [
             "compressed summary", "concurrent foreign turn",
