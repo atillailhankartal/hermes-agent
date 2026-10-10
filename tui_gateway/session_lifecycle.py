@@ -146,6 +146,32 @@ def _prove_active_session_slot(sid: str, session: dict) -> str | None:
     if (not key or lease is None or getattr(lease, "released", False)
             or str(getattr(lease, "session_id", "")) != key):
         return _SESSION_OWNERSHIP_UNAVAILABLE
+    from pathlib import Path
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+    from hermes_constants import get_hermes_home
+
+    home = Path(session.get("profile_home") or get_hermes_home())
+    if getattr(lease, "enabled", False):
+        pinned = getattr(lease, "state_path", None)
+        if pinned is None or Path(pinned).resolve() != (home / "runtime" / "active_sessions.json").resolve():
+            return _SESSION_OWNERSHIP_UNAVAILABLE
+        lease_id = str(lease.lease_id)
+    else:
+        # Compute-host children borrow a parent token; the token alone is inert. Its parent row
+        # must still be live in this profile before the child may mutate history off-turn.
+        lease_id = str(lease.lease_id).removeprefix("borrowed:")
+        if lease_id == str(lease.lease_id):
+            return _SESSION_OWNERSHIP_UNAVAILABLE
+    try:
+        rows = active_session_registry_snapshot(home, strict=True)
+    except Exception:
+        logger.warning("Could not verify active session slot for sid=%s", sid, exc_info=True)
+        return _SESSION_OWNERSHIP_UNAVAILABLE
+    if not any(str(row.get("lease_id") or "") == lease_id
+               and str(row.get("session_id") or "") == key
+               and str((row.get("metadata") or {}).get("live_session_id") or "") == sid
+               for row in rows):
+        return _SESSION_OWNERSHIP_UNAVAILABLE
     return None
 
 

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import threading
+from copy import copy
 from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli.active_sessions import active_session_registry_snapshot, try_acquire_active_session
+from hermes_cli.active_sessions import ActiveSessionLease, active_session_registry_snapshot, try_acquire_active_session
 from tui_gateway import server
 
 
@@ -66,6 +67,195 @@ def test_manual_compress_refuses_foreign_owner_before_mutation(home):
         assert [(row["session_id"], row["lease_id"]) for row in _entries(home)] == [("A", foreign.lease_id)]
     finally:
         foreign.release()
+
+
+def test_stale_lease_object_cannot_mutate_after_foreign_owner_takes_a(home):
+    owned, refusal = try_acquire_active_session(
+        session_id="A", surface="tui", config={}, metadata={"live_session_id": "ui"},
+        registry_home=home)
+    assert owned is not None and refusal is None
+    stale = copy(owned)
+    owned.release()  # one handle removes the row; the copied handle still claims released=False
+    assert stale.released is False and _entries(home) == []
+    foreign, refusal = try_acquire_active_session(
+        session_id="A", surface="cli", config={}, metadata={"live_session_id": "foreign"},
+        registry_home=home)
+    assert foreign is not None and refusal is None
+    session = _session()
+    session["active_session_lease"] = stale
+    try:
+        with pytest.raises(RuntimeError, match="could not safely reserve"):
+            with server._manual_compress_turn("ui", session):
+                session["history"].clear()
+        assert session["history"] and session["session_key"] == "A"
+        assert [row["lease_id"] for row in _entries(home)] == [foreign.lease_id]
+    finally:
+        foreign.release()
+
+
+def test_lease_from_other_profile_cannot_prove_local_history(home, tmp_path):
+    other_home = tmp_path / "other-profile"
+    other, refusal = try_acquire_active_session(
+        session_id="A", surface="tui", config={}, metadata={"live_session_id": "ui"},
+        registry_home=other_home)
+    assert other is not None and refusal is None
+    session = _session()
+    session["profile_home"] = home
+    session["active_session_lease"] = other
+    try:
+        with pytest.raises(RuntimeError, match="could not safely reserve"):
+            with server._manual_compress_turn("ui", session):
+                session["history"].clear()
+        assert session["history"] and _entries(home) == []
+        assert [row["lease_id"] for row in _entries(other_home)] == [other.lease_id]
+    finally:
+        other.release()
+
+
+def test_borrowed_token_alone_cannot_prove_parent_lease(home):
+    session = _session()
+    session["active_session_lease"] = ActiveSessionLease(
+        lease_id="borrowed:missing-parent", session_id="A", surface="desktop", enabled=False)
+    with pytest.raises(RuntimeError, match="could not safely reserve"):
+        with server._manual_compress_turn("ui", session):
+            session["history"].clear()
+    assert session["history"] and _entries(home) == []
+
+
+def test_borrowed_token_matches_real_parent_lease(home):
+    parent, refusal = try_acquire_active_session(
+        session_id="A", surface="desktop", config={}, metadata={"live_session_id": "ui"},
+        registry_home=home, track_liveness=True)
+    assert parent is not None and refusal is None
+    session = _session()
+    session["active_session_lease"] = ActiveSessionLease(
+        lease_id=f"borrowed:{parent.lease_id}", session_id="A", surface="desktop", enabled=False)
+    try:
+        with server._manual_compress_turn("ui", session):
+            assert [row["lease_id"] for row in _entries(home)] == [parent.lease_id]
+    finally:
+        parent.release()
+
+
+def test_short_history_noop_compress_releases_new_slot_before_prompt_drain(home, monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 1})
+    session = _session()
+    observed_at_drain = []
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a: observed_at_drain.extend(_entries(home)))
+    with server._manual_compress_turn("ui", session):
+        removed, _usage = server._compress_session_history(session)
+        assert removed == 0
+    assert observed_at_drain == [] and _entries(home) == []
+    assert session.get("active_session_lease") is None
+    next_owner, refusal = try_acquire_active_session(
+        session_id="B", surface="cli", config={"max_concurrent_sessions": 1},
+        metadata={"live_session_id": "next"}, registry_home=home)
+    assert next_owner is not None and refusal is None
+    next_owner.release()
+
+
+def test_real_compaction_keeps_lease_after_in_place_history_commit(home, monkeypatch):
+    from agent import conversation_compression_manual as manual
+
+    session = _session()
+    session["history"] = [{"role": "user", "content": f"message {i}"} for i in range(4)]
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(home))
+
+    def compress_now(_agent, before, _request, **_kw):
+        assert [row["session_id"] for row in _entries(home)] == ["A"]
+        return SimpleNamespace(status="compressed", after_messages=before[:2], removed=2)
+
+    monkeypatch.setattr(manual, "compress_now", compress_now)
+    with server._manual_compress_turn("ui", session):
+        removed, _usage = server._compress_session_history(session)
+        assert removed == 2
+    lease = session["active_session_lease"]
+    try:
+        assert session["history_version"] == 1 and len(session["history"]) == 2
+        assert [row["lease_id"] for row in _entries(home)] == [lease.lease_id]
+    finally:
+        lease.release()
+
+
+def test_lease_loss_during_summary_cannot_commit_old_history(home, monkeypatch):
+    from agent import conversation_compression_manual as manual
+
+    session = _session()
+    before = [{"role": "user", "content": f"message {i}"} for i in range(4)]
+    session["history"] = before[:]
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(home))
+    foreign = None
+
+    def compress_now(_agent, messages, _request, **_kw):
+        nonlocal foreign
+        copy(session["active_session_lease"]).release()
+        foreign, refusal = try_acquire_active_session(
+            session_id="A", surface="cli", config={}, metadata={"live_session_id": "foreign"},
+            registry_home=home)
+        assert foreign is not None and refusal is None
+        return SimpleNamespace(status="compressed", after_messages=messages[:2], removed=2)
+
+    monkeypatch.setattr(manual, "compress_now", compress_now)
+    try:
+        with pytest.raises(RuntimeError, match="could not safely reserve"):
+            with server._manual_compress_turn("ui", session):
+                server._compress_session_history(session)
+        assert session["history"] == before and session["history_version"] == 0
+        assert [row["lease_id"] for row in _entries(home)] == [foreign.lease_id]
+    finally:
+        if foreign is not None:
+            foreign.release()
+
+
+def test_foreign_acquire_waits_until_short_history_commit_finishes(home, monkeypatch):
+    from agent import conversation_compression_manual as manual
+
+    write_reached = threading.Event()
+    acquire_attempted = threading.Event()
+    foreign_done = threading.Event()
+    observed_while_paused = []
+    foreign_holder = []
+
+    class PausingSession(dict):
+        def __setitem__(self, key, value):
+            if key == "history" and len(value) == 2:
+                write_reached.set()
+                assert acquire_attempted.wait(5)
+                observed_while_paused.append(foreign_done.wait(2))
+            super().__setitem__(key, value)
+
+    session = PausingSession(_session())
+    session["history"] = [{"role": "user", "content": f"message {i}"} for i in range(4)]
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(home))
+    monkeypatch.setattr(manual, "compress_now", lambda _agent, before, _request, **_kw: SimpleNamespace(
+        status="compressed", after_messages=before[:2], removed=2))
+
+    def compete():
+        assert write_reached.wait(10)
+        acquire_attempted.set()
+        copy(session["active_session_lease"]).release()
+        owner, refusal = try_acquire_active_session(
+            session_id="A", surface="cli", config={}, metadata={"live_session_id": "foreign"},
+            registry_home=home)
+        foreign_holder.append((owner, refusal))
+        foreign_done.set()
+
+    worker = threading.Thread(target=compete, daemon=True)
+    worker.start()
+    try:
+        with server._manual_compress_turn("ui", session):
+            removed, _usage = server._compress_session_history(session)
+            assert removed == 2
+        assert observed_while_paused == [False]
+        assert session["history_version"] == 1
+        assert foreign_done.wait(5)
+        owner, refusal = foreign_holder[0]
+        assert owner is not None and refusal is None
+    finally:
+        write_reached.set()
+        worker.join(timeout=5)
+        if foreign_holder and foreign_holder[0][0] is not None:
+            foreign_holder[0][0].release()
 
 
 def test_failed_manual_transfer_keeps_old_route_and_no_new_notification(home, monkeypatch):
