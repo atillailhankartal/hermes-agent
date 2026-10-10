@@ -5,6 +5,7 @@ import threading
 from datetime import datetime
 from dataclasses import replace
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
@@ -827,6 +828,210 @@ async def test_actual_new_publishes_before_slow_cleanup_and_resume_replaces_only
     assert runner._agent_cache == {}
     assert runner._spawn_release_thread.call_count == 1
     assert runner._spawn_release_thread.call_args.args[1] == (captured_old_agent,)
+
+
+@pytest.mark.asyncio
+async def test_late_resume_hook_cannot_clear_successor_new_pin_or_cache(tmp_path, monkeypatch):
+    store, old = _store(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "_generate_session_key", lambda _source: "route")
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_key_for_source = lambda _source: "route"
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._release_running_agent_state = Mock()
+    runner._agent_cache = {"route": (object(), "A-signature")}
+    runner._agent_cache_lock = threading.Lock()
+    runner._spawn_release_thread = Mock()
+    runner._evict_cached_agent = Mock(wraps=runner._evict_cached_agent)
+    runner._clear_conversation_scope = Mock()
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._reset_notice_session_info = Mock(return_value="")
+    runner._telegram_topic_new_header = Mock(return_value=None)
+    runner._is_telegram_topic_lane = Mock(return_value=False)
+    runner._session_db = SimpleNamespace(get_session_title=AsyncMock(return_value="C"))
+    runner._finalize_session_off_loop = AsyncMock()
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._resolve_resume_target = AsyncMock(return_value=("C", "C"))
+    runner._resume_access_denied_reply = AsyncMock(return_value=None)
+    runner._session_state("route").persistent.run_generation = 1
+    entered, release = asyncio.Event(), asyncio.Event()
+    events = []
+
+    async def hold_resume(_runner, name, payload):
+        events.append((name, payload))
+        if name == "on_session_resumed":
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", hold_resume)
+    await runner._handle_reset_command(MessageEvent(text="/new", source=old.origin))
+    d = store.lookup_by_session_key("route")
+    resume = asyncio.create_task(runner._handle_resume_command(MessageEvent(text="/resume C", source=old.origin)))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        c = store.lookup_by_session_key("route")
+        assert c.session_id == "C"
+        c_epoch = c.route_epoch
+        await runner._handle_reset_command(MessageEvent(text="/new", source=old.origin))
+        e = store.lookup_by_session_key("route")
+        assert e.session_id not in ("A", "C", d.session_id)
+        assert len({d.route_epoch, c_epoch, e.route_epoch}) == 3
+        await runner.async_session_store.set_model_override("route", {"model": "E-pin"})
+        successor = object()
+        runner._agent_cache["route"] = (successor, "E-signature")
+        eviction_count = runner._evict_cached_agent.call_count
+    finally:
+        release.set()
+    await asyncio.wait_for(resume, 2)
+    assert store.lookup_by_session_key("route").route_epoch == e.route_epoch
+    assert store.get_model_override("route") == {"model": "E-pin"}
+    assert _durable(tmp_path)["model_override"] == {"model": "E-pin"}
+    assert runner._agent_cache["route"][0] is successor
+    assert runner._evict_cached_agent.call_count == eviction_count
+    assert [name for name, _ in events] == ["on_session_reset", "on_session_resumed", "on_session_reset"]
+    assert events[1][1]["route_epoch"] == c_epoch
+    assert events[2][1]["route_epoch"] == e.route_epoch
+
+
+def _resume_boundary_runner(store, home):
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_key_for_source = lambda _source: "route"
+    runner._resolve_profile_home_for_source = lambda _source: home
+    runner._release_running_agent_state = Mock()
+    runner._evict_cached_agent = Mock(return_value=None)
+    runner._clear_conversation_scope = Mock()
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._reset_notice_session_info = Mock(return_value="")
+    runner._telegram_topic_new_header = Mock(return_value=None)
+    runner._is_telegram_topic_lane = Mock(return_value=False)
+    runner._session_db = SimpleNamespace(get_session_title=AsyncMock(return_value="C"))
+    runner._finalize_session_off_loop = AsyncMock()
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._resolve_resume_target = AsyncMock(return_value=("C", "C"))
+    runner._resume_access_denied_reply = AsyncMock(return_value=None)
+    runner._session_state("route").persistent.run_generation = 1
+    return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("readback_fails", [False, True])
+async def test_resume_commit_then_error_uses_authoritative_readback_or_closes_route(
+    tmp_path, monkeypatch, readback_fails,
+):
+    store, old = _store(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "_generate_session_key", lambda _source: "route")
+    store.set_model_override("route", {"model": "old-pin"})
+    runner = _resume_boundary_runner(store, tmp_path)
+    emitted = AsyncMock()
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
+    real_persist = store._persist_routing_data
+    real_read = Path.read_text
+
+    def committed_then_failed(data, generation):
+        real_persist(data, generation)
+        route = data.get("route", {})
+        if route.get("session_id") == "C" and route.get("model_override") is None:
+            raise OSError("resume completion lost after durable commit")
+
+    def unavailable_readback(path, *args, **kwargs):
+        if str(path) == str(tmp_path / "sessions" / "sessions.json"):
+            raise OSError("authoritative route readback unavailable")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_persist_routing_data", committed_then_failed)
+    with monkeypatch.context() as patch:
+        if readback_fails:
+            patch.setattr(Path, "read_text", unavailable_readback)
+        if readback_fails:
+            with pytest.raises(OSError, match="resume completion lost"):
+                await runner._handle_resume_command(MessageEvent(text="/resume C", source=old.origin))
+        else:
+            await runner._handle_resume_command(MessageEvent(text="/resume C", source=old.origin))
+    durable = _durable(tmp_path)
+    assert durable["session_id"] == "C"
+    if readback_fails:
+        assert store.lookup_by_session_key("route").route_claim_blocked is True
+        emitted.assert_not_awaited()
+    else:
+        live = store.lookup_by_session_key("route")
+        assert live.session_id == "C" and live.route_epoch == durable["route_epoch"]
+        assert store.get_model_override("route") is None and durable.get("model_override") is None
+        emitted.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion_error", [False, True])
+async def test_cancelled_resume_boundary_write_drains_before_new_route_can_publish(
+    tmp_path, monkeypatch, completion_error,
+):
+    store, old = _store(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "_generate_session_key", lambda _source: "route")
+    runner = _resume_boundary_runner(store, tmp_path)
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", AsyncMock())
+    started, release = threading.Event(), threading.Event()
+    real_persist = store._persist_routing_data
+
+    def held_switch(data, generation):
+        if data.get("route", {}).get("session_id") == "C":
+            started.set()
+            assert release.wait(3)
+        result = real_persist(data, generation)
+        if completion_error and data.get("route", {}).get("session_id") == "C":
+            raise OSError("resume completion lost after durable commit")
+        return result
+
+    monkeypatch.setattr(store, "_persist_routing_data", held_switch)
+    resume = asyncio.create_task(runner._handle_resume_command(MessageEvent(text="/resume C", source=old.origin)))
+    reset = None
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        resume.cancel()
+        reset = asyncio.create_task(runner._handle_reset_command(MessageEvent(text="/new", source=old.origin)))
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.01, heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), 0.1)
+        gate_held = runner._session_route_gate("route").locked()
+        reset_pending = not reset.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(resume, 2)
+    assert reset is not None
+    await asyncio.wait_for(reset, 2)
+    assert gate_held and reset_pending
+    live = store.lookup_by_session_key("route")
+    assert live.session_id != "C" and _durable(tmp_path)["route_epoch"] == live.route_epoch
+
+
+@pytest.mark.asyncio
+async def test_resume_definite_write_failure_preserves_old_route_without_hook(tmp_path, monkeypatch):
+    store, old = _store(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "_generate_session_key", lambda _source: "route")
+    runner = _resume_boundary_runner(store, tmp_path)
+    emitted = AsyncMock()
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
+    old_epoch = old.route_epoch
+    real_persist = store._persist_routing_data
+
+    def fail_before_commit(data, generation):
+        if data.get("route", {}).get("session_id") == "C":
+            raise OSError("resume write definitely failed")
+        return real_persist(data, generation)
+
+    monkeypatch.setattr(store, "_persist_routing_data", fail_before_commit)
+    with pytest.raises(OSError, match="resume write definitely failed"):
+        await runner._handle_resume_command(MessageEvent(text="/resume C", source=old.origin))
+    live = store.lookup_by_session_key("route")
+    assert live.session_id == "A" and live.route_epoch == old_epoch
+    assert not live.route_claim_blocked
+    assert _durable(tmp_path)["session_id"] == "A"
+    assert _durable(tmp_path)["route_epoch"] == old_epoch
+    emitted.assert_not_awaited()
 
 
 @pytest.mark.asyncio

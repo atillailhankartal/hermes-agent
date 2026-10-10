@@ -1066,45 +1066,50 @@ class GatewaySessionCommandsMixin:
         old_epoch = current_entry.route_epoch
         # Freeze generation invalidation and the durable route CAS under the same per-key gate.
         # Cancellation drains the offloaded write before another /new or turn can enter.
+        cancelled = False
         async with self._session_route_gate(session_key):
             current = await self.async_session_store.lookup_by_session_key(session_key)
             if current is not current_entry or current.session_id != old_sid:
                 return t("gateway.resume.switch_failed")
             boundary_generation = self._begin_session_run_generation(session_key)
-            write = asyncio.create_task(self.async_session_store.switch_session(
-                session_key, target_id, expected_session_id=old_sid, preserve_prompt_pin=False,
-                route_claim_blocked=False,
-            ))
-            cancelled = False
-            while not write.done():
-                try:
-                    await asyncio.shield(write)
-                except asyncio.CancelledError:
-                    cancelled = True
-            new_entry = write.result()
-        if not new_entry:
-            return t("gateway.resume.switch_failed")
-        self._release_running_agent_state(session_key, run_generation=boundary_generation)
-        # Conversation boundary: all conversation-scoped state + security state in one funnel call.
-        # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
-        # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
-        # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
-        self._clear_conversation_scope(session_key, reason="resume")
+            try:
+                new_entry, write_cancelled = await self._drain_reset_boundary_operation(
+                    self.async_session_store.switch_session(
+                        session_key, target_id, expected_session_id=old_sid,
+                        preserve_prompt_pin=False, preserve_model_override=False,
+                        route_claim_blocked=False,
+                    ))
+                cancelled |= write_cancelled
+            except Exception:
+                # The writer may have committed the new route before reporting failure.
+                # Resolve its result while this key is still gated; an unknown readback
+                # closes the in-process route instead of admitting an unproven owner.
+                cancelled |= bool(asyncio.current_task().cancelling())
+                new_entry, read_cancelled = await self._drain_reset_boundary_operation(
+                    self.async_session_store.reconcile_failed_switch(
+                        session_key, old_sid, old_epoch, target_id))
+                cancelled |= read_cancelled
+                if new_entry is None:
+                    raise
+                logger.warning("Gateway resume writer reported an error after durable route commit for %s",
+                               session_key, exc_info=True)
+            if not new_entry:
+                return t("gateway.resume.switch_failed")
+            self._release_running_agent_state(session_key, run_generation=boundary_generation)
+            # A successor may publish as soon as this gate opens. Complete every mutation
+            # of this shared key before the slow keyed lifecycle callback starts.
+            self._clear_conversation_scope(session_key, reason="resume")
+            self._evict_cached_agent(session_key)
         # The route is durable now. Publish an immutable keyed transition before slow banner
         # reads; a delayed observer can see a later /new and reject this exact epoch.
         from gateway.route_lifecycle import emit_route_lifecycle, route_lifecycle_payload
-        await emit_route_lifecycle(self, "on_session_resumed", {
-            **route_lifecycle_payload(self, new_entry, source), "reason": "resume",
-            "old_session_id": old_sid, "old_route_epoch": old_epoch,
-            "new_session_id": new_entry.session_id, "user_id": source.user_id,
-        })
-        # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
-        # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
-        # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
-        await self.async_session_store.set_model_override(session_key, None)
-        # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
-        # provider cached _session_id at initialize() and would keep writing to the wrong session.
-        self._evict_cached_agent(session_key)
+        _, hook_cancelled = await self._drain_reset_boundary_operation(
+            emit_route_lifecycle(self, "on_session_resumed", {
+                **route_lifecycle_payload(self, new_entry, source), "reason": "resume",
+                "old_session_id": old_sid, "old_route_epoch": old_epoch,
+                "new_session_id": new_entry.session_id, "user_id": source.user_id,
+            }))
+        cancelled |= hook_cancelled
         if cancelled:
             raise asyncio.CancelledError
         title = await self._session_db.get_session_title(target_id) or name

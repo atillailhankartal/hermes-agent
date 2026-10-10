@@ -1224,6 +1224,59 @@ class SessionStore(
             self._entries[session_key] = durable
             return replace(durable)
 
+    def reconcile_failed_switch(
+        self, session_key: str, old_session_id: str, old_route_epoch: Optional[str],
+        target_session_id: str,
+    ) -> Optional[SessionEntry]:
+        """Resolve an ambiguous /resume write from the authoritative routing index.
+
+        A route write may commit before its worker reports an error. The caller holds the
+        per-key route gate after draining that worker. Adopt only the exact target with a
+        fresh epoch and the boundary's cleared model pin; close the live route if storage
+        cannot prove either the old route or that committed target.
+        """
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if current is None:
+                return None
+            if current.session_id not in (old_session_id, target_session_id):
+                current.route_claim_blocked = True
+                current.route_claim_recoverable = False
+                return None
+            try:
+                loader = self._routing_db_method("load_gateway_routing_entries")
+                if loader is not None:
+                    raw = loader(scope=self._routing_scope()).get(session_key)
+                    durable_data = json.loads(raw) if raw else None
+                else:
+                    durable_data = json.loads(
+                        (self.sessions_dir / "sessions.json").read_text(encoding="utf-8-sig")
+                    ).get(session_key)
+                durable = SessionEntry.from_dict(durable_data) if isinstance(durable_data, dict) else None
+            except Exception:
+                logger.warning("Gateway resume route readback failed for %s", session_key, exc_info=True)
+                durable = None
+
+            if (durable is not None and durable.session_key == session_key
+                    and durable.origin == current.origin):
+                if (durable.session_id == target_session_id and durable.route_epoch
+                        and durable.route_epoch != old_route_epoch
+                        and durable.model_override is None and not durable.route_claim_blocked
+                        and current.session_id in (old_session_id, target_session_id)
+                        and (current.session_id != target_session_id
+                             or current.route_epoch == durable.route_epoch)):
+                    self._entries[session_key] = durable
+                    return replace(durable)
+                if (durable.session_id == old_session_id
+                        and durable.route_epoch == old_route_epoch
+                        and current.session_id == old_session_id
+                        and current.route_epoch == old_route_epoch):
+                    return None  # The old route is durably unchanged; the switch failed.
+
+            current.route_claim_blocked = True
+            current.route_claim_recoverable = False
+            return None
+
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
         """Persist a fresh route and epoch before publishing either in memory. Lock held."""
         new_entry = SessionEntry(
@@ -1315,7 +1368,8 @@ class SessionStore(
     # restart-resume freshness gate (#85709).
     def switch_session(
         self, session_key: str, target_session_id: str, *, expected_session_id: Optional[str] = None,
-        preserve_prompt_pin: bool = True, route_claim_blocked: bool = True,
+        preserve_prompt_pin: bool = True, preserve_model_override: bool = True,
+        route_claim_blocked: bool = True,
     ) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
         reopens the target so resume matches the CLI.
@@ -1323,8 +1377,9 @@ class SessionStore(
         ``expected_session_id`` makes the repoint a compare-and-swap: ``None`` is returned when
         the key no longer points at that session, so a caller that resolved against a snapshot
         across an await (async-delegation re-pin) cannot overwrite a concurrent /new or /resume.
-        Prompt pins follow non-boundary repoints by default; /resume opts out explicitly because it
-        starts a different conversation on the same routing key.
+        Prompt and model pins follow non-boundary repoints by default; /resume opts out explicitly
+        because it starts a different conversation on the same routing key. Clearing the model pin
+        in this same routing write prevents a delayed boundary from clearing a successor's pin.
         """
         with self._lock:
             old_entry = self._entry_locked(session_key)
@@ -1340,7 +1395,8 @@ class SessionStore(
                 return old_entry
             new_entry = self._replace_route_locked(
                 session_key, old_entry, target_session_id, _now(),
-                display_name=old_entry.display_name, model_override=old_entry.model_override,
+                display_name=old_entry.display_name,
+                model_override=old_entry.model_override if preserve_model_override else None,
                 yolo=old_entry.yolo,
                 route_claim_blocked=route_claim_blocked,
                 route_claim_recoverable=route_claim_blocked,
