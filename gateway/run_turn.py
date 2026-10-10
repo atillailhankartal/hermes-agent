@@ -1138,6 +1138,8 @@ class GatewayTurnMixin:
                 await asyncio.to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="hygiene-compression",
                 )
+        elif _hyg_in_place:
+            await self._hmwa_publish_in_place_compaction_epoch(session_entry, _quick_key, run_generation)
 
         if _hyg_rotated or _hyg_in_place:
             # Persisted (rotation) or persisted by archive_and_compact() (in-place): reset token count.
@@ -1566,8 +1568,6 @@ class GatewayTurnMixin:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
 
-        # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
-        # if the binding still points at the session this run was launched against.
         if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
             if session_entry.session_id == _run_start_session_id:
                 await self._hmwa_publish_compression_child_route(

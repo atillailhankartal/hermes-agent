@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 
 from gateway.config import GatewayConfig, Platform
+from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, SessionStore
 from gateway.route_claim import claim_for_tool, gateway_route_scope
 from gateway.run import GatewayRunner
@@ -338,3 +339,59 @@ async def test_manual_child_persist_cancellation_drains_before_releasing_lease(t
         await task
     assert entry.session_id == "A" and _durable(tmp_path)["session_id"] == "A"
     assert runner._turn_leases._leases["A"].holder is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_resume_revokes_old_claim_before_durable_b_switch(tmp_path, monkeypatch, cancel):
+    store, entry = _store(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "get_or_create_session", Mock(return_value=entry))
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._session_db = SimpleNamespace(get_session_title=AsyncMock(return_value="B"))
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._session_key_for_source = lambda _source: "route"
+    runner._resolve_resume_target = AsyncMock(return_value=("B", "B"))
+    runner._resume_access_denied_reply = AsyncMock(return_value=None)
+    runner._persist_active_agents = Mock()
+    runner._clear_conversation_scope = Mock()
+    runner._evict_cached_agent = Mock()
+    runner._session_state("route").persistent.run_generation = 1
+    token = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = token
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        old_claim = claim_for_tool("A")
+    assert old_claim and old_claim.is_current()
+    started, release = threading.Event(), threading.Event()
+    real_switch = store.switch_session
+
+    def delayed_switch(*args, **kwargs):
+        started.set()
+        assert release.wait(2), "test switch was not released"
+        return real_switch(*args, **kwargs)
+
+    monkeypatch.setattr(store, "switch_session", delayed_switch)
+    task = asyncio.create_task(runner._handle_resume_command(MessageEvent(
+        text="/resume B", source=entry.origin,
+    )))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        assert old_claim.is_current() is False
+        assert entry.session_id == "A" and _durable(tmp_path)["session_id"] == "A"
+        if cancel:
+            task.cancel()
+            heartbeat = asyncio.Event()
+            asyncio.get_running_loop().call_later(0.01, heartbeat.set)
+            await asyncio.wait_for(heartbeat.wait(), 0.1)
+            assert not task.done()
+    finally:
+        release.set()
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await task
+    assert store.lookup_by_session_key("route").session_id == "B"
+    runner._turn_leases.release(token)

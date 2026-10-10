@@ -89,6 +89,26 @@ async def test_agent_result_in_place_compaction_mints_durable_epoch(tmp_path, mo
         runner._turn_leases.release(token)
 
 
+@pytest.mark.asyncio
+async def test_hygiene_in_place_compaction_mints_durable_epoch(tmp_path, monkeypatch):
+    runner, store, entry, source, token = await _runner(tmp_path, monkeypatch)
+    old_epoch = entry.route_epoch
+    attempt = SimpleNamespace(
+        agent=SimpleNamespace(session_id="old", _last_compaction_in_place=True), history=_HISTORY,
+    )
+    plan = SimpleNamespace(msg_count=4, approx_tokens=4000, warn_token_threshold=10**9)
+    try:
+        await runner._hmwa_hygiene_adopt_transcript(
+            attempt, _COMPRESSED, _HISTORY, plan, session_entry=entry, source=source,
+            _quick_key="route", run_generation=1,
+        )
+        assert entry.route_epoch != old_epoch
+        reopened = SessionStore(tmp_path / "sessions", GatewayConfig())
+        assert reopened.lookup_by_session_key("route").route_epoch == entry.route_epoch
+    finally:
+        runner._turn_leases.release(token)
+
+
 async def _run_sync_split(runner, source, monkeypatch, *, failed=False):
     """Drive the real executor body while replacing only model/progress plumbing."""
     agent = SimpleNamespace(session_id="child", _last_compaction_in_place=False)
