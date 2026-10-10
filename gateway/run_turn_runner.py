@@ -1850,6 +1850,13 @@ class TurnRunner:
         return final_response + "\n" + "\n".join(unique_tags)
 
     def run_sync(self):
+        """Bind one host-issued Gateway route scope for the executor and tool workers."""
+        from gateway.route_claim import gateway_route_scope
+        ctx = self._ctx
+        with gateway_route_scope(self._runner, ctx.session_key, ctx.run_generation, ctx.source):
+            return self._run_sync_inner()
+
+    def _run_sync_inner(self):
         """Executor-thread body of the turn; returns the gateway result dict.
 
         The turn message lives on the shared TurnContext (``ctx.message``) so ``_run_agent_inner`` sees

@@ -20,6 +20,7 @@ from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pi
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
+from gateway.route_claim import new_route_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -540,6 +541,11 @@ class SessionEntry:
     # Gateway ``/yolo`` bypass for this lane, mirrored from ``tools.approval``'s in-memory set so a restart
     # keeps it; cleared with it at every conversation boundary (``_clear_session_boundary_security_state``).
     yolo: bool = False
+    # Opaque durable route publication generation. Native IDs can repeat after /resume.
+    route_epoch: Optional[str] = field(default_factory=new_route_epoch)
+    # A store-level compression heal has no proof that the active turn lease followed the child.
+    # Such routes stay closed to Bee until an explicitly leased publication replaces them.
+    route_claim_blocked: bool = False
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -560,6 +566,7 @@ class SessionEntry:
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type, "metadata": self.metadata,
+            "route_epoch": self.route_epoch, "route_claim_blocked": self.route_claim_blocked,
         }
         result.update((name, getattr(self, name)) for name in self._PLAIN_FIELDS)
         result["last_resume_marked_at"] = _iso(self.last_resume_marked_at)
@@ -617,6 +624,8 @@ class SessionEntry:
             model_override=sanitize_model_override(data.get("model_override")),
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
+            route_epoch=data.get("route_epoch") if isinstance(data.get("route_epoch"), str) and data.get("route_epoch") else None,
+            route_claim_blocked=data.get("route_claim_blocked") is True,
             **plain,
         )
 
@@ -796,6 +805,11 @@ class SessionStore(
         self._routing_db_loaded = False
         self._routing_fallback_baseline: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()  # guards _entries / _loaded only
+        # Process-local issuer proof complements the durable epoch: an old process cannot issue
+        # a claim for a new boot even if its copied routing data names the same native session.
+        self._route_owner_id = new_route_epoch()
+        self._route_claim_proof = object()
+        self._route_owner_retired = False
         self._save_lock = threading.Lock()  # whole-index persistence, never held with _lock
         # Fast (single-entry) and full saves share one generation counter so they are totally
         # ordered; _fast_persisted_entries: key -> (revision, entry_json) since the last rewrite.
@@ -854,6 +868,10 @@ class SessionStore(
         except Exception:
             self._routing_home = None
         self._open_session_db_for_active_scope()
+
+    def retire_route_owner(self) -> None:
+        """Revoke this process's claims at shutdown without waiting on a route-store write."""
+        self._route_owner_retired = True
 
     def _lazy(self, name: str, factory):
         """``self.<name>``, created via *factory* when missing/None (suites build bare stores via
@@ -1032,8 +1050,14 @@ class SessionStore(
             return
         self._reopen_session_row(session_key, recovered.session_id)
         with self._lock:
-            decision.entry = self._entries.setdefault(session_key, recovered)
-        decision.needs_save = True
+            current = self._entries.get(session_key)
+            if current is None:
+                data, generation = self._snapshot_routing_locked()
+                data[session_key] = recovered.to_dict()
+                self._persist_routing_data(data, generation)
+                self._entries[session_key] = current = recovered
+        decision.entry = current
+        decision.needs_save = False
 
     def _route_create(
         self, decision: _RouteDecision, session_key: str, source: SessionSource, now: datetime,
@@ -1052,9 +1076,12 @@ class SessionStore(
         with self._lock:
             current = self._entries.get(session_key)
             if current is None or (force_new and current is observed):
+                data, generation = self._snapshot_routing_locked()
+                data[session_key] = candidate.to_dict()
+                self._persist_routing_data(data, generation)
                 self._entries[session_key] = current = candidate
         decision.entry = current
-        decision.needs_save = True
+        decision.needs_save = False
         if current is not candidate:
             return None
         return self._session_create_kwargs(
@@ -1157,14 +1184,16 @@ class SessionStore(
         return new_entry
 
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
-        """Publish a fresh entry (inheriting origin/platform/chat_type) and save. Lock held."""
+        """Persist a fresh route and epoch before publishing either in memory. Lock held."""
         new_entry = SessionEntry(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=old_entry.origin, platform=old_entry.platform, chat_type=old_entry.chat_type,
             transport_profile=old_entry.transport_profile, **fields,
         )
+        data, generation = self._snapshot_routing_locked()
+        data[session_key] = new_entry.to_dict()
+        self._persist_routing_data(data, generation)
         self._entries[session_key] = new_entry
-        self._save()
         return new_entry
 
     def rekey_profile_routing(self, old_name: str, new_name: str) -> int:

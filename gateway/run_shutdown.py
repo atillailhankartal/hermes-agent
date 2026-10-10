@@ -1862,6 +1862,7 @@ class GatewayShutdownMixin:
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
         self._running = False
+        getattr(getattr(self, "session_store", None), "retire_route_owner", lambda: None)()
         self._clear_plugin_message_injector()
         self._draining = True
         self._mark_api_runs_shutdown_requested()
@@ -2225,8 +2226,6 @@ class GatewayShutdownMixin:
     async def _stop_impl(self) -> None:
         """Run every ``_stop_*`` phase under the thread-based shutdown watchdog."""
         from gateway.run import GatewayRunner
-        # Thread-based watchdog (asyncio timeouts cannot recover a frozen loop): dumps stacks and
-        # os._exit past drain+grace so the service manager revives us. Skipped under pytest.
         # Arm a plain OS thread at the start of stop(); if teardown never finishes within drain+grace it
         # dumps faulthandler stacks and os._exit so KeepAlive/systemd can revive. Skip under pytest so
         # stop()-driving unit tests don't get a delayed hard-exit in the worker. See #66892.
