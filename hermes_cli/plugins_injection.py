@@ -101,18 +101,27 @@ def _call_host_bounded(
 
     def invoke_host() -> None:
         try:
-            outcome["receipt"] = registered[1](**callback_kwargs)
+            # The caller may be inside a different profile. Keep its other ContextVars,
+            # but bind host work to the manager that authorized this delivery.
+            from hermes_cli.plugins import _plugin_home_scope
+            with _plugin_home_scope(manager.home_path):
+                outcome["receipt"] = registered[1](**callback_kwargs)
         except BaseException:  # health: allow BLE001 -- worker must release capacity even on host failure
             outcome["failed"] = True
         finally:
             _release_admission_worker(manager, surface)
             done.set()
 
+    worker = None
     try:
         from agent.memory_provider import spawn_context_thread
-        spawn_context_thread(invoke_host, name="plugin-admission").start()
+        worker = spawn_context_thread(invoke_host, name="plugin-admission")
+        worker.start()
     except Exception:  # health: allow BLE001 -- scheduler may fail after dispatch was attempted
-        _release_admission_worker(manager, surface)
+        # A scheduler can report failure after starting the thread. In that case
+        # the late callback owns its capacity slot until it actually finishes.
+        if worker is None or worker.ident is None:
+            _release_admission_worker(manager, surface)
         return _admission_receipt("unknown", "host_worker_start_failed", delivery_id, route_epoch)
     if not done.wait(_ADMISSION_WAIT_SECONDS):
         return _admission_receipt("unknown", "admission_timeout", delivery_id, route_epoch)
@@ -200,10 +209,26 @@ def inject_plugin_message_admitted(
     ctx: Any, content: str, *, surface: str, route_claim: Any,
     expected_session_id: str, delivery_id: str,
 ) -> AdmissionReceipt:
+    """Run every route observation under the authorizing manager's profile."""
+    from hermes_cli.plugins import _plugin_home_scope
+
+    with _plugin_home_scope(ctx._manager.home_path):
+        return _inject_plugin_message_admitted_scoped(
+            ctx, content, surface=surface, route_claim=route_claim,
+            expected_session_id=expected_session_id, delivery_id=delivery_id,
+        )
+
+
+def _inject_plugin_message_admitted_scoped(
+    ctx: Any, content: str, *, surface: str, route_claim: Any,
+    expected_session_id: str, delivery_id: str,
+) -> AdmissionReceipt:
     """Ask a separately registered host for a definitive candidate insertion result.
 
     Legacy Gateway/TUI bool callbacks are never consulted. A timeout or exception after
     dispatch is ambiguous, so it is ``unknown`` rather than a retryable rejection.
+    A route change after dispatch stays unknown until a same-delivery host status query
+    proves whether the candidate was inserted; never retry blindly on that result.
     """
     manager = ctx._manager
     epoch = getattr(route_claim, "route_epoch", None)
@@ -264,7 +289,7 @@ def inject_plugin_message_admitted(
             or result.route_epoch != epoch or result.state not in ("admitted", "rejected", "unknown")
             or (result.state == "admitted" and not (
                 isinstance(result.admission_id, str) and result.admission_id.strip()
-            ))):
+            )) or (result.state != "admitted" and result.admission_id is not None)):
         return _admission_receipt("unknown", "invalid_host_receipt", delivery_id, epoch)
     try:
         still_current = route_claim.is_route_current() is True

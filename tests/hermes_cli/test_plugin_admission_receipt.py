@@ -16,7 +16,7 @@ from hermes_cli.plugins import (
     _reset_plugin_managers_for_tests, clear_published_admission_host,
     get_plugin_manager, publish_admission_host,
 )
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
 from hermes_cli import plugins_injection
 
 
@@ -195,6 +195,90 @@ def test_admission_worker_preserves_task_local_context(tmp_path):
         marker.reset(token)
 
 
+def test_typed_host_callback_uses_manager_profile_when_caller_is_in_another_profile(tmp_path):
+    ctx, manager = pair(tmp_path)
+    other_home = tmp_path / "other-profile"
+    other_home.mkdir()
+    marker = ContextVar("profile-crossing-marker", default="missing")
+    marker_token = marker.set("caller-context")
+    seen = []
+
+    def host(**kwargs):
+        seen.append((get_hermes_home().resolve(), marker.get(), kwargs["manager"].scope_key))
+        return AdmissionReceipt("admitted", "inserted", kwargs["delivery_id"], "epoch-1", "candidate-1")
+
+    manager.set_admission_host("gateway", object(), host, "owner-1")
+    home_token = set_hermes_home_override(other_home)
+    try:
+        receipt = ask(ctx, route(manager))
+        assert get_hermes_home().resolve() == other_home.resolve()
+    finally:
+        reset_hermes_home_override(home_token)
+        marker.reset(marker_token)
+    assert receipt.state == "admitted"
+    assert (receipt.admission_id, receipt.candidate_id) == ("candidate-1", "candidate-1")
+    assert seen == [(manager.home_path.resolve(), "caller-context", manager.scope_key)]
+
+
+def test_route_guards_use_manager_profile_before_and_after_host_dispatch(tmp_path):
+    ctx, manager = pair(tmp_path)
+    other_home = tmp_path / "other-profile"
+    other_home.mkdir()
+    claim = route(manager)
+    seen = []
+
+    def check_route():
+        seen.append(get_hermes_home().resolve())
+        return get_hermes_home().resolve() == manager.home_path.resolve()
+
+    claim.is_route_current = check_route
+    manager.set_admission_host(
+        "gateway", object(),
+        lambda **kwargs: AdmissionReceipt(
+            "admitted", "inserted", kwargs["delivery_id"], "epoch-1", "candidate-1",
+        ), "owner-1",
+    )
+    token = set_hermes_home_override(other_home)
+    try:
+        receipt = ask(ctx, claim)
+    finally:
+        reset_hermes_home_override(token)
+    assert receipt.state == "admitted"
+    assert len(seen) == 3
+    assert seen == [manager.home_path.resolve()] * 3
+
+
+@pytest.mark.parametrize("state", ["rejected", "unknown"])
+def test_host_receipt_with_nonadmitted_candidate_is_unknown(tmp_path, state):
+    ctx, manager = pair(tmp_path)
+    manager.set_admission_host(
+        "gateway", object(),
+        lambda **kwargs: AdmissionReceipt(
+            state, "inconsistent", kwargs["delivery_id"], "epoch-1", "candidate-maybe-inserted",
+        ), "owner-1",
+    )
+    receipt = ask(ctx, route(manager))
+    assert (receipt.state, receipt.reason, receipt.admission_id, receipt.candidate_id) == (
+        "unknown", "invalid_host_receipt", None, None,
+    )
+
+
+def test_confirmed_insertion_then_route_revocation_remains_unknown_without_retry_proof(tmp_path):
+    ctx, manager = pair(tmp_path)
+    claim = route(manager)
+
+    def host(**kwargs):
+        claim.current = False
+        return AdmissionReceipt("admitted", "inserted", kwargs["delivery_id"], "epoch-1", "candidate-1")
+
+    manager.set_admission_host("gateway", object(), host, "owner-1")
+    receipt = ask(ctx, claim)
+    assert (receipt.state, receipt.reason, receipt.delivery_id, receipt.route_epoch) == (
+        "unknown", "route_changed_after_dispatch", "delivery-1", "epoch-1",
+    )
+    assert receipt.admission_id is None  # Status query by this exact delivery is required before retry.
+
+
 def test_worker_start_failure_is_unknown_and_releases_capacity(tmp_path, monkeypatch):
     ctx, manager = pair(tmp_path)
     host = Mock(return_value=AdmissionReceipt("admitted", "inserted", "delivery-1", "epoch-1", "candidate-1"))
@@ -209,6 +293,51 @@ def test_worker_start_failure_is_unknown_and_releases_capacity(tmp_path, monkeyp
     assert (receipt.state, receipt.reason) == ("unknown", "host_worker_start_failed")
     host.assert_not_called()
     assert ask(ctx, route(manager)).state == "admitted"
+
+
+def test_worker_start_error_after_schedule_keeps_capacity_until_late_callback_finishes(tmp_path, monkeypatch):
+    ctx, manager = pair(tmp_path)
+    monkeypatch.setattr(plugins_injection, "_MAX_ADMISSION_WORKERS_PER_SURFACE", 1)
+    entered, release, finished = Event(), Event(), Event()
+    called = []
+
+    def host(**kwargs):
+        called.append(kwargs["delivery_id"])
+        if kwargs["delivery_id"] == "delivery-1":
+            entered.set()
+            release.wait(1)
+            finished.set()
+        return AdmissionReceipt("admitted", "inserted", kwargs["delivery_id"],
+                                "epoch-1", "candidate-" + kwargs["delivery_id"])
+
+    manager.set_admission_host("gateway", object(), host, "owner-1")
+    real_start = plugins_injection.threading.Thread.start
+
+    def start_then_raise(thread):
+        real_start(thread)
+        assert entered.wait(1)
+        raise RuntimeError("completion lost after scheduling")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(plugins_injection.threading.Thread, "start", start_then_raise)
+            first = ask(ctx, route(manager))
+        assert (first.state, first.reason) == ("unknown", "host_worker_start_failed")
+        second = ask(ctx, route(manager), "delivery-2")
+        assert (second.state, second.reason) == ("unknown", "admission_workers_saturated")
+        assert called == ["delivery-1"]
+    finally:
+        release.set()
+    assert finished.wait(1)
+    deadline = monotonic() + 1
+    while monotonic() < deadline:
+        with plugins_injection._admission_workers_lock:
+            if not plugins_injection._admission_workers.get(manager, {}).get("gateway"):
+                break
+        sleep(0.001)
+    else:
+        pytest.fail("late callback kept a completed capacity slot")
+    assert ask(ctx, route(manager), "delivery-3").state == "admitted"
 
 
 @pytest.mark.asyncio
