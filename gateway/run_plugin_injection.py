@@ -249,6 +249,14 @@ class GatewayPluginInjectionMixin:
             try:
                 with active_session_lease_guard(state.turn.lease, session_id=key,
                                                live_session_id=key, registry_home=profile_home):
+                    from hermes_cli.trusted_inbound_broker import NativeCandidateSnapshot, TrustedInboundBrokerClient
+                    try:
+                        snapshot = NativeCandidateSnapshot.from_running_row(row, surface="gateway", content=event.text)
+                    except ValueError:
+                        return False
+                    if snapshot.host_owner_id != self.session_store._route_owner_id:
+                        return False
+                    TrustedInboundBrokerClient().observe_native_turn(snapshot)
                     return queue.settle(row["candidate"])
             except ActiveSessionRegistryError:
                 return False

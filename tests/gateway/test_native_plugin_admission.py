@@ -374,6 +374,7 @@ async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, mo
     import gateway.run as gateway_run
     from gateway.platforms.base import BasePlatformAdapter, PlatformConfig, SendResult
     from hermes_cli.plugins import PluginContext
+    from hermes_cli.trusted_inbound_broker import TrustedInboundBrokerClient
 
     class RecordingAdapter(BasePlatformAdapter):
         async def connect(self, **kwargs):
@@ -392,6 +393,15 @@ async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, mo
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     (tmp_path / "config.yaml").write_text("plugins:\n  entries:\n    bee:\n      allow_gateway_injection: true\n")
     runner = GatewayRunner(GatewayConfig(multiplex_profiles=False, sessions_dir=tmp_path / "sessions"))
+    observations = []
+    original_observe = TrustedInboundBrokerClient.observe_native_turn
+    def observe(client, snapshot):
+        state = runner._peek_session_state(snapshot.session_key)
+        assert state is not None
+        assert runner._held_turn_lease(snapshot.session_key, state.persistent.run_generation) is not None
+        observations.append(snapshot)
+        return original_observe(client, snapshot)
+    monkeypatch.setattr(TrustedInboundBrokerClient, "observe_native_turn", observe)
     adapter = RecordingAdapter(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
     adapter.gateway_runner = runner
     adapter.set_message_handler(runner._handle_message)
@@ -425,11 +435,15 @@ async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, mo
         await runner._drain_native_plugin_candidates_once()
         await adapter._session_tasks[entry.session_key]
     if missing:
+        assert observations == []
         assert observed == []
         assert (await admit(runner, manager, claim, "first", "first native")).state == "unknown"
         assert len(runner._native_plugin_queue().queued()) == 0
         return
     assert observed == [("first native", entry.session_id), ("second native", entry.session_id)]
+    assert [item.delivery_id for item in observations] == ["first", "second"]
+    assert all(original_observe(TrustedInboundBrokerClient(), item).state == "unknown"
+               for item in observations)
     assert (await admit(runner, manager, claim, "first", "first native")).state == "admitted"
     await runner._drain_native_plugin_candidates_once()
     assert len(observed) == 2

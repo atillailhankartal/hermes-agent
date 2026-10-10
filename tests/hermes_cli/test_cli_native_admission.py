@@ -148,6 +148,54 @@ def test_actual_agent_thread_settles_only_with_native_slot(shell):
     assert not host.drain_one()
 
 
+def test_trusted_broker_observation_is_unavailable_even_after_local_turn(shell, monkeypatch):
+    from hermes_cli.trusted_inbound_broker import TrustedInboundBrokerClient
+
+    host, ctx = context(shell)
+    claim = host.claim()
+    observations = []
+    original = TrustedInboundBrokerClient.observe_native_turn
+
+    def observe(client, snapshot):
+        assert host.active_turn is not None
+        assert host.active_turn[2] is not None
+        observations.append(snapshot)
+        return original(client, snapshot)
+
+    monkeypatch.setattr(TrustedInboundBrokerClient, "observe_native_turn", observe)
+    bind_real_agent_thread(shell, lambda **kwargs: {"messages": [], "final_response": "done", "completed": True})
+    assert deliver(ctx, claim).state == "unknown"
+    assert host.drain_one()
+    assert len(observations) == 1
+    snapshot = observations[0]
+    assert (snapshot.delivery_id, snapshot.candidate_id, snapshot.payload_sha256,
+            snapshot.host_owner_id, snapshot.route_epoch) == (
+        "delivery", host.queue.lookup(host.profile, claim.route_epoch, "delivery")["candidate"],
+        host.queue.payload_digest("native prompt"), claim.host_owner_id, claim.route_epoch)
+    assert original(TrustedInboundBrokerClient(), snapshot).state == "unknown"
+    assert not host.drain_one()
+    assert len(observations) == 1
+
+
+def test_forged_local_digest_never_reaches_broker_observer(shell, monkeypatch):
+    from hermes_cli.trusted_inbound_broker import TrustedInboundBrokerClient
+
+    host, ctx = context(shell)
+    claim = host.claim()
+    assert deliver(ctx, claim).state == "unknown"
+    with host.queue._connection() as db:
+        db.execute("UPDATE candidates SET payload_digest=? WHERE delivery=?", ("0" * 64, "delivery"))
+    observed = []
+    monkeypatch.setattr(TrustedInboundBrokerClient, "observe_native_turn",
+                        lambda *args: observed.append(args))
+    bind_real_agent_thread(shell, lambda **kwargs: {"messages": [], "final_response": "done", "completed": True})
+    assert host.drain_one()
+    assert observed == []
+    assert host.query(route_claim=claim, delivery_id="delivery",
+                      expected_content="native prompt").state == "unknown"
+    assert not host.drain_one()
+
+
 def test_slot_failure_never_settles_or_requeues(shell, monkeypatch):
     host, ctx = context(shell)
     claim = host.claim()

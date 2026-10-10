@@ -107,6 +107,15 @@ def _settle_candidate(host, row):
         raise RuntimeError("CLI native candidate owner unavailable")
     if not host.queue.transition(row["candidate"], "dispatching", "running"):
         raise RuntimeError("CLI native candidate already consumed")
+    from hermes_cli.trusted_inbound_broker import NativeCandidateSnapshot, TrustedInboundBrokerClient
+    running = host.queue.lookup(row["profile"], row["epoch"], row["delivery"])
+    try:
+        snapshot = NativeCandidateSnapshot.from_running_row(running or {}, surface="cli", content=row["content"])
+    except ValueError as exc:
+        raise RuntimeError("CLI native candidate changed") from exc
+    if snapshot.candidate_id != row["candidate"] or snapshot.host_owner_id != host.owner:
+        raise RuntimeError("CLI native candidate owner changed")
+    TrustedInboundBrokerClient().observe_native_turn(snapshot)
     if not host.queue.settle(row["candidate"]):
         raise RuntimeError("CLI native candidate settlement unavailable")
 
