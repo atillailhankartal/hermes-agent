@@ -2,8 +2,8 @@
 
 The Hermes SQLite row is only a local candidate. Its route fingerprint is a
 correlation value, never proof that the broker saw a native insertion. Bee
-space, recipient, generation, message and enrollment are unavailable from
-this host callback. No transport, credential, signer or admitted proof exists.
+space, recipient and upstream delivery authority are unavailable from this host
+callback. A protected IPC grant permits QUEUE only; it is never an admitted proof.
 """
 from __future__ import annotations
 
@@ -104,60 +104,38 @@ class TrustedInboundBrokerClient:
     def __init__(self, *, socket_path=None, issuer_socket_path=None,
                  expected_broker_uid=None, timeout=0.5):
         self.transport = None
-        self.issuer_transport = None
+        if issuer_socket_path is not None:
+            raise ValueError("ENROLL belongs to the protected issuer supervisor")
         if socket_path is not None and expected_broker_uid is not None:
             from hermes_cli.trusted_inbound_wire import BHI1UnixClient
             self.transport = BHI1UnixClient(socket_path, expected_broker_uid=expected_broker_uid,
                                             timeout=timeout)
-            if issuer_socket_path is not None:
-                self.issuer_transport = BHI1UnixClient(
-                    issuer_socket_path, expected_broker_uid=expected_broker_uid, timeout=timeout)
 
     @staticmethod
     def _unknown(snapshot, reason):
         return AdmissionReceipt("unknown", reason, snapshot.delivery_id, snapshot.route_epoch)
 
-    def enroll_pre_model(self, *, queue, enrollment_attempt_id, delivery_id, surface,
-                         profile_home_key, session_key, native_session_id, host_owner_id,
-                         route_epoch, route_fingerprint, host_boot_epoch, origin_epoch,
-                         payload_sha256):
-        """Pre-model issuer path: reserve and queue before local candidate creation.
+    def enroll_pre_model(self, **kwargs):
+        """Legacy same-process enrollment is disabled; use authenticated grant IPC."""
+        return None
 
-        The caller must be the isolated supervisor. The default process has no
-        issuer socket or broker principal; without both responses there is no
-        grant to install. Bee independently rechecks the exact body and route.
-        """
-        if self.issuer_transport is None or self.transport is None:
+    def queue_pre_model(self, *, queue, grant, still_current):
+        """Host-only QUEUE after the IPC receiver authenticated the protected issuer."""
+        if (not still_current() or self.transport is None or type(grant) is not PreModelBrokerGrant
+                or type(grant.expires_at_unix_ms) is not int
+                or grant.expires_at_unix_ms <= int(time.time() * 1000)):
             return None
         from hermes_cli.trusted_inbound_wire import decode_request, encode_request
         try:
-            digest = bytes.fromhex(payload_sha256)
-            if len(digest) != 32 or digest.hex() != payload_sha256:
+            request = encode_request(2, grant.delivery_id, grant.enrollment_id,
+                                     grant.capability, bytes.fromhex(grant.payload_sha256))
+            response = self.transport.exchange(request)
+            if (response is None or response.kind != 0x82 or response.status != 1
+                    or response.request_id != decode_request(request).request_id
+                    or response.candidate_id != grant.reserved_candidate_id
+                    or not still_current()
+                    or grant.expires_at_unix_ms <= int(time.time() * 1000)):
                 return None
-            request = encode_request(1, enrollment_attempt_id, delivery_id, surface,
-                                     profile_home_key, session_key, native_session_id,
-                                     host_owner_id, route_epoch, route_fingerprint,
-                                     host_boot_epoch, origin_epoch)
-            enrollment = self.issuer_transport.exchange(request)
-            if (enrollment is None or enrollment.status != 1 or enrollment.kind != 0x81
-                    or enrollment.request_id != decode_request(request).request_id
-                    or not all((enrollment.enrollment_id, enrollment.reserved_candidate_id,
-                                enrollment.capability))
-                    or enrollment.expires_at_unix_ms <= int(time.time() * 1000)):
-                return None
-            queued_request = encode_request(2, delivery_id, enrollment.enrollment_id,
-                                            enrollment.capability, digest)
-            queued = self.transport.exchange(queued_request)
-            if (queued is None or queued.status != 1 or queued.kind != 0x82
-                    or queued.request_id != decode_request(queued_request).request_id
-                    or queued.candidate_id != enrollment.reserved_candidate_id):
-                return None
-            grant = PreModelBrokerGrant(
-                delivery_id, surface, profile_home_key, session_key, native_session_id,
-                host_owner_id, route_epoch, payload_sha256, enrollment.enrollment_id,
-                enrollment.reserved_candidate_id, enrollment.capability,
-                enrollment.expires_at_unix_ms,
-            )
             return grant if queue.install_pre_model_grant(grant) else None
         except (TypeError, ValueError):
             return None

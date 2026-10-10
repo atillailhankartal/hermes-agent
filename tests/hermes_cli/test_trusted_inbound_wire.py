@@ -234,46 +234,32 @@ def test_unverified_positive_broker_reply_cannot_promote_host_receipt():
     assert receipt.state == "unknown" and receipt.candidate_id is None
 
 
-def test_pre_model_enroll_and_queue_pass_exact_reserved_id_into_sqlite(tmp_path):
+def test_pre_model_host_queues_reserved_id_without_enrolling(tmp_path):
     from gateway.native_plugin_queue import NativePluginQueue
+    from hermes_cli.trusted_inbound_broker import PreModelBrokerGrant
 
     queue = NativePluginQueue(tmp_path)
-    expires = int(time.time() * 1000) + 60_000
     seen = []
-
-    class Issuer:
-        def exchange(self, request):
-            parsed = decode_request(request)
-            seen.append(parsed)
-            assert parsed.kind == 1 and parsed.fields[1:3] == ("delivery", "gateway")
-            return BHI1Response(0x81, parsed.request_id, 1, "enrolled", "enrollment",
-                                "bee-reserved", "capability", None, None, None, None, None,
-                                expires, b"")
 
     class Broker:
         def exchange(self, request):
             parsed = decode_request(request)
-            seen.append(parsed)
-            assert parsed.kind == 2 and parsed.fields[:3] == (
-                "delivery", "enrollment", "capability")
+            seen.append(parsed.kind)
+            assert parsed.kind == 2
             return BHI1Response(0x82, parsed.request_id, 1, "queued", None, None, None,
                                 "bee-reserved", None, None, None, None, -1, b"")
 
     client = TrustedInboundBrokerClient()
-    client.issuer_transport = Issuer()
     client.transport = Broker()
-    digest = queue.payload_digest("payload")
-    grant = client.enroll_pre_model(
-        queue=queue, enrollment_attempt_id="attempt", delivery_id="delivery", surface="gateway",
-        profile_home_key="profile", session_key="key", native_session_id="native",
-        host_owner_id="owner", route_epoch="epoch", route_fingerprint="fingerprint",
-        host_boot_epoch="boot", origin_epoch="origin", payload_sha256=digest,
-    )
-    assert grant and grant.reserved_candidate_id == "bee-reserved"
+    grant = PreModelBrokerGrant(
+        "delivery", "gateway", "profile", "key", "native", "owner", "epoch",
+        queue.payload_digest("payload"), "enrollment", "bee-reserved", "test-capability",
+        int(time.time() * 1000) + 60_000)
+    assert client.queue_pre_model(queue=queue, grant=grant, still_current=lambda: True) == grant
     row = queue.admit(profile="profile", epoch="epoch", delivery="delivery", session_key="key",
                       native_id="native", owner="owner", plugin="bee", content="payload")
     assert row["candidate"] == "bee-reserved" and row["state"] == "unknown"
-    assert [request.kind for request in seen] == [1, 2]
+    assert seen == [2]
 
 
 @pytest.mark.platforms("linux")
