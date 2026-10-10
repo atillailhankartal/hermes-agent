@@ -29,7 +29,16 @@ before READY. A passing rejection test does not make that positive path pass.
 experiment. It requires exactly `sizeof(struct socket_fdinfo)` bytes from public
 `proc_pidfdinfo(getpid(), fd, PROC_PIDFDSOCKETINFO, ...)`, checks AF_UNIX,
 SOCK_STREAM and SOCKINFO_UN, then reads `psi.soi_options & SO_ACCEPTCONN`.
-`socket_state_probe.c` independently measures bound=0/listening=1. This mode does
+`socket_state_probe.c` independently measures bound=0/empty-listener=1/queued-listener=1
+on actual FD **6**, requiring exact **792** bytes on the pinned target ABI. Each
+state also calls the deliberately swapped public arguments and requires that
+result to remain unknown/rejected, with no `F_GETFL` change. FD6 must differ from
+socket-info flavor3: accidentally using FD3 would hide the argument-order bug.
+The public libproc API takes `(pid, fd, flavor, buffer, size)`; the kernel-internal
+helper's argument order is not its public signature. The probe creates no grant
+and never accepts the queued client. Both native and Python checks gate the A/B
+results, and the runner verifies removal of the probe's owned directory.
+This mode does
 not amend or approve the protected bootstrap contract. Every result carries
 `candidate_only: true`. READY here only describes this disposable socket test;
 there are no source grants, pair provisioning, code-signing or incarnation checks.

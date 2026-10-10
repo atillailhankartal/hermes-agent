@@ -119,10 +119,25 @@ class NativeFixtureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertLess(len(result.stdout.encode()), 16384)
-        rows = json.loads(result.stdout)["observations"]
-        self.assertEqual([row["acceptconn"] for row in rows], [0, 1])
+        data = json.loads(result.stdout)
+        self.assertTrue(data["candidate_only"])
+        self.assertTrue(data["cleanup"])
+        self.assertFalse(Path(data["directory"]).exists())
+        rows = data["observations"]
+        self.assertEqual([row["phase"] for row in rows],
+                         ["bound", "empty_listener", "queued_listener"])
+        self.assertEqual([row["acceptconn"] for row in rows], [0, 1, 1])
         for row in rows:
-            self.assertEqual(row["proc_bytes"], row["expected_bytes"])
+            self.assertEqual(row["fd"], 6)
+            self.assertEqual(row["flavor"], 3)
+            self.assertNotEqual(row["fd"], row["flavor"])
+            self.assertEqual(row["proc_bytes"], 792)
+            self.assertEqual(row["expected_bytes"], 792)
+            self.assertEqual((row["family"], row["type"], row["kind"]), (1, 1, 3))
+            self.assertTrue(row["flags_unchanged"])
+            self.assertTrue(row["swapped_rejected"])
+            self.assertNotEqual(row["swapped_bytes"], 792)
+            self.assertEqual(row["swapped_acceptconn"], -1)
             self.assertEqual(row["proc_errno"], 0)
             self.assertEqual(row["getsockopt_errno"], errno.ENOPROTOOPT)
 
