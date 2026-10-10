@@ -58,6 +58,8 @@ class _BoundGatewayRoute:
     run_generation: int
     profile_home_key: str
     profile_matches: bool
+    initial_session_id: Optional[str]
+    initial_route_epoch: Optional[str]
     agent_holder: Any = None
 
 
@@ -75,8 +77,16 @@ def gateway_route_scope(
     except Exception:
         logger.debug("Gateway route profile resolution failed", exc_info=True)
         expected_home = ""
+    try:
+        route = runner.session_store.snapshot_route_entry(session_key)
+    except Exception:
+        logger.debug("Gateway route snapshot failed", exc_info=True)
+        route = None
     token = _BOUND_ROUTE.set(_BoundGatewayRoute(
-        runner, session_key, run_generation, actual_home, actual_home == expected_home, agent_holder,
+        runner, session_key, run_generation, actual_home, actual_home == expected_home,
+        route.session_id if route is not None else None,
+        route.route_epoch if route is not None else None,
+        agent_holder,
     ))
     try:
         yield
@@ -87,6 +97,25 @@ def gateway_route_scope(
 def gateway_route_bound() -> bool:
     """Distinguish a denied Gateway claim from a CLI tool with no Gateway route."""
     return _BOUND_ROUTE.get() is not None
+
+
+def bound_session_key_for_tool(native_session_id: str, session_key: str) -> Optional[str]:
+    """Read a key only from the exact route that owned this Gateway turn at scope entry.
+
+    A copied task keeps its original route snapshot. If /new then /resume reuses the
+    native ID while changing the epoch, it cannot adopt the resumed route's key.
+    The returned key is an observation, not an admission receipt.
+    """
+    bound = _BOUND_ROUTE.get()
+    if (bound is None or not bound.profile_matches or not session_key
+            or bound.session_key != session_key or not bound.initial_route_epoch
+            or bound.initial_session_id != native_session_id):
+        return None
+    claim = claim_for_tool(native_session_id)
+    if (claim is None or claim.route_epoch != bound.initial_route_epoch
+            or not claim.is_current(session_key=session_key, native_session_id=native_session_id)):
+        return None
+    return session_key
 
 
 def claim_for_route(runner: Any, entry: Any, source: Any) -> Optional[RouteClaim]:
