@@ -16,6 +16,7 @@ from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, Sess
 from gateway.route_claim import claim_for_tool, gateway_route_scope
 from gateway.run import GatewayRunner
 from gateway.turn_lease import SessionTurnLeaseRegistry
+from model_tools import _CallIds, _execute_tool, registry
 
 
 def _store(tmp_path, monkeypatch):
@@ -653,3 +654,136 @@ async def test_reset_hooks_carry_distinct_keyed_old_and_new_epochs(tmp_path, mon
     assert payload["route_is_current"]() is True
     assert store.switch_session("route", old.session_id, expected_session_id=new.session_id)
     assert payload["route_is_current"]() is False  # late reset cannot retire resumed A
+
+
+@pytest.mark.asyncio
+async def test_legacy_route_epoch_requires_held_exact_lease_and_durable_save(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    entry.route_epoch = None
+    store._save_entries()
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    store._db = None
+    entry = store.lookup_by_session_key("route")
+    assert entry.route_epoch is None
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        assert claim_for_tool("A") is None
+
+    wrong = await runner._turn_leases.acquire("B", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = wrong
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        assert claim_for_tool("A") is None
+    runner._turn_leases.release(wrong)
+    runner._session_state("route").turn.lease_tokens.pop(1)
+
+    stale = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = stale
+    runner._turn_leases.release(stale)
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        assert claim_for_tool("A") is None
+    assert entry.route_epoch is None
+    runner._session_state("route").turn.lease_tokens.pop(1)
+
+    token = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = token
+    real_save = store._save_entry
+    monkeypatch.setattr(store, "_save_entry", Mock(side_effect=OSError("save failed")))
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        assert claim_for_tool("A") is None
+    assert entry.route_epoch is None and _durable(tmp_path)["route_epoch"] is None
+    monkeypatch.setattr(store, "_save_entry", real_save)
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        claim = claim_for_tool("A")
+    assert claim and claim.is_current()
+    assert entry.route_epoch == claim.route_epoch == _durable(tmp_path)["route_epoch"]
+    runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
+async def test_actual_new_finalizes_pre_revoke_epoch(tmp_path, monkeypatch):
+    store, old = _store(tmp_path, monkeypatch)
+    original_epoch = old.route_epoch
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_key_for_source = lambda _source: "route"
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._release_running_agent_state = Mock()
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._evict_cached_agent = Mock()
+    runner._clear_conversation_scope = Mock()
+    runner._reset_notice_session_info = Mock(return_value="")
+    runner._telegram_topic_new_header = Mock(return_value=None)
+    runner._is_telegram_topic_lane = Mock(return_value=False)
+    runner._session_db = None
+    runner._finalize_session_off_loop = AsyncMock()
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    emitted = AsyncMock()
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
+    runner._session_state("route").persistent.run_generation = 1
+
+    started, release = threading.Event(), threading.Event()
+    real_revoke = store.revoke_route_claim
+
+    def held_revoke(key):
+        started.set()
+        assert release.wait(2)
+        return real_revoke(key)
+
+    monkeypatch.setattr(store, "revoke_route_claim", held_revoke)
+    reset = asyncio.create_task(runner._handle_reset_command(MessageEvent(text="/new", source=old.origin)))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.01, heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), 0.1)
+        assert not reset.done() and not emitted.await_count
+        assert store.lookup_by_session_key("route").route_epoch == original_epoch
+    finally:
+        release.set()
+    await reset
+    new = store.lookup_by_session_key("route")
+    assert new.session_id != old.session_id
+    assert new.route_epoch not in (None, original_epoch)
+    assert runner._finalize_session_off_loop.await_args.kwargs["route_epoch"] == original_epoch
+    assert emitted.await_args.args[2]["old_route_epoch"] == original_epoch
+    assert emitted.await_args.args[2]["route_epoch"] == new.route_epoch
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_route_change_reports_unknown_before_retry(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    token = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = token
+    calls = []
+
+    def dispatch(_name, _args, **kwargs):
+        calls.append(kwargs["route_claim"])
+        assert store.revoke_route_claim("route")
+        return json.dumps({"error": "operation may have committed", "error_type": "outcome_unknown"})
+
+    monkeypatch.setattr(registry, "dispatch", dispatch)
+    ids = _CallIds(session_id="A", task_id="turn", tool_call_id="tool")
+    try:
+        with gateway_route_scope(runner, "route", 1, entry.origin):
+            result = _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                                   enabled_tools=None, skip_tool_execution_middleware=True)
+        assert len(calls) == 1
+        assert json.loads(result)["error_type"] == "outcome_unknown"
+        runner._session_state("route").persistent.run_generation = 2
+        with gateway_route_scope(runner, "route", 1, entry.origin):
+            rejected = _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                                     enabled_tools=None, skip_tool_execution_middleware=True)
+        assert len(calls) == 1
+        assert json.loads(rejected)["error_type"] == "session_closed"
+    finally:
+        runner._turn_leases.release(token)

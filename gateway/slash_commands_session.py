@@ -172,17 +172,17 @@ class GatewaySessionCommandsMixin:
         """Handle /new or /reset command."""
         source = event.source
         session_key = self._session_key_for_source(source)
-        await self._invalidate_session_run_generation_async(session_key, reason="session_reset")
+        # Snapshot the epoch that owns the old Bee receiver BEFORE revocation rotates it.
+        # The gate serializes this snapshot with admission and the offloaded durable fence;
+        # the store takes its own lock while copying against legacy synchronous writers.
+        async with self._session_route_gate(session_key):
+            old_entry = await self.async_session_store.snapshot_route_entry(session_key)
+            self._invalidate_session_run_generation(session_key, reason="session_reset")
+            await self._revoke_route_claim_async(session_key)
         # Evict the running-agent slot now that the generation is bumped: the in-flight run's own
         # guarded release (old generation) returns False and would leave a zombie slot that silently
         # drops all later messages. Idempotent, so the run's finally calling it again is harmless.
         self._release_running_agent_state(session_key)
-        # Snapshot the old entry so on_session_finalize can report the expiring session id.
-        # Evict the running-agent slot now that the generation is bumped. The in-flight run's own guarded
-        # release (run_generation=old) will return False and leave its dead agent behind; clearing here
-        # keeps the slot from becoming a zombie that silently drops all later messages (#28686). Idempotent,
-        # so the run's finally calling it again is harmless.
-        old_entry = await self.async_session_store.lookup_by_session_key(session_key)
         await self._cleanup_old_agent_for_reset(session_key)
         self._evict_cached_agent(session_key)
         # Conversation boundary: ALL conversation-scoped per-session state + security state in one

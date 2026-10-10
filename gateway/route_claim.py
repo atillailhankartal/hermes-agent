@@ -154,15 +154,9 @@ def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
         return None
     with store._lock:
         entry = store._entry_locked(key)
-        if entry is None or entry.session_id != native_session_id or entry.route_claim_blocked:
+        if (entry is None or entry.session_id != native_session_id
+                or entry.route_claim_blocked or not entry.route_epoch):
             return None
-        if not entry.route_epoch:
-            # Legacy routing rows predate epochs. Persist a candidate before making any proof
-            # available; failure leaves the row and all Bee ingress closed.
-            candidate = entry.to_dict()
-            candidate["route_epoch"] = new_route_epoch()
-            store._save_entry(key, entry_data=candidate, lock_held=True)
-            entry.route_epoch = candidate["route_epoch"]
         epoch = entry.route_epoch
         owner, proof = store._route_owner_id, store._route_claim_proof
     if not owns_turn():

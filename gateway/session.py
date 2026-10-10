@@ -9,7 +9,7 @@ import json
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Dict, List, Optional, Any
 
 from .config import Platform, GatewayConfig, HomeChannel
@@ -1334,13 +1334,29 @@ class SessionStore(
         return new_entry
 
     def _reopen_route_claim_with_lease(self, session_key: str, native_session_id: str, token) -> bool:
-        """Reopen an unverified repoint only after exact durable readback and a held native lease."""
+        """Mint a legacy epoch or reopen a repoint only with the exact held native lease."""
         with self._lock:
             entry = self._entry_locked(session_key)
-            if (entry is None or entry.session_id != native_session_id or not entry.route_epoch
+            if (entry is None or entry.session_id != native_session_id
                     or token is None or token.released or token.lease.holder is not token
                     or token.owner_key != session_key or token.session_id != native_session_id):
                 return False
+            if not entry.route_epoch:
+                # Pre-epoch routing rows may issue a first proof only after this turn owns their
+                # native session. Persist the epoch before publishing it in memory or returning a
+                # claim; a blocked repoint cannot be made recoverable by this migration.
+                if entry.route_claim_blocked or self._route_owner_retired:
+                    return False
+                candidate = entry.to_dict()
+                candidate["route_epoch"] = new_route_epoch()
+                try:
+                    self._save_entry(session_key, entry_data=candidate, lock_held=True)
+                except Exception:
+                    logger.warning("Gateway legacy route epoch save failed for %s", session_key, exc_info=True)
+                    return False
+                entry.route_epoch = candidate["route_epoch"]
+                if token.released or token.lease.holder is not token:
+                    return False
             if not entry.route_claim_blocked:
                 return True
             if not entry.route_claim_recoverable:
@@ -1427,6 +1443,14 @@ class SessionStore(
             return None
         with self._lock:
             return self._entry_locked(session_key)
+
+    def snapshot_route_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Copy a route's immutable identity while the routing lock is held."""
+        if not session_key:
+            return None
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return replace(entry) if entry is not None else None
 
     def peek_session_id(self, session_key: str) -> Optional[str]:
         """Lock-held accessor for the key -> session_id mapping (None if unknown)."""

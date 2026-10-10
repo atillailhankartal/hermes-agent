@@ -849,7 +849,10 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
             return tool_error("Gateway route is no longer current", error_type="session_closed")
         result = registry.dispatch(function_name, next_args, **dispatch_kwargs)
         if route_claim is not None and not route_claim.is_current(native_session_id=ids.session_id):
-            return tool_error("Gateway route changed during tool dispatch", error_type="session_closed")
+            # Dispatch may already have committed a Bee operation. A route change after that
+            # boundary makes its outcome uncertain; reporting session_closed would invite a
+            # duplicate retry. Pre-dispatch closure above remains a safe session_closed.
+            return tool_error("Gateway route changed during tool dispatch", error_type="outcome_unknown")
         return result
 
     with _approval_observability(ids):
