@@ -3,6 +3,12 @@
 #include "a2c_policy.h"
 #include <stdint.h>
 #include <sys/types.h>
+/* Optional nonsecret terminal telemetry, never a command or admission proof.
+ * A sends once with MSG_DONTWAIT; a missing/partial report cannot hold exit. */
+#define BH_A2C_STATUS_TERMINAL 0xa2c10020U
+struct bh_a2c_status {
+    uint32_t kind, reason, cancelled, bound, fd6_open, parent_open, node_known;
+};
 enum bh_a2c_command { BH_A2C_PROCEED = 1, BH_A2C_CANCEL = 2 };
 struct bh_a2c_command_frame { uint32_t epoch, checkpoint, command; };
 struct bh_a2c_control {

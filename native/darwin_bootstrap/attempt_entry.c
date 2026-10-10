@@ -1,17 +1,23 @@
 #include "launch_control.h"
 #include <fcntl.h>
 #include <signal.h>
-#include <stdio.h>
+#include <sys/socket.h>
 #include <string.h>
 #include <unistd.h>
 
 static void terminal(struct bh_a2a_root *root, int reason, int parent_fd) {
     root->cancelled = 1;
     /* No root_cancel, unlink, per-slot cleanup, retry or exit callbacks. */
-    (void)dprintf(1, "A_TERMINAL reason=%d cancelled=%d bound=%d fd6=%d parent=%d node_known=%d\n",
-                  reason, root->cancelled, root->bound, fcntl(6, F_GETFD) >= 0,
-                  parent_fd >= 0 && fcntl(parent_fd, F_GETFD) >= 0,
-                  S_ISSOCK(root->node.st_mode) != 0);
+    struct bh_a2c_status status = {
+        .kind = BH_A2C_STATUS_TERMINAL, .reason = (uint32_t)reason,
+        .cancelled = 1, .bound = (uint32_t)root->bound,
+        .fd6_open = fcntl(6, F_GETFD) >= 0,
+        .parent_open = parent_fd >= 0 && fcntl(parent_fd, F_GETFD) >= 0,
+        .node_known = S_ISSOCK(root->node.st_mode) != 0
+    };
+    /* One nonblocking attempt even if FD3 setup failed. No retry, stdio, poll,
+     * acknowledgement or send-success dependency can defer process teardown. */
+    (void)send(3, &status, sizeof(status), MSG_DONTWAIT | MSG_NOSIGNAL);
     _exit(20);
 }
 static int signals_match(void) {
@@ -37,7 +43,6 @@ int main(void) {
     int parent_fd = -1;
     if (bh_a2a_inventory_check(allowed, 4, &inventory) != BH_A2A_OK || inventory.count != 4 ||
         !signals_match() || !bh_a2c_channel_init(3)) terminal(&root, 100, parent_fd);
-    (void)dprintf(1, "A_ENTRY exact_fds=0,1,2,3 signal_policy=checked pid=%ld\n", (long)getpid());
     if (!bh_a2c_receive(3, &config, sizeof(config), control.deadline_ms) ||
         config.version != BH_A2C_VERSION || config.epoch != BH_A2C_EPOCH ||
         strnlen(config.parent, sizeof(config.parent)) == sizeof(config.parent))
@@ -54,8 +59,6 @@ int main(void) {
     checkpoint = 2;
     if (!bh_a2c_send(3, &checkpoint, sizeof(checkpoint), control.deadline_ms) ||
         !bh_a2c_guard(&control, &root, checkpoint)) terminal(&root, control.reason, parent_fd);
-    (void)dprintf(1, "BOUND_OBSERVED_SOURCE_ONLY fd6=%d parent=%d children=0\n",
-                  fcntl(6, F_GETFD) >= 0, fcntl(parent_fd, F_GETFD) >= 0);
     /* Successful measurement also terminates; P never clears pending. */
     _exit(0);
 }

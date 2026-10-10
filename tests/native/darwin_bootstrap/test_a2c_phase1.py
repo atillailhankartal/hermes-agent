@@ -2,6 +2,7 @@
 """Real native P→A phase-1 source mechanics. No installed qualification."""
 from pathlib import Path
 import os
+import signal
 import re
 import shutil
 import subprocess
@@ -26,6 +27,81 @@ def command(args):
     if result.returncode or result.stderr:
         raise RuntimeError("native command failed")
     return result
+
+
+def stdout_cases(parents):
+    failures = []
+    cases = [("full_entry_loss", False, True), ("full_after_loss", False, False),
+             ("full_entry", True, True), ("full_after", True, False),
+             ("full_after", False, False), ("full_status", False, True)]
+    for mode, fault, prefill in cases:
+        with tempfile.TemporaryDirectory(prefix="bee-a2c1-stdout-", dir="/private/tmp") as directory:
+            folder = Path(directory)
+            journal = folder / "attempt.journal"
+            journal.write_bytes(b"SOURCE_FIXTURE_FRESH\n")
+            journal.chmod(0o600)
+            reader, writer = os.pipe()
+            child = None
+            result = None
+            rescue = False
+            try:
+                if prefill:
+                    os.set_blocking(writer, False)
+                    try:
+                        while True:
+                            os.write(writer, b"x" * 4096)
+                    except BlockingIOError:
+                        pass
+                    os.set_blocking(writer, True)
+                parent = parents["fault" if fault else "normal"]
+                started = time.monotonic()
+                result = subprocess.run([str(parent), directory, mode, str(writer)],
+                                        pass_fds=(writer,), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                        timeout=8, check=False)
+                child = int(re.search(r"P_SPAWN child=(\d+)", result.stdout).group(1))
+                # External read endpoint remains OPEN and UNDRAINED until A exits.
+                deadline = started + 3.0
+                alive = True
+                while True:
+                    try:
+                        os.kill(child, 0)
+                    except ProcessLookupError:
+                        alive = False
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+                elapsed = time.monotonic() - started
+                expected_bound = not mode.endswith("loss") and mode != "full_status"
+                expected_code = 20 if fault or mode == "full_status" else 0
+                okay = (not alive and elapsed < 3.0 and not result.stderr and
+                        result.returncode == (31 if mode.endswith("loss") else 0) and
+                        journal.read_bytes() == PENDING and
+                        (folder / "broker.sock").exists() == expected_bound)
+                if not mode.endswith("loss"):
+                    okay = okay and f"P_REAP exited=1 code={expected_code}" in result.stdout
+                if alive:
+                    os.kill(child, signal.SIGKILL)  # Failure cleanup, NEVER a passing oracle.
+                    rescue = True
+                    for _ in range(200):
+                        try:
+                            os.kill(child, 0)
+                        except ProcessLookupError:
+                            break
+                        time.sleep(0.01)
+                print(f"STDOUT_CASE {mode} fault={fault} prefill={prefill} "
+                      f"parent_exit={result.returncode} elapsed={elapsed:.3f} "
+                      f"rescue={rescue} PASS={okay}\n{result.stdout}", flush=True)
+                retry = subprocess.run([str(parent), directory, "baseline"],
+                                       capture_output=True, text=True, timeout=3, check=False)
+                okay = okay and retry.returncode == 30 and "P_SPAWN" not in retry.stdout
+                if not okay:
+                    failures.append((mode, fault))
+            finally:
+                os.close(writer)
+                os.close(reader)
+    assert not failures, f"undrained stdout prevented A own bounded exit: {failures}"
+    return len(cases)
 
 
 def main():
@@ -56,6 +132,9 @@ def main():
                  ("baseline", True)]
         if "--red" in sys.argv:
             cases = cases[:1]
+        if "--stdout-red" in sys.argv:
+            stdout_cases(parents)
+            return
         for mode, fault in cases:
             with tempfile.TemporaryDirectory(prefix="bee-a2c1-", dir="/private/tmp") as directory:
                 folder = Path(directory)
@@ -69,18 +148,19 @@ def main():
                 assert not result.stderr, result.stderr
                 assert time.monotonic() - started < 8
                 assert result.returncode == (31 if mode.startswith("loss_") else 0)
-                assert "A_ENTRY exact_fds=0,1,2,3 signal_policy=checked" in result.stdout
+                assert "P_CHECKPOINT checkpoint=1" in result.stdout
                 assert journal.read_bytes() == PENDING
                 leaf = folder / "broker.sock"
                 expected_bound = fault or mode in ("baseline", "loss_postbind")
                 assert leaf.exists() == expected_bound, f"{mode}: unexpected bind after parent loss/cancel"
                 assert ("BOUND_OBSERVED_SOURCE_ONLY" in result.stdout) == (mode == "baseline" and not fault)
-                if mode != "baseline" or fault:
-                    assert "A_TERMINAL" in result.stdout
+                if (mode != "baseline" or fault) and mode not in ("loss_prebind", "loss_postbind", "shutdown"):
+                    assert "P_OBSERVED_A_TERMINAL" in result.stdout
                 if fault:
                     assert "cancelled=1 bound=1 fd6=1 parent=1 node_known=0" in result.stdout
                 if not mode.startswith("loss_"):
-                    assert "P_REAP exited=1" in result.stdout
+                    expected_exit = 0 if mode == "baseline" and not fault else 20
+                    assert f"P_REAP exited=1 code={expected_exit}" in result.stdout
                 child = int(re.search(r"P_SPAWN child=(\d+)", result.stdout).group(1))
                 # Pipe EOF proves child closed inherited output; verify PID no longer lives.
                 try:
@@ -101,6 +181,8 @@ def main():
                     assert retry.returncode == 30 and "P_SPAWN" not in retry.stdout
                 print(f"PASS {mode} fault={fault} pending/missing/corrupt_restart=DENIED", flush=True)
         if "--red" not in sys.argv:
+            stdout_count = stdout_cases(parents)
+            print(f"A2c full_stdout_cases={stdout_count} failures=0")
             for source in ("a2c_policy.c", "launch_control.c", "attempt_entry.c"):
                 command(CC + ["--analyze", "-Xanalyzer", "-analyzer-output=text", str(NATIVE / source),
                               "-o", str(build / (source + ".plist"))])
