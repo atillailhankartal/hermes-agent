@@ -613,6 +613,100 @@ def register(ctx):
 '''
 
 
+MEMORY_ROUTE_PLUGIN = '''
+import json
+from pathlib import Path
+from agent.memory_provider import MemoryProvider
+
+class Probe(MemoryProvider):
+    @property
+    def name(self): return "memprobe"
+    def is_available(self): return True
+    def initialize(self, session_id, **kw): pass
+    def get_tool_schemas(self): return []
+
+def register(ctx):
+    ctx.register_memory_provider(Probe())
+    ctx.register_tool(name="memory_route_tool", toolset="memprobe",
+                      schema={"name": "memory_route_tool", "description": "route probe",
+                              "parameters": {"type": "object", "properties": {}}},
+                      handler=lambda args, route_claim=None: json.dumps({
+                          "current": route_claim.is_current(),
+                          "route_current": route_claim.is_route_current()}))
+    def on_reset(route_claim=None, route_is_current=None, **kwargs):
+        Path(__file__).with_name("route-observed.json").write_text(json.dumps({
+            "route_current": route_claim.is_route_current(),
+            "tool_current": route_claim.is_current(),
+            "guard_current": route_is_current(),
+            "private_absent": not hasattr(route_claim, "_proof"),
+        }), encoding="utf-8")
+    ctx.register_hook("on_session_reset", on_reset)
+'''
+
+
+@pytest.mark.platforms("any")
+def test_memory_only_host_hook_gets_parent_checked_lifecycle_claim(tmp_path, monkeypatch):
+    from gateway.route_claim import RouteClaim
+    from hermes_cli.plugin_host_wire import PluginHostUnsupported
+    from hermes_cli.plugins_ledger import PluginRegistration
+    from plugins.memory import load_memory_provider
+    from tools.registry import registry
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {})
+    provider_dir = home / "plugins" / "memprobe"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "__init__.py").write_text(MEMORY_ROUTE_PLUGIN, encoding="utf-8")
+    observed = provider_dir / "route-observed.json"
+    manager = plugins_mod.get_plugin_manager()
+    host = manager._plugin_host()
+    owner = object()
+    try:
+        assert load_memory_provider("memprobe").name == "memprobe"
+        assert "memprobe" not in manager._plugins  # loaded by category, not general plugin discovery
+        tool_claim = RouteClaim("gateway", manager.scope_key, "route", "native", "epoch-1", "owner-1",
+                                object(), lambda _claim: True, lambda _claim: True)
+        assert json.loads(registry.dispatch("memory_route_tool", {}, scope=manager.scope_key,
+                                            route_claim=tool_claim)) == {
+            "current": True, "route_current": False}
+        manager.set_keyed_lifecycle_host("gateway", owner, "owner-1")
+        current = {"route": True}
+        claim = RouteClaim("gateway", manager.scope_key, "route", "native", "epoch-1", "owner-1",
+                           object(), lambda _claim: False, lambda _claim: current["route"])
+        assert manager.notify_keyed_session_reset(
+            "gateway", owner, session_key="route", session_id="native", route_epoch="epoch-1",
+            old_session_id="old", old_route_epoch="epoch-0", route_claim=claim,
+            route_is_current=lambda: current["route"],
+        ) is True
+        assert json.loads(observed.read_text(encoding="utf-8")) == {
+            "route_current": True, "tool_current": False,
+            "guard_current": True, "private_absent": True}
+        ref, (key, registration) = next(
+            (ref, owned) for ref, owned in host._registered_refs.items()
+            if owned[0] == "register_memory_provider:memprobe")
+        impostor = PluginRegistration("hook", "on_session_reset", lambda: None, plugin_key="memprobe")
+        host._registered_refs[ref] = (key, impostor)
+        try:
+            with pytest.raises(PluginHostUnsupported, match="outside this plugin host scope"):
+                host._issue_route_cap(ref, {"route_claim": claim, "route_is_current": lambda: True},
+                                      host._generation)
+        finally:
+            host._registered_refs[ref] = (key, registration)
+        foreign = RouteClaim("gateway", "foreign-profile", "route", "native", "epoch-1", "owner-1",
+                             object(), lambda _claim: False, lambda _claim: True)
+        with pytest.raises(PluginHostUnsupported, match="outside this plugin host scope"):
+            host._issue_route_cap(ref, {"route_claim": foreign, "route_is_current": lambda: True},
+                                  host._generation)
+        current["route"] = False
+        assert manager.notify_keyed_session_reset(
+            "gateway", owner, session_key="route", session_id="native", route_epoch="epoch-1",
+            old_session_id="old", old_route_epoch="epoch-0", route_claim=claim,
+            route_is_current=lambda: current["route"],
+        ) is False
+    finally:
+        manager.unload()
+        host.shutdown()
+
+
 @pytest.mark.platforms("posix")  # SIGKILL
 def test_hosted_memory_provider_stays_live_across_a_host_crash(tmp_path, monkeypatch):
     import signal

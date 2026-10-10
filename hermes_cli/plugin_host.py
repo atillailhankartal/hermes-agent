@@ -395,11 +395,8 @@ class PluginHost:
         if owned is None or channel is None or generation != self._generation:
             raise PluginHostUnsupported("route claim callback is no longer registered")
         plugin_key, registration = owned
-        loaded = self._manager._plugins.get(plugin_key)
         coordinates = {field: getattr(claim, field) for field in _ROUTE_FIELDS}
-        if (not registration.active or registration.plugin_key != plugin_key
-                or self._contexts.get(plugin_key) is None
-                or loaded is None or not loaded.enabled or loaded.error
+        if (not self._registration_owner_current(plugin_key, registration)
                 or coordinates["profile_home_key"] != self._manager.scope_key
                 or not all(isinstance(value, str) and value for value in coordinates.values())):
             raise PluginHostUnsupported("route claim is outside this plugin host scope")
@@ -419,6 +416,32 @@ class PluginHost:
             self._route_caps[token] = cap
         return token, {"__route_cap__": token, "coordinates": coordinates}
 
+    def _registration_owner_current(self, plugin_key: str, registration: Any) -> bool:
+        """Require a loaded plugin or an exact live memory category registration."""
+        if not registration.active or self._contexts.get(plugin_key) is None:
+            return False
+        if registration.plugin_key == plugin_key:
+            loaded = self._manager._plugins.get(plugin_key)
+            return loaded is not None and loaded.enabled and not loaded.error
+        # Category providers load through a synthetic host key but registrations
+        # belong to the canonical memory manifest key. The parent ledger, not the
+        # child-supplied key, proves this exact callback is still live.
+        if plugin_key != f"register_memory_provider:{registration.plugin_key}":
+            return False
+        from plugins.memory import _ProviderCollector
+
+        context = self._contexts[plugin_key]
+        if not isinstance(context, _ProviderCollector) or context.name != registration.plugin_key:
+            return False
+        if not any(handle is registration for handle in self._manager._ownership_ledger.get(
+                registration.plugin_key, ())):
+            return False
+        if registration.kind != "hook":
+            return True
+        source = context._hook_source
+        return source is not None and any(
+            handle is registration for handle in self._manager._memory_hook_registrations.get(source, ()))
+
     def _check_route_cap(self, params: dict[str, Any], origin: Optional[int]) -> bool:
         token, mode, coordinates = params.get("handle"), params.get("operation"), params.get("coordinates")
         if not isinstance(token, str) or not isinstance(coordinates, dict):
@@ -429,10 +452,9 @@ class PluginHost:
                 or mode != cap.mode or coordinates != cap.coordinates
                 or cap.generation != self._generation or cap.channel is not self._channel
                 or not self.alive or self._contexts.get(cap.plugin_key) is None
-                or not cap.registration.active or cap.registration.plugin_key != cap.plugin_key):
+                or not self._registration_owner_current(cap.plugin_key, cap.registration)):
             return False
-        loaded = self._manager._plugins.get(cap.plugin_key)
-        if loaded is None or not loaded.enabled or loaded.error or self._manager.scope_key != coordinates["profile_home_key"]:
+        if self._manager.scope_key != coordinates["profile_home_key"]:
             return False
         try:
             current = (cap.claim.is_current() if mode == "tool-current" else
