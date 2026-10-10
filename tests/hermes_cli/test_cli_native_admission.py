@@ -389,3 +389,48 @@ def test_unsuccessful_quiet_turn_does_not_start_native_followup(shell, monkeypat
     assert exited.value.code != 0
     assert seen == ["initial"]
     assert host.query(route_claim=claim, delivery_id="delivery", expected_content="native prompt").state == "unknown"
+
+
+@pytest.mark.parametrize("rotation", ["invalidate", "restart"])
+def test_stale_capacity_does_not_block_fresh_native_turn(shell, rotation):
+    from hermes_cli.cli_plugin_admission import install_cli_admission_host
+    host, ctx = context(shell)
+    old = host.claim()
+    for index in range(100):
+        assert deliver(ctx, old, f"old-{index}").state == "unknown"
+    assert deliver(ctx, old, "over-cap").reason == "native_queue_full"
+    original = host.queue.lookup(host.profile, old.route_epoch, "old-0")
+    if rotation == "restart":
+        host = install_cli_admission_host(shell)
+    else:
+        host.invalidate()
+    fresh = host.claim()
+    assert fresh.route_epoch != old.route_epoch
+    assert deliver(ctx, fresh, "fresh").state == "unknown"
+    row = host.queue.next_candidate(host.profile, fresh.route_epoch, host.owner)
+    assert row["delivery"] == "fresh"
+    assert deliver(ctx, fresh, "fresh").state == "unknown"
+    assert deliver(ctx, fresh, "fresh", "conflict").reason == "native_delivery_conflict"
+    seen = []
+    bind_real_agent_thread(shell, lambda **kwargs: seen.append(kwargs["user_message"]) or {"final_response": "ok"})
+    assert host.drain_one()
+    assert not host.drain_one()
+    assert seen == ["native prompt"]
+    assert host.query(route_claim=fresh, delivery_id="fresh", expected_content="native prompt").state == "admitted"
+    assert host.query(route_claim=fresh, route_epoch=old.route_epoch,
+        delivery_id="old-0", expected_content="native prompt").state == "unknown"
+    assert host.queue.lookup(host.profile, old.route_epoch, "old-0") == original
+
+    import json
+    import subprocess
+    import sys
+    script = ("import json,sys; from pathlib import Path; "
+              "from hermes_cli.cli_plugin_ledger import CliPluginLedger; "
+              "q=CliPluginLedger(Path(sys.argv[1])); r=q.lookup(*sys.argv[2:]); "
+              "print(json.dumps(r))")
+    reopened = json.loads(subprocess.check_output([sys.executable, "-c", script,
+        str(host.home / "cli-admission"), host.profile, old.route_epoch, "old-0"], text=True))
+    assert reopened == original
+    for index in range(100):
+        assert deliver(ctx, fresh, f"current-{index}").state == "unknown"
+    assert deliver(ctx, fresh, "current-over-cap").reason == "native_queue_full"
