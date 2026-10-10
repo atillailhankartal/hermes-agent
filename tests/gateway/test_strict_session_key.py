@@ -2,12 +2,13 @@
 
 from contextvars import copy_context
 from datetime import datetime
+import json
 
 import pytest
 
 from agent.delegation_context import delegated_child_context
 from gateway.config import GatewayConfig, Platform
-from gateway.route_claim import claim_for_tool, gateway_route_scope
+from gateway.route_claim import gateway_route_scope
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.session_context import (
@@ -76,10 +77,19 @@ async def test_bound_key_requires_live_gateway_lease_and_rejects_child_and_aba(t
             resumed = runner.session_store.switch_session(key, "A", expected_session_id="B")
             assert resumed is not None and resumed.session_id == "A"
             assert resumed.route_epoch != original_epoch
-            assert claim_for_tool("A") is not None  # Lease and ID alone would admit resumed A.
+            before = runner.session_store.snapshot_route_entry(key)
+            assert (before.route_claim_blocked, before.route_claim_recoverable) == (True, True)
             # A stale task still has its original key, native ID and live lease. Only the
             # epoch snapshot at scope entry distinguishes it from the resumed A route.
             assert old_turn.run(get_bound_session_key) is None
+            after = runner.session_store.snapshot_route_entry(key)
+            durable = json.loads((runner.session_store.sessions_dir / "sessions.json").read_text())[key]
+            assert (after.route_claim_blocked, after.route_claim_recoverable, after.route_epoch) == (
+                before.route_claim_blocked, before.route_claim_recoverable, before.route_epoch,
+            )
+            assert (durable["route_claim_blocked"], durable["route_claim_recoverable"], durable["route_epoch"]) == (
+                before.route_claim_blocked, before.route_claim_recoverable, before.route_epoch,
+            )
     finally:
         clear_session_vars(tokens)
         runner._turn_leases.release(lease)
@@ -94,7 +104,44 @@ async def test_bound_key_requires_live_gateway_lease_and_rejects_child_and_aba(t
     try:
         with gateway_route_scope(runner, key, 2, resumed.origin):
             assert get_bound_session_key() == key
+            current = runner.session_store.snapshot_route_entry(key)
+            assert (current.route_claim_blocked, current.route_claim_recoverable) == (False, False)
             assert old_turn.run(get_bound_session_key) is None
     finally:
         clear_session_vars(current_tokens)
         runner._turn_leases.release(current_lease)
+
+
+@pytest.mark.asyncio
+async def test_bound_key_epoch_check_is_atomic_with_reopen(tmp_path, monkeypatch):
+    runner, entry, _home = _gateway(tmp_path, monkeypatch)
+    store, key = runner.session_store, entry.session_key
+    lease = await runner._turn_leases.acquire("A", owner_key=key, generation=1, timeout=1)
+    runner._session_state(key).turn.lease_tokens[1] = lease
+    tokens = set_session_vars(session_key=key, session_id="A")
+    try:
+        with gateway_route_scope(runner, key, 1, entry.origin):
+            assert get_bound_session_key() == key
+            bound_epoch = entry.route_epoch
+            reopen = store._reopen_route_claim_with_lease
+
+            def repoint_before_locked_reopen(session_key, native_id, token, *, expected_route_epoch=None):
+                assert expected_route_epoch == bound_epoch
+                assert store.switch_session(key, "B", expected_session_id="A")
+                assert store.switch_session(key, "A", expected_session_id="B")
+                return reopen(
+                    session_key, native_id, token, expected_route_epoch=expected_route_epoch,
+                )
+
+            monkeypatch.setattr(store, "_reopen_route_claim_with_lease", repoint_before_locked_reopen)
+            assert get_bound_session_key() is None
+            current = store.snapshot_route_entry(key)
+            durable = json.loads((store.sessions_dir / "sessions.json").read_text())[key]
+            assert current.route_epoch != bound_epoch
+            assert (current.route_claim_blocked, current.route_claim_recoverable) == (True, True)
+            assert (durable["route_epoch"], durable["route_claim_blocked"], durable["route_claim_recoverable"]) == (
+                current.route_epoch, True, True,
+            )
+    finally:
+        clear_session_vars(tokens)
+        runner._turn_leases.release(lease)

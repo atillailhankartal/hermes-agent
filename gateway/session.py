@@ -1425,11 +1425,16 @@ class SessionStore(
             )
         return new_entry
 
-    def _reopen_route_claim_with_lease(self, session_key: str, native_session_id: str, token) -> bool:
-        """Mint a legacy epoch or reopen a repoint only with the exact held native lease."""
+    def _reopen_route_claim_with_lease(
+        self, session_key: str, native_session_id: str, token, *,
+        expected_route_epoch: Optional[str] = None,
+    ) -> bool:
+        """Mint or reopen with the exact lease and optional scope epoch under one lock."""
         with self._lock:
             entry = self._entry_locked(session_key)
             if (entry is None or entry.session_id != native_session_id
+                    or (expected_route_epoch is not None
+                        and entry.route_epoch != expected_route_epoch)
                     or token is None or token.released or token.lease.holder is not token
                     or token.owner_key != session_key or token.session_id != native_session_id):
                 return False

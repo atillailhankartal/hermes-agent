@@ -111,7 +111,7 @@ def bound_session_key_for_tool(native_session_id: str, session_key: str) -> Opti
             or bound.session_key != session_key or not bound.initial_route_epoch
             or bound.initial_session_id != native_session_id):
         return None
-    claim = claim_for_tool(native_session_id)
+    claim = claim_for_tool(native_session_id, expected_route_epoch=bound.initial_route_epoch)
     if (claim is None or claim.route_epoch != bound.initial_route_epoch
             or not claim.is_current(session_key=session_key, native_session_id=native_session_id)):
         return None
@@ -150,7 +150,9 @@ def claim_for_route(runner: Any, entry: Any, source: Any) -> Optional[RouteClaim
                       lambda _claim: False, validate_route)
 
 
-def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
+def claim_for_tool(
+    native_session_id: str, *, expected_route_epoch: Optional[str] = None,
+) -> Optional[RouteClaim]:
     """Issue a fresh claim for the *actual* tool-call native ID, only with its held turn lease."""
     bound = _BOUND_ROUTE.get()
     if bound is None or not bound.profile_matches or not native_session_id or not bound.session_key:
@@ -179,7 +181,9 @@ def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
     if held is None or generation not in held[1]:
         return None
     token = held[1][generation]
-    if not store._reopen_route_claim_with_lease(key, native_session_id, token):
+    if not store._reopen_route_claim_with_lease(
+        key, native_session_id, token, expected_route_epoch=expected_route_epoch,
+    ):
         return None
     with store._lock:
         entry = store._entry_locked(key)
