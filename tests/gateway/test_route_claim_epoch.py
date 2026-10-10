@@ -12,12 +12,13 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
-from agent.delegation_context import delegated_child_context
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, delegated_child_context
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, SessionStore
 from gateway.route_claim import claim_for_tool, gateway_route_scope
 from gateway.run import GatewayRunner
+from gateway.session_context import clear_session_vars, get_bound_session_key, set_session_vars
 from gateway.turn_lease import SessionTurnLeaseRegistry
 from model_tools import _CallIds, _execute_tool, registry
 
@@ -472,6 +473,70 @@ async def test_gateway_direct_dispatch_denies_foreign_profile_child_and_replaced
             assert called == [True]
     finally:
         runner._turn_leases.release(fresh)
+
+
+@pytest.mark.asyncio
+async def test_gateway_direct_dispatch_denies_child_process_marker_without_durable_change(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    lease = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = lease
+    assert store.revoke_route_claim("route")
+    session_tokens = set_session_vars(session_key="route", session_id="A")
+    called = []
+    monkeypatch.setattr(registry, "dispatch", lambda *_args, **_kwargs: called.append(True) or "ok")
+    ids = _CallIds(session_id="A", task_id="turn", tool_call_id="tool")
+    try:
+        with gateway_route_scope(runner, "route", 1, entry.origin):
+            before = store.snapshot_route_entry("route")
+            durable_before = _durable(tmp_path)
+            assert (before.route_claim_blocked, before.route_claim_recoverable) == (True, True)
+
+            monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, "1")
+            assert get_bound_session_key() is None
+            denied = _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                                   enabled_tools=None, skip_tool_execution_middleware=True)
+            assert "route" in denied.lower() or "session" in denied.lower()
+            assert called == []
+            assert store.snapshot_route_entry("route") == before
+            assert _durable(tmp_path) == durable_before
+
+            monkeypatch.delenv(DELEGATED_CHILD_ENV_MARKER)
+            assert _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                                 enabled_tools=None, skip_tool_execution_middleware=True) == "ok"
+            assert called == [True]
+    finally:
+        clear_session_vars(session_tokens)
+        runner._turn_leases.release(lease)
+
+
+@pytest.mark.asyncio
+async def test_generic_gateway_claim_denies_child_process_marker(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    lease = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = lease
+    assert store.revoke_route_claim("route")
+    try:
+        with gateway_route_scope(runner, "route", 1, entry.origin):
+            before = store.snapshot_route_entry("route")
+            durable_before = _durable(tmp_path)
+            monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, "1")
+            assert claim_for_tool("A") is None
+            assert store.snapshot_route_entry("route") == before
+            assert _durable(tmp_path) == durable_before
+            monkeypatch.delenv(DELEGATED_CHILD_ENV_MARKER)
+            assert claim_for_tool("A") is not None
+    finally:
+        runner._turn_leases.release(lease)
 
 
 @pytest.mark.asyncio

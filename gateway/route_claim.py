@@ -131,8 +131,8 @@ def claim_for_direct_gateway_tool(native_session_id: str) -> Optional[RouteClaim
     if (bound is None or not bound.profile_matches or not bound.initial_route_epoch
             or not bound.initial_session_id or bound.turn_lease_token is None):
         return None
-    from agent.delegation_context import is_delegated_child_context
-    if is_delegated_child_context():
+    from agent.delegation_context import is_delegated_child_process_context
+    if is_delegated_child_process_context():
         return None
     expected_epoch = bound.runner.session_store._bound_gateway_tool_epoch(
         bound.session_key, bound.initial_session_id, bound.initial_route_epoch,
@@ -181,6 +181,9 @@ def claim_for_tool(
     """Issue a fresh claim for the *actual* tool-call native ID, only with its held turn lease."""
     bound = _BOUND_ROUTE.get()
     if bound is None or not bound.profile_matches or not native_session_id or not bound.session_key:
+        return None
+    from agent.delegation_context import is_delegated_child_process_context
+    if is_delegated_child_process_context():
         return None
     runner, key, generation = bound.runner, bound.session_key, bound.run_generation
     store = runner.session_store
