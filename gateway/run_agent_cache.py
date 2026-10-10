@@ -434,6 +434,7 @@ class GatewayAgentCacheMixin:
         self, session_entry, child_session_id, session_key, run_generation,
     ) -> None:
         """Transfer the live turn lease before making a compression child routable."""
+        old_session_id, old_epoch = session_entry.session_id, session_entry.route_epoch
         async with self._session_route_gate(session_key):
             if not self._is_session_run_current(session_key, run_generation):
                 raise RuntimeError("compression route changed before lease handoff")
@@ -456,8 +457,6 @@ class GatewayAgentCacheMixin:
                     except asyncio.CancelledError:
                         cancelled = True
                 committed = write.result()
-                if cancelled:
-                    raise asyncio.CancelledError
                 routed_entry = (await self.async_session_store.lookup_by_session_key(session_entry.session_key)
                                 if committed else None)
                 if (not committed or not self._is_session_run_current(session_key, run_generation)
@@ -466,11 +465,15 @@ class GatewayAgentCacheMixin:
                     raise RuntimeError("compression route changed during lease handoff")
             finally:
                 self._end_compression_lease_handoff(session_key, run_generation)
+        await self._emit_compaction_route_lifecycle(session_entry, old_session_id, old_epoch, in_place=False)
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _hmwa_publish_in_place_compaction_epoch(
         self, session_entry, session_key, run_generation,
     ) -> None:
         """Rotate the durable route epoch after a same-ID compaction under the held A lease."""
+        old_session_id, old_epoch = session_entry.session_id, session_entry.route_epoch
         async with self._session_route_gate(session_key):
             held = self._held_turn_lease(session_key, run_generation)
             if not self._is_session_run_current(session_key, run_generation) or held is None:
@@ -490,11 +493,21 @@ class GatewayAgentCacheMixin:
                 except asyncio.CancelledError:
                     cancelled = True
             committed = write.result()
-            if cancelled:
-                raise asyncio.CancelledError
             if (not committed or not self._is_session_run_current(session_key, run_generation)
                     or session_entry.session_id != native_id):
                 raise RuntimeError("in-place compaction route changed during publication")
+        await self._emit_compaction_route_lifecycle(session_entry, old_session_id, old_epoch, in_place=True)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _emit_compaction_route_lifecycle(self, entry, old_session_id, old_epoch, *, in_place: bool) -> None:
+        from gateway.route_lifecycle import emit_route_lifecycle, route_lifecycle_payload
+        payload = route_lifecycle_payload(self, entry, entry.origin)
+        await emit_route_lifecycle(self, "on_session_compacted", {
+            **payload, "reason": "compression", "old_session_id": old_session_id,
+            "old_route_epoch": old_epoch, "new_session_id": entry.session_id,
+            "in_place": in_place,
+        })
 
     def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
         """THE single conversation-boundary funnel (/new, /resume, suspension replacement,
@@ -587,7 +600,26 @@ class GatewayAgentCacheMixin:
 
     async def _invalidate_session_run_generation_async(self, session_key: str, *, reason: str = "") -> int:
         async with self._session_route_gate(session_key):
-            return self._invalidate_session_run_generation(session_key, reason=reason)
+            generation = self._invalidate_session_run_generation(session_key, reason=reason)
+            await self._revoke_route_claim_async(session_key)
+            return generation
+
+    async def _revoke_route_claim_async(self, session_key: str) -> None:
+        """Drain an offloaded durable fence before the per-key admission gate is released."""
+        store = getattr(self, "session_store", None)
+        if not callable(getattr(store, "revoke_route_claim", None)):
+            return
+        writer = asyncio.create_task(asyncio.to_thread(store.revoke_route_claim, session_key))
+        cancelled = False
+        while not writer.done():
+            try:
+                await asyncio.shield(writer)
+            except asyncio.CancelledError:
+                cancelled = True
+        if not writer.result():
+            logger.warning("Gateway route claim remains closed after failed revocation for %s", session_key)
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _current_session_run_generation(self, session_key: str) -> int:
         """Current run generation for ``session_key`` (0 when the key tracks no run)."""
@@ -652,10 +684,12 @@ class GatewayAgentCacheMixin:
         tool_reason: str | None = None,
     ) -> int:
         async with self._session_route_gate(session_key):
-            return self._interrupt_running_turn(
+            generation = self._interrupt_running_turn(
                 session_key, interrupt_reason=interrupt_reason,
                 invalidation_reason=invalidation_reason, tool_reason=tool_reason,
             )
+            await self._revoke_route_claim_async(session_key)
+            return generation
 
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,

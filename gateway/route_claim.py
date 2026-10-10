@@ -89,6 +89,38 @@ def gateway_route_bound() -> bool:
     return _BOUND_ROUTE.get() is not None
 
 
+def claim_for_route(runner: Any, entry: Any, source: Any) -> Optional[RouteClaim]:
+    """Issue an observation-only binding for a published lifecycle route.
+
+    It can validate a delayed route snapshot, but cannot join tools or admit delivery by itself.
+    """
+    store = runner.session_store
+    try:
+        home = hermes_home_key(runner._resolve_profile_home_for_source(source))
+    except Exception:
+        logger.debug("Gateway lifecycle route profile resolution failed", exc_info=True)
+        return None
+    key, native_id, epoch = entry.session_key, entry.session_id, entry.route_epoch
+    owner, proof = store._route_owner_id, store._route_claim_proof
+    if not home or not key or not native_id or not epoch:
+        return None
+
+    def validate_route(claim: RouteClaim) -> bool:
+        if (getattr(store, "_route_owner_retired", False) or claim._proof is not proof
+                or claim.surface != "gateway" or claim.profile_home_key != home
+                or claim.session_key != key or claim.native_session_id != native_id
+                or claim.route_epoch != epoch or claim.host_owner_id != owner):
+            return False
+        with store._lock:
+            current = store._entry_locked(key)
+            return bool(current and current.session_id == native_id and current.route_epoch == epoch
+                        and not current.route_claim_blocked and store._route_owner_id == owner
+                        and store._route_claim_proof is proof)
+
+    return RouteClaim("gateway", home, key, native_id, epoch, owner, proof,
+                      lambda _claim: False, validate_route)
+
+
 def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
     """Issue a fresh claim for the *actual* tool-call native ID, only with its held turn lease."""
     bound = _BOUND_ROUTE.get()
@@ -113,6 +145,12 @@ def claim_for_tool(native_session_id: str) -> Optional[RouteClaim]:
                     and token.session_id == native_session_id)
 
     if getattr(store, "_route_owner_retired", False) or compacted_in_place() or not owns_turn():
+        return None
+    held = runner._held_turn_lease(key, generation)
+    if held is None or generation not in held[1]:
+        return None
+    token = held[1][generation]
+    if not store._reopen_route_claim_with_lease(key, native_session_id, token):
         return None
     with store._lock:
         entry = store._entry_locked(key)

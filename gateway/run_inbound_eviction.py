@@ -96,4 +96,5 @@ class GatewayInboundEvictionMixin:
             _generation_at_interrupt = self._interrupt_running_turn(
                 _quick_key, interrupt_reason=_INTERRUPT_REASON_EVICTED, invalidation_reason=reason,
                 tool_reason=_INTERRUPT_TOOL_REASON_EVICTED)
+            await self._revoke_route_claim_async(_quick_key)
             self._drop_turn_slot(_quick_key, run_generation=_generation_at_interrupt)

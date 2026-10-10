@@ -669,6 +669,9 @@ class GatewaySessionCommandsMixin:
         archive; an unchanged id without in-place means rotation FAILED."""
         key = session_entry.session_key
         parent_id, new_session_id = session_entry.session_id, tmp_agent.session_id
+        old_epoch = session_entry.route_epoch
+        route_committed = False
+        route_cancelled = False
         async with self._session_route_gate(key):
             current = await self.async_session_store.lookup_by_session_key(key)
             if current is not session_entry or current.session_id != parent_id:
@@ -726,13 +729,18 @@ class GatewaySessionCommandsMixin:
                         except asyncio.CancelledError:
                             cancelled = True
                     committed = write.result()
-                    if cancelled:
-                        raise asyncio.CancelledError
                     if not committed:
                         raise RuntimeError("manual compression route changed during publication")
+                    route_committed, route_cancelled = True, cancelled
             finally:
                 if owned_here:
                     self._turn_leases.release(token)
+        if route_committed:
+            await self._emit_compaction_route_lifecycle(
+                session_entry, parent_id, old_epoch, in_place=new_session_id == parent_id,
+            )
+        if route_cancelled:
+            raise asyncio.CancelledError
         if new_session_id != parent_id:
             await asyncio.to_thread(self._sync_telegram_topic_binding, source, session_entry,
                                     reason="compress-command")
@@ -1010,6 +1018,7 @@ class GatewaySessionCommandsMixin:
             boundary_generation = self._begin_session_run_generation(session_key)
             write = asyncio.create_task(self.async_session_store.switch_session(
                 session_key, target_id, expected_session_id=old_sid, preserve_prompt_pin=False,
+                route_claim_blocked=False,
             ))
             cancelled = False
             while not write.done():

@@ -132,6 +132,7 @@ class SessionTranscriptMixin:
         candidate["session_id"] = canonical_session_id
         candidate["route_epoch"] = new_route_epoch()
         candidate["route_claim_blocked"] = True
+        candidate["route_claim_recoverable"] = False
         self._save_entry(entry.session_key, entry_data=candidate, lock_held=True)
         logger.info(
             "SessionStore healed compressed session mapping: %s -> %s", entry.session_id,
@@ -139,6 +140,7 @@ class SessionTranscriptMixin:
         entry.session_id = canonical_session_id
         entry.route_epoch = candidate["route_epoch"]
         entry.route_claim_blocked = True
+        entry.route_claim_recoverable = False
         return True
 
     def advance_compression_session(
@@ -278,6 +280,7 @@ class SessionTranscriptMixin:
                 candidate["session_id"] = child_id
                 candidate["route_epoch"] = new_route_epoch()
                 candidate["route_claim_blocked"] = True
+                candidate["route_claim_recoverable"] = False
                 data[entry.session_key] = candidate
             if moving:
                 self._persist_routing_data(data, generation)
@@ -285,6 +288,7 @@ class SessionTranscriptMixin:
                     entry.session_id = child_id
                     entry.route_epoch = data[entry.session_key]["route_epoch"]
                     entry.route_claim_blocked = True
+                    entry.route_claim_recoverable = False
         (getattr(self, "_session_owner_hints", None) or {}).pop(child_id, None)
 
     def _append_to_transcript_serialized(self, session_id: str, message: Dict[str, Any]) -> None:
@@ -646,10 +650,12 @@ class SessionTranscriptMixin:
             candidate["session_id"] = child_session_id
             candidate["route_epoch"] = new_route_epoch()
             candidate["route_claim_blocked"] = False
+            candidate["route_claim_recoverable"] = False
             self._save_entry(session_key, entry_data=candidate, lock_held=True)
             current.session_id = child_session_id
             current.route_epoch = candidate["route_epoch"]
             current.route_claim_blocked = False
+            current.route_claim_recoverable = False
             return True
 
     def publish_in_place_compaction_epoch(
@@ -663,9 +669,11 @@ class SessionTranscriptMixin:
             candidate = current.to_dict()
             candidate["route_epoch"] = new_route_epoch()
             candidate["route_claim_blocked"] = False
+            candidate["route_claim_recoverable"] = False
             self._save_entry(session_key, entry_data=candidate, lock_held=True)
             current.route_epoch = candidate["route_epoch"]
             current.route_claim_blocked = False
+            current.route_claim_recoverable = False
             return True
 
     def has_input_owner(self, session_id: str, owner: str) -> bool:

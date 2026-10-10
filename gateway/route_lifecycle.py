@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from hermes_constants import hermes_home_key
+from gateway.route_claim import claim_for_route
 
 logger = logging.getLogger("gateway.run")
 
@@ -12,28 +12,14 @@ def route_lifecycle_payload(runner, entry, source) -> dict:
     """Capture one route epoch; a delayed observer can test that exact publication."""
     store = runner.session_store
     key, native_id, epoch = entry.session_key, entry.session_id, entry.route_epoch
-    owner = store._route_owner_id
-    try:
-        home = hermes_home_key(runner._resolve_profile_home_for_source(source))
-    except Exception:
-        logger.debug("Gateway lifecycle profile resolution failed", exc_info=True)
-        home = ""
-
-    def route_is_current() -> bool:
-        if not home or not epoch or getattr(store, "_route_owner_retired", False):
-            return False
-        with store._lock:
-            current = store._entry_locked(key)
-            return bool(current and current.session_id == native_id
-                        and current.route_epoch == epoch and not current.route_claim_blocked
-                        and store._route_owner_id == owner)
+    claim = claim_for_route(runner, entry, source)
 
     return {
-        "surface": "gateway", "profile_home_key": home, "session_key": key,
+        "surface": "gateway", "profile_home_key": claim.profile_home_key if claim else "", "session_key": key,
         "session_id": native_id, "native_session_id": native_id,
-        "route_epoch": epoch, "host_owner_id": owner,
-        "route_is_current": route_is_current,
-        "platform": source.platform.value if source.platform else "",
+        "route_epoch": epoch, "host_owner_id": store._route_owner_id,
+        "route_claim": claim, "route_is_current": claim.is_route_current if claim else lambda: False,
+        "platform": source.platform.value if source and source.platform else "",
     }
 
 

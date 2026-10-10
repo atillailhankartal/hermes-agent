@@ -171,6 +171,134 @@ async def test_delayed_route_validation_requires_exact_epoch_owner_and_private_p
 
 
 @pytest.mark.asyncio
+async def test_unverified_switch_stays_closed_until_exact_durable_route_and_new_turn_lease(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    switched = store.switch_session("route", "B", expected_session_id="A")
+    assert switched is not None and switched.route_claim_blocked is True
+    assert _durable(tmp_path)["route_claim_blocked"] is True
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        assert claim_for_tool("B") is None
+    token = await runner._turn_leases.acquire("B", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = token
+    try:
+        route_file = tmp_path / "sessions" / "sessions.json"
+        original = route_file.read_text()
+        tampered = json.loads(original)
+        tampered["route"]["route_epoch"] = "unrelated-durable-epoch"
+        route_file.write_text(json.dumps(tampered))
+        with gateway_route_scope(runner, "route", 1, switched.origin):
+            assert claim_for_tool("B") is None
+        assert switched.route_claim_blocked is True
+        route_file.write_text(original)
+        with gateway_route_scope(runner, "route", 1, switched.origin):
+            # A new turn proves native ownership and reads back the exact durable epoch.
+            recovered = claim_for_tool("B")
+            assert recovered is not None and recovered.is_current()
+            assert switched.route_claim_blocked is False
+            assert _durable(tmp_path)["route_claim_blocked"] is False
+    finally:
+        runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
+async def test_revocation_drains_offloaded_write_without_blocking_loop_or_opening_gate(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    started, release = threading.Event(), threading.Event()
+    real_revoke = store.revoke_route_claim
+
+    def held_writer(key):
+        started.set()
+        assert release.wait(2)
+        return real_revoke(key)
+
+    monkeypatch.setattr(store, "revoke_route_claim", held_writer)
+    task = asyncio.create_task(runner._invalidate_session_run_generation_async("route", reason="session_reset"))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        gate_entered = asyncio.Event()
+
+        async def try_gate():
+            async with runner._session_route_gate("route"):
+                gate_entered.set()
+
+        contender = asyncio.create_task(try_gate())
+        task.cancel()
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.01, heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), 0.1)
+        assert not task.done() and not gate_entered.is_set()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(contender, 0.1)
+    assert gate_entered.is_set()
+    assert store.lookup_by_session_key("route") is entry
+    assert entry.route_claim_blocked and _durable(tmp_path)["route_claim_blocked"]
+
+
+def test_failed_route_revocation_closes_old_proof_in_memory(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    old_epoch = entry.route_epoch
+    monkeypatch.setattr(store, "_save_entry", Mock(side_effect=OSError("disk unavailable")))
+    assert store.revoke_route_claim("route") is False
+    assert entry.route_epoch == old_epoch
+    assert entry.route_claim_blocked is True
+    assert entry.route_claim_recoverable is False
+    assert _durable(tmp_path)["route_epoch"] == old_epoch
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["stop", "new", "evict"])
+async def test_interrupt_boundary_revokes_delayed_route_claim_and_next_turn_recovers(tmp_path, monkeypatch, boundary):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    first = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = first
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        old = claim_for_tool("A")
+    assert old and old.is_route_current()
+    if boundary == "new":
+        await runner._invalidate_session_run_generation_async("route", reason="session_reset")
+    elif boundary == "stop":
+        await runner._interrupt_running_turn_async(
+            "route", interrupt_reason="stop", invalidation_reason="stop_command",
+        )
+    else:
+        runner._drop_turn_slot = Mock()
+        await runner._hm_evict_running_agent("route", "stale_running_agent_eviction")
+    assert old.is_route_current() is False
+    assert entry.route_epoch != old.route_epoch
+    assert entry.route_claim_blocked is True
+    assert _durable(tmp_path)["route_epoch"] == entry.route_epoch
+    runner._turn_leases.release(first)
+    runner._session_state("route").turn.lease_tokens.pop(1, None)
+    generation = runner._current_session_run_generation("route")
+    successor = await runner._turn_leases.acquire("A", owner_key="route", generation=generation, timeout=1)
+    runner._session_state("route").turn.lease_tokens[generation] = successor
+    try:
+        with gateway_route_scope(runner, "route", generation, entry.origin):
+            fresh = claim_for_tool("A")
+        assert fresh and fresh.is_current() and fresh.is_route_current()
+        assert fresh.route_epoch != old.route_epoch
+    finally:
+        runner._turn_leases.release(successor)
+
+
+@pytest.mark.asyncio
 async def test_in_place_compaction_revokes_in_flight_claim_before_next_tool(tmp_path, monkeypatch):
     store, entry = _store(tmp_path, monkeypatch)
     runner = object.__new__(GatewayRunner)
@@ -284,6 +412,9 @@ async def test_manual_in_place_compression_mints_new_epoch(tmp_path, monkeypatch
     runner.session_store = store
     runner._async_session_store = AsyncSessionStore(store)
     runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    emitted = AsyncMock()
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
     old_epoch = entry.route_epoch
     await runner._persist_manual_compression(
         type("Agent", (), {"session_id": "A", "_last_compaction_in_place": True})(),
@@ -291,6 +422,42 @@ async def test_manual_in_place_compression_mints_new_epoch(tmp_path, monkeypatch
     )
     assert entry.route_epoch != old_epoch
     assert _durable(tmp_path)["route_epoch"] == entry.route_epoch
+    emitted.assert_awaited_once()
+    _, name, payload = emitted.await_args.args
+    assert name == "on_session_compacted"
+    assert payload["old_session_id"] == payload["session_id"] == "A"
+    assert payload["old_route_epoch"] == old_epoch and payload["route_epoch"] == entry.route_epoch
+    assert payload["in_place"] is True
+    assert payload["route_claim"].is_current() is False
+    assert payload["route_claim"].is_route_current() is True
+
+
+@pytest.mark.asyncio
+async def test_child_compaction_lifecycle_follows_durable_lease_handoff(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    token = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = token
+    emitted = AsyncMock()
+    monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
+    old_epoch = entry.route_epoch
+    try:
+        await runner._hmwa_publish_compression_child_route(entry, "B", "route", 1)
+        emitted.assert_awaited_once()
+        _, name, payload = emitted.await_args.args
+        assert name == "on_session_compacted"
+        assert payload["old_session_id"] == "A" and payload["session_id"] == "B"
+        assert payload["old_route_epoch"] == old_epoch and payload["route_epoch"] == entry.route_epoch
+        assert payload["in_place"] is False
+        assert payload["route_claim"].is_route_current()
+        assert _durable(tmp_path)["route_epoch"] == entry.route_epoch
+    finally:
+        runner._turn_leases.release(token)
 
 
 @pytest.mark.asyncio
@@ -450,6 +617,8 @@ async def test_resume_revokes_old_claim_before_durable_b_switch(tmp_path, monkey
     assert payload["old_route_epoch"] == old_claim.route_epoch
     assert payload["route_epoch"] != old_claim.route_epoch
     assert payload["route_is_current"]() is True
+    assert payload["route_claim"].is_current() is False
+    assert payload["route_claim"].is_route_current() is True
     runner._turn_leases.release(token)
 
 
