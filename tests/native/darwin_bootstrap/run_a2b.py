@@ -38,7 +38,7 @@ def main():
         size = sum(path.stat().st_size for path in target.iterdir())
         if size >= 64 * 1024**2:
             raise SystemExit("UNAVAILABLE: A2b build exceeded 64 MiB")
-        for binary, count in ((suite, 34), (faults, 10)):
+        for binary, count in ((suite, 34), (faults, 18)):
             output = run([str(binary)], timeout=20)
             if f"cases={count} failures=0" not in output:
                 raise SystemExit("A2b suite did not report expected passing cases")

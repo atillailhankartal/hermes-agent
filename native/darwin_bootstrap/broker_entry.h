@@ -49,13 +49,17 @@ struct bh_a2b_observation {
     size_t cleanup_count;
     struct bh_a2b_cleanup cleanup[BH_A2B_MAX_CLEANUP];
     int source_fd;
-    int fd7_installed;
+    int fd7_installed; /* Historical event only, never current ownership/readiness. */
     int acl_policy_verified; /* Always zero in this slice. */
 };
 /* Dormant only. Caller must own a sealed single-threaded FD interval: no other
  * thread, signal handler or callback may mutate the descriptor table. Candidate
  * metadata is not authenticated. No authority or ABA/lifetime proof is returned.
- * On observed success the caller owns FD7; on PAUSED inspect cleanup decisions.
+ * On observed success the caller owns FD7. Error cleanup retains outstanding
+ * slots as RETAINED_UNKNOWN; PAUSED is terminal, requiring process termination
+ * or operator reconciliation, never another acquisition attempt in this process.
+ * Successful traversal retirement still requires the unproved sealed-entry
+ * precondition; vnode equality does not exclude open-file-description reuse.
  * Inputs and output must be disjoint valid objects. Never closes inherited FDs.
  */
 enum bh_a2b_result bh_a2b_observe_fd7(const struct bh_a2b_candidate *candidate,

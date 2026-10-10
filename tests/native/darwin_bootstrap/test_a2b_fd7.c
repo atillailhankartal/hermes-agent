@@ -15,7 +15,23 @@
 
 #ifdef BH_A2B_FAULTS
 static int open_count, stat_count, path_count, fail_open, fail_stat, fail_path;
-static int replace_final, occupy7, preserve_unrelated, unrelated = -1;
+static int replace_final, replace_same, replace_first, occupy7, preserve_unrelated, unrelated = -1;
+static struct stat original7, replacement7;
+static int close_count, fail_close, close_then_replace, close_then_error;
+static int intercepted_close(int fd) {
+    if (++close_count == fail_close) {
+        if (close_then_error && close(fd) != 0) _exit(95);
+        if (close_then_replace) {
+            int foreign;
+            if (close(fd) != 0) _exit(93);
+            foreign = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (foreign != fd) _exit(94);
+        }
+        errno = EIO;
+        return -1;
+    }
+    return close(fd);
+}
 static int intercepted_openat(int fd, const char *path, int flags, ...) {
     if (++open_count == fail_open) {
         if (preserve_unrelated) unrelated = fcntl(1, F_DUPFD_CLOEXEC, 100);
@@ -25,7 +41,16 @@ static int intercepted_openat(int fd, const char *path, int flags, ...) {
     return openat(fd, path, flags);
 }
 static int intercepted_fstat(int fd, struct stat *info) {
-    if (++stat_count == fail_stat) { errno = EIO; return -1; }
+    if (++stat_count == fail_stat) {
+        if (replace_first) {
+            int foreign;
+            (void)close(fd);
+            foreign = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (foreign < 0 || dup2(foreign, fd) != fd) _exit(88);
+            if (foreign != fd) (void)close(foreign);
+        }
+        errno = EIO; return -1;
+    }
     return fstat(fd, info);
 }
 static int intercepted_fcntl(int fd, int command, ...) {
@@ -42,11 +67,13 @@ static int intercepted_fcntl(int fd, int command, ...) {
         if (++path_count == fail_path) {
             if (replace_final) {
                 int foreign;
+                if (fstat(7, &original7) != 0) _exit(89);
                 (void)close(7);
-                foreign = open("/dev/null", O_RDONLY | O_CLOEXEC);
+                foreign = open(replace_same ? "/private/tmp" : "/dev/null", O_RDONLY | O_CLOEXEC);
                 if (foreign < 0 || dup2(foreign, 7) != 7) _exit(90);
                 if (foreign != 7) (void)close(foreign);
                 (void)fcntl(7, F_SETFD, FD_CLOEXEC);
+                if (fstat(7, &replacement7) != 0) _exit(92);
             }
             errno = EIO;
             result = -1;
@@ -55,10 +82,12 @@ static int intercepted_fcntl(int fd, int command, ...) {
     va_end(args);
     return result;
 }
+#define close intercepted_close
 #define openat intercepted_openat
 #define fstat intercepted_fstat
 #define fcntl intercepted_fcntl
 #include "../../../native/darwin_bootstrap/broker_entry.c"
+#undef close
 #undef openat
 #undef fstat
 #undef fcntl
@@ -155,6 +184,12 @@ static int exercise(const char *name) {
     if (strcmp(name, "missing6") != 0 && strcmp(name, "wrong_type6") != 0)
         CHECK(capture(6, &socket_before) == 0);
 #ifdef BH_A2B_FAULTS
+    if (strcmp(name, "retire_fstat_failure") == 0) fail_stat = 9;
+    if (strcmp(name, "final_retire_fstat_failure") == 0) fail_stat = 12;
+    if (strcmp(name, "final_close_failure") == 0) fail_close = 3;
+    if (strcmp(name, "close_failure") == 0) fail_close = 1;
+    if (strcmp(name, "close_completed_error") == 0) { fail_close = 1; close_then_error = 1; }
+    if (strcmp(name, "close_failure_replaced5") == 0) { fail_close = 1; close_then_replace = 1; }
     if (strcmp(name, "open_root_failure") == 0) fail_open = 1;
     if (strcmp(name, "open_component_failure") == 0) fail_open = 3;
     if (strcmp(name, "fstat_inventory_failure") == 0) fail_stat = 1;
@@ -163,6 +198,8 @@ static int exercise(const char *name) {
     if (strcmp(name, "occupied7_at_move") == 0) occupy7 = 1;
     if (strcmp(name, "getpath_failure") == 0) fail_path = 2;
     if (strcmp(name, "final_getpath_failure") == 0) fail_path = 4;
+    if (strcmp(name, "same_vnode7") == 0) { fail_path = 4; replace_final = 1; replace_same = 1; }
+    if (strcmp(name, "first_fstat_replaced5") == 0) { fail_stat = 7; replace_first = 1; }
     if (strcmp(name, "replaced7") == 0) { fail_path = 4; replace_final = 1; }
     if (strcmp(name, "preserve_unrelated") == 0) { fail_open = 3; preserve_unrelated = 1; }
 #endif
@@ -181,6 +218,15 @@ static int exercise(const char *name) {
         CHECK(socket_before.descriptor_flags == socket_after.descriptor_flags);
         CHECK(socket_before.status_flags == socket_after.status_flags);
     }
+#ifdef BH_A2B_FAULTS
+    if (replace_same) {
+        CHECK(original7.st_dev == replacement7.st_dev && original7.st_ino == replacement7.st_ino &&
+              original7.st_mode == replacement7.st_mode && original7.st_uid == replacement7.st_uid &&
+              original7.st_gid == replacement7.st_gid);
+        CHECK(fcntl(7, F_GETFD) >= 0); /* Preserve same-vnode foreign FD7. */
+    }
+    if (replace_first) CHECK(fcntl(5, F_GETFD) >= 0); /* Preserve unknown foreign FD5. */
+#endif
     if (extra >= 0) CHECK(fcntl(extra, F_GETFD) >= 0);
     if (success) {
         CHECK(out->initial.complete && out->initial.count == 6);
@@ -191,15 +237,32 @@ static int exercise(const char *name) {
         CHECK(out->ancestor_count >= 1 && strcmp(out->ancestors[0].path, "/") == 0);
         CHECK(strcmp(out->ancestors[out->ancestor_count - 1].path, candidate.path) == 0);
         for (i = 0; i < out->cleanup_count; i++) CHECK(out->cleanup[i].decision == BH_A2B_CLOSED);
-    } else {
-        CHECK(fcntl(5, F_GETFD) == -1 || extra == 5);
-        CHECK(fcntl(7, F_GETFD) == -1 || extra == 7 || strcmp(name, "replaced7") == 0 || strcmp(name, "occupied7_at_move") == 0);
+    }
+    /* Independent physical table readback: every final record and retained slot
+     * must agree, including foreign descriptors and unknown first metadata. */
+    {
+        size_t actual_count = 0;
+        int fd;
+        CHECK(out->final.complete);
+        for (fd = 0; fd < 256; fd++) if (fcntl(fd, F_GETFD) >= 0) actual_count++;
+        CHECK(actual_count == out->final.count);
+        for (i = 0; i < out->final.count; i++) {
+            const struct bh_a2b_fd *entry = &out->final.descriptors[i];
+            struct stat actual;
+            CHECK(fstat(entry->number, &actual) == 0);
+            CHECK(actual.st_dev == entry->metadata.st_dev && actual.st_ino == entry->metadata.st_ino &&
+                  actual.st_mode == entry->metadata.st_mode);
+            CHECK(fcntl(entry->number, F_GETFD) == entry->descriptor_flags);
+        }
+        for (i = 0; i < out->cleanup_count; i++)
+            if (out->cleanup[i].decision == BH_A2B_RETAINED_UNKNOWN)
+                CHECK(fcntl(out->cleanup[i].number, F_GETFD) >= 0);
     }
 #ifdef BH_A2B_FAULTS
     if (replace_final) {
         struct stat foreign;
         int retained = 0;
-        CHECK(fstat(7, &foreign) == 0 && S_ISCHR(foreign.st_mode));
+        CHECK(fstat(7, &foreign) == 0 && (replace_same ? S_ISDIR(foreign.st_mode) : S_ISCHR(foreign.st_mode)));
         for (i = 0; i < out->cleanup_count; i++)
             if (out->cleanup[i].number == 7 && out->cleanup[i].decision == BH_A2B_RETAINED_UNKNOWN) retained++;
         CHECK(retained == 1);
@@ -207,7 +270,28 @@ static int exercise(const char *name) {
     if (occupy7) {
         struct stat foreign;
         CHECK(fstat(7, &foreign) == 0 && S_ISCHR(foreign.st_mode));
-        CHECK(fcntl(8, F_GETFD) == -1);
+        CHECK(fcntl(8, F_GETFD) == FD_CLOEXEC); /* Failed move retains its duplicate too. */
+    }
+    if (replace_first) {
+        struct stat foreign;
+        int retained = 0;
+        CHECK(fstat(5, &foreign) == 0 && S_ISCHR(foreign.st_mode));
+        for (i = 0; i < out->cleanup_count; i++)
+            if (out->cleanup[i].number == 5 && out->cleanup[i].decision == BH_A2B_RETAINED_UNKNOWN) retained++;
+        CHECK(retained == 1 && close_count == 0);
+    }
+    if (fail_close) {
+        int failed = 0;
+        CHECK(close_count == fail_close); /* Never retry or close the next directory after error. */
+        CHECK((close_then_error ? fcntl(5, F_GETFD) == -1 : fcntl(5, F_GETFD) >= 0) &&
+              fcntl(7, F_GETFD) >= 0);
+        for (i = 0; i < out->cleanup_count; i++)
+            if (out->cleanup[i].number == 5 && out->cleanup[i].decision == BH_A2B_CLOSE_FAILED) failed++;
+        CHECK(failed == 1);
+        if (close_then_replace) {
+            struct stat foreign;
+            CHECK(fstat(5, &foreign) == 0 && S_ISCHR(foreign.st_mode));
+        }
     }
     if (preserve_unrelated) CHECK(unrelated == 100 && fcntl(unrelated, F_GETFD) == FD_CLOEXEC);
 #endif
@@ -218,7 +302,7 @@ static int exercise(const char *name) {
 int main(void) {
     const char *cases[] = {
 #ifdef BH_A2B_FAULTS
-        "open_root_failure", "open_component_failure", "fstat_inventory_failure",
+        "final_retire_fstat_failure", "final_close_failure", "retire_fstat_failure", "close_completed_error", "close_failure", "close_failure_replaced5", "same_vnode7", "first_fstat_replaced5", "open_root_failure", "open_component_failure", "fstat_inventory_failure",
         "fstat_open_failure", "fstat_final_failure", "occupied7_at_move", "getpath_failure", "final_getpath_failure", "replaced7", "preserve_unrelated"
 #else
         "success", "success_source7", "success_root", "extra5", "extra7", "extra_high",

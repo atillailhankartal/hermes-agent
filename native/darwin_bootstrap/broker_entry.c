@@ -106,17 +106,28 @@ static int valid_path(const struct bh_a2b_candidate *candidate) {
     return 1;
 }
 
+static void retain_unknown(struct owned_directory *owned, struct bh_a2b_observation *out) {
+    struct bh_a2b_cleanup *decision;
+    if (owned->fd < 0) return;
+    decision = &out->cleanup[out->cleanup_count++];
+    decision->number = owned->fd;
+    decision->decision = BH_A2B_RETAINED_UNKNOWN;
+    owned->fd = -1; /* Forget the cleanup candidate, never close its numeric slot. */
+}
+
 static int retire(struct owned_directory *owned, struct bh_a2b_observation *out) {
     struct stat current;
     struct bh_a2b_cleanup *decision;
     int clean = 0;
     if (owned->fd < 0) return 1;
-    /* A failed close is never retried. An identity mismatch is never closed.
-     * This is a vnode check within the caller's sealed interval, not ABA proof. */
+    /* Success-path retirement alone relies on the sealed-entry precondition.
+     * Vnode metadata cannot prove open-file-description identity. On any error,
+     * retain uncertain slots for terminal cancellation; never retry a close. */
+    if (!owned->known) { retain_unknown(owned, out); return 0; }
     decision = &out->cleanup[out->cleanup_count++];
     decision->number = owned->fd;
-    if (owned->known && (fstat(owned->fd, &current) != 0 ||
-                         !same_metadata(&current, &owned->identity))) {
+    if (fstat(owned->fd, &current) != 0 ||
+        !same_metadata(&current, &owned->identity)) {
         decision->decision = BH_A2B_RETAINED_UNKNOWN;
     } else if (close(owned->fd) == 0) {
         decision->decision = BH_A2B_CLOSED;
@@ -163,8 +174,8 @@ static int walk(const struct bh_a2b_candidate *candidate, struct owned_directory
         path[end] = '\0';
         next.fd = openat(current->fd, component, flags);
         if (next.fd < 0) return 0;
-        if (!observe_directory(&next, path, out)) { (void)retire(&next, out); return 0; }
-        if (!retire(current, out)) { (void)retire(&next, out); return 0; }
+        if (!observe_directory(&next, path, out)) { retain_unknown(&next, out); return 0; }
+        if (!retire(current, out)) { retain_unknown(&next, out); return 0; }
         *current = next;
         start = end + 1;
     }
@@ -209,8 +220,10 @@ enum bh_a2b_result bh_a2b_observe_fd7(const struct bh_a2b_candidate *candidate,
     out->result = BH_A2B_FD7_OBSERVED_UNTRUSTED;
     return out->result;
 fail:
-    (void)retire(&current, out);
-    (void)retire(&installed, out);
+    /* Once observation fails, no metadata read can exclude same-vnode ABA.
+     * Keep every outstanding slot, even when its metadata still matches. */
+    retain_unknown(&current, out);
+    retain_unknown(&installed, out);
     memset(&out->final, 0, sizeof(out->final));
     (void)inventory(&out->final);
     return BH_A2B_PAUSED;
