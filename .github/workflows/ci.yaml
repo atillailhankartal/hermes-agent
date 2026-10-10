@@ -64,7 +64,7 @@ jobs:
         with:
           python-version: '3.13'
       - name: Install policy parser
-        run: python -m pip install PyYAML==6.0.3
+        run: python -m pip install ruamel.yaml==0.18.16
       - name: Enforce workflow runner policy
         run: python scripts/ci/selfhosted_workflow_policy.py
 

@@ -12,6 +12,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import logging
+import sqlite3
 import weakref
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -28,12 +29,316 @@ class GatewayPluginInjectionMixin:
         from hermes_cli.plugins import publish_gateway_message_host
 
         publish_gateway_message_host(self, self._schedule_plugin_message_injection)
+        self._native_plugin_admission_open = True
+        from hermes_cli.plugins_injection import publish_admission_host, publish_keyed_lifecycle_host
+        owner = getattr(self.session_store, "_route_owner_id", None)
+        if owner:
+            self._native_plugin_queue()
+            publish_admission_host("gateway", self, self._admit_plugin_message, owner)
+            publish_keyed_lifecycle_host("gateway", self, owner)
+            loop = getattr(self, "_gateway_loop", None)
+            if loop is not None and not loop.is_closed():
+                self._native_plugin_drain_task = loop.create_task(self._drain_native_plugin_candidates())
 
     def _clear_plugin_message_injector(self) -> None:
         """Remove this runner's scheduler without clobbering a newer owner."""
         from hermes_cli.plugins import clear_published_gateway_message_host
 
+        self._native_plugin_admission_open = False
         clear_published_gateway_message_host(self)
+        from hermes_cli.plugins_injection import clear_published_admission_host, clear_published_keyed_lifecycle_host
+        clear_published_admission_host("gateway", self)
+        clear_published_keyed_lifecycle_host("gateway", self)
+        task = getattr(self, "_native_plugin_drain_task", None)
+        if task is not None:
+            task.cancel()
+
+    def _native_plugin_queue(self):
+        from gateway.native_plugin_queue import NativePluginQueue
+        queue = self.__dict__.get("_native_plugin_candidate_store")
+        if queue is None:
+            queue = NativePluginQueue(self.session_store.sessions_dir)
+            self._native_plugin_candidate_store = queue
+        return queue
+
+    def _native_plugin_claim_owned(self, manager, claim) -> bool:
+        """Authenticate the host object, even for status of a now-stale route."""
+        from gateway.route_claim import RouteClaim
+        from hermes_constants import hermes_home_key
+        store = self.session_store
+        return (type(claim) is RouteClaim and claim.surface == "gateway"
+                and claim._proof is store._route_claim_proof
+                and claim.host_owner_id == store._route_owner_id
+                and claim.profile_home_key == manager.scope_key
+                and hermes_home_key(manager.home_path) == manager.scope_key)
+
+    def _query_native_plugin_admission(
+        self, *, manager, route_claim, delivery_id, expected_content, route_epoch=None, expected_session_id=None,
+    ):
+        """Private same-ID readback; does not schedule, reinsert or require a current epoch.
+
+        A fresh host claim after restart can read a retained same-epoch receipt.
+        Historical claims from this owner can reconcile late completion after /new.
+        After restart a fresh host claim for the same profile/key can select the
+        retained epoch/native pair explicitly. Selectors are correlation, not authority.
+        This reports the ORIGINAL owner's admission, never a new-owner insertion.
+        Settlement requires expected_content and the original attempt's owner/route
+        fingerprint. There is no status-only receipt path.
+        Missing status is unknown, never permission to reinsert.
+        """
+        from hermes_cli.plugins_injection import AdmissionReceipt
+        epoch = route_epoch if route_epoch is not None else getattr(route_claim, "route_epoch", None)
+        native = expected_session_id if expected_session_id is not None else getattr(route_claim, "native_session_id", None)
+        unknown = AdmissionReceipt("unknown", "native_status_unavailable", delivery_id, epoch)
+        if not self._native_plugin_claim_owned(manager, route_claim):
+            return unknown
+        try:
+            queue = self._native_plugin_queue()
+            row = queue.lookup(manager.scope_key, epoch, delivery_id)
+            if (row and row["session_key"] == route_claim.session_key
+                    and row["native_id"] == native):
+                if not isinstance(expected_content, str) or row["payload_digest"] != queue.payload_digest(expected_content):
+                    return queue.receipt(queue.conflict(row))
+                return queue.receipt(row)
+        except (OSError, sqlite3.Error):
+            logger.warning("Native plugin status read failed")
+        return unknown
+
+    def _admit_plugin_message(self, **request):
+        """Typed worker callback. A timeout leaves the exact operation running for readback."""
+        from hermes_cli.plugins_injection import AdmissionReceipt
+        epoch = getattr(request.get("route_claim"), "route_epoch", None)
+        unknown = AdmissionReceipt("unknown", "native_admission_pending", request["delivery_id"], epoch)
+        loop = getattr(self, "_gateway_loop", None)
+        if loop is None or loop.is_closed():
+            return unknown
+        try:
+            if asyncio.get_running_loop() is loop:
+                return unknown
+        except RuntimeError:
+            pass
+        coro = self._admit_native_plugin_candidate(**request)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:
+            coro.close()
+            return unknown
+        try:
+            return future.result(timeout=4.0)
+        except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
+            return unknown
+        except Exception:  # health: allow BLE001 -- attempted dispatch may have committed
+            logger.warning("Native plugin admission outcome unavailable")
+            return unknown
+
+    async def _admit_native_plugin_candidate(
+        self, *, content, surface, route_claim, expected_session_id, delivery_id, plugin_id, manager,
+    ):
+        from hermes_cli.plugins_injection import AdmissionReceipt
+        from hermes_constants import hermes_home_key
+        epoch = getattr(route_claim, "route_epoch", None)
+        queue = None
+
+        def reject(reason):
+            if queue is not None:
+                row = queue.admit(profile=manager.scope_key, epoch=epoch, delivery=delivery_id,
+                                  session_key=route_claim.session_key, native_id=expected_session_id,
+                                  owner=self.session_store._route_owner_id, plugin=plugin_id,
+                                  content=content, rejection_reason=reason)
+                return queue.receipt(row)
+            return AdmissionReceipt("rejected", reason, delivery_id, epoch)
+
+        if (surface != "gateway" or not self._native_plugin_claim_owned(manager, route_claim)
+                or expected_session_id != route_claim.native_session_id):
+            return reject("invalid_host_route")
+        if not all(isinstance(value, str) and value.strip() for value in (content, delivery_id, plugin_id)):
+            return reject("invalid_request")
+        async with self._session_route_gate(route_claim.session_key):
+            try:
+                queue = self._native_plugin_queue()
+                existing = queue.lookup(manager.scope_key, epoch, delivery_id)
+                if existing:
+                    if (existing["session_key"] != route_claim.session_key
+                            or existing["native_id"] != expected_session_id or existing["plugin"] != plugin_id
+                            or existing["payload_digest"] != queue.payload_digest(content)):
+                        return AdmissionReceipt("unknown", "native_delivery_conflict", delivery_id, epoch)
+                    return queue.receipt(existing)
+                if not route_claim.is_route_current():
+                    return reject("route_not_current")
+                store = self.session_store
+                # The store lock also fences synchronous reset/repoint writers.
+                with manager._admission_host_lock, store._lock:
+                    registered = manager._admission_hosts.get("gateway")
+                    if (registered is None or registered[0] is not self
+                            or registered[2] != route_claim.host_owner_id
+                            or not getattr(self, "_native_plugin_admission_open", True)):
+                        return reject("admission_host_replaced")
+                    entry = store._entry_locked(route_claim.session_key)
+                    if (not self._plugin_injection_accepting() or store._route_owner_retired
+                            or entry is None or entry.origin is None or entry.route_claim_blocked
+                            or entry.session_id != expected_session_id or entry.route_epoch != epoch):
+                        return reject("route_not_current")
+                    source = self._restored_source(entry)
+                    if hermes_home_key(self._resolve_profile_home_for_source(source)) != manager.scope_key:
+                        return reject("profile_mismatch")
+                    from hermes_cli.plugins import PluginContext
+                    loaded = manager._plugins.get(plugin_id)
+                    if (loaded is None or not loaded.enabled or loaded.error
+                            or not PluginContext(loaded.manifest, manager)._gateway_injection_allowed()):
+                        return reject("plugin_grant_denied")
+                    if (not self._plugin_injection_authorized(source, plugin_id=plugin_id, target="native")
+                            or self._delivery_adapter_for(source) is None):
+                        return reject("route_unavailable")
+                    row = queue.admit(profile=manager.scope_key, epoch=epoch, delivery=delivery_id,
+                                      session_key=route_claim.session_key, native_id=expected_session_id,
+                                      owner=store._route_owner_id, plugin=plugin_id, content=content)
+                return queue.receipt(row)
+            except (OSError, sqlite3.Error):
+                # Includes failures reported after COMMIT: exact readback can recover the receipt.
+                logger.warning("Native plugin candidate commit outcome unavailable")
+                return self._query_native_plugin_admission(
+                    manager=manager, route_claim=route_claim, delivery_id=delivery_id, expected_content=content)
+
+    @staticmethod
+    def _strict_plugin_session_matches(entry, native_id, metadata):
+        if entry is None or not native_id or entry.session_id != native_id:
+            return False
+        epoch = metadata.get("gateway_route_epoch")
+        return not epoch or (entry.route_epoch == epoch and not entry.route_claim_blocked)
+
+    async def _hmwa_acquire_native_turn_lease(self, event, key, generation, entry, env_tokens):
+        await self._hmwa_acquire_turn_lease(key, generation, entry, env_tokens)
+        if not (getattr(event, "metadata", None) or {}).get("hermes_native_candidate_id"):
+            return
+        try:
+            async with self._session_route_gate(key):
+                if self._settle_native_plugin_turn(event, key, generation, entry):
+                    return
+        except (OSError, sqlite3.Error):
+            logger.warning("Native turn settlement unavailable")
+        self._clear_session_env(env_tokens)
+        from gateway.turn_lease import TurnLeaseTimeoutError
+        raise TurnLeaseTimeoutError(entry.session_id, owner_key=key, generation=generation, wait_seconds=0)
+
+    def _settle_native_plugin_turn(self, event, key, generation, entry):
+        from hermes_cli.active_sessions import active_session_lease_guard, ActiveSessionRegistryError
+        from hermes_constants import hermes_home_key
+        state = self._peek_session_state(key)
+        held = self._held_turn_lease(key, generation)
+        if state is None or held is None or state.turn.event is not event:
+            return False
+        if state.persistent.run_generation != generation:
+            return False
+        token = held[1][generation]
+        if (token.released or token.lease.holder is not token or token.session_id != entry.session_id
+                or token.owner_key != key or token.generation != generation):
+            return False
+        metadata = event.metadata
+        profile_home = self._resolve_profile_home_for_source(event.source)
+        queue = self._native_plugin_queue()
+        with self.session_store._lock:
+            live = self.session_store._entry_locked(key)
+            if not self._strict_plugin_session_matches(live, entry.session_id, metadata):
+                return False
+            row = queue.lookup(hermes_home_key(profile_home), live.route_epoch, metadata["hermes_delivery_id"])
+            if (not row or row["candidate"] != metadata["hermes_native_candidate_id"]
+                    or row["session_key"] != key or row["native_id"] != live.session_id
+                    or row["content"] != event.text
+                    or getattr(event, "_native_plugin_proof", None) is not self.session_store._route_claim_proof):
+                return False
+            try:
+                with active_session_lease_guard(state.turn.lease, session_id=key,
+                                               live_session_id=key, registry_home=profile_home):
+                    return queue.settle(row["candidate"])
+            except ActiveSessionRegistryError:
+                return False
+
+    async def _handle_native_plugin_candidate(self, event):
+        """One native dequeue can enter the ordinary Gateway handler at most once."""
+        from hermes_constants import hermes_home_key
+        metadata = event.metadata or {}
+        key = metadata.get("gateway_session_key")
+        queue = self._native_plugin_queue()
+        async with self._session_route_gate(key):
+            if (getattr(event, "_native_plugin_proof", None) is not self.session_store._route_claim_proof
+                    or not event.internal or event.allow_gateway_control):
+                return None
+            with self.session_store._lock:
+                entry = self.session_store._entry_locked(key)
+                if (entry is None or entry.route_claim_blocked
+                        or entry.session_id != metadata.get("gateway_session_id")
+                        or entry.route_epoch != metadata.get("gateway_route_epoch")):
+                    queue.transition(metadata["hermes_native_candidate_id"], "dispatching", "stale_route")
+                    return None
+                profile = hermes_home_key(self._resolve_profile_home_for_source(event.source))
+                row = queue.lookup(profile, entry.route_epoch, metadata.get("hermes_delivery_id"))
+                if (not row or row["candidate"] != metadata["hermes_native_candidate_id"]
+                        or row["session_key"] != key or row["native_id"] != entry.session_id
+                        or row["content"] != event.text
+                        or not queue.transition(row["candidate"], "dispatching", "running")):
+                    return None
+        try:
+            result = await self._handle_message_admitted(event)
+        except BaseException:
+            queue.transition(row["candidate"], "running", "execution_unknown")
+            raise
+        queue.transition(row["candidate"], "running", "handler_returned")
+        return result
+
+    async def _drain_native_plugin_candidates(self):
+        """Restart recovery and wake loop; the database is the queue, this task is only a signal."""
+        while getattr(self, "_running", False):
+            try:
+                await self._drain_native_plugin_candidates_once()
+            except Exception:  # health: allow BLE001 -- durable queue remains authoritative after a wake failure
+                logger.warning("Native plugin queue wake failed")
+            await asyncio.sleep(0.25)
+
+    async def _drain_native_plugin_candidates_once(self):
+        from hermes_constants import hermes_home_key
+        if not self._plugin_injection_accepting():
+            return
+        queue = self._native_plugin_queue()
+        for row in queue.next_queued_page():
+            key = row["session_key"]
+            async with self._session_route_gate(key):
+                entry = self.session_store.lookup_by_session_key(key)
+                if (entry is None or entry.route_epoch != row["epoch"]
+                        or entry.session_id != row["native_id"] or entry.route_claim_blocked
+                        or entry.origin is None):
+                    queue.transition(row["candidate"], "queued", "stale_route")
+                    continue
+                source = self._restored_source(entry)
+                if hermes_home_key(self._resolve_profile_home_for_source(source)) != row["profile"]:
+                    queue.transition(row["candidate"], "queued", "stale_profile")
+                    continue
+                adapter = self._delivery_adapter_for(source)
+                if (adapter is None or self._is_session_running(key)
+                        or key in adapter._active_sessions or key in adapter._pending_messages):
+                    continue
+                if not self._plugin_injection_authorized(source, plugin_id=row["plugin"], target="native"):
+                    queue.transition(row["candidate"], "queued", "authorization_revoked")
+                    continue
+                event = MessageEvent(text=row["content"], message_type=MessageType.TEXT, source=source,
+                                     internal=True, allow_gateway_control=False, metadata={
+                    "hermes_plugin_id": row["plugin"], "hermes_plugin_injection": True,
+                    "hermes_native_candidate_id": row["candidate"], "hermes_delivery_id": row["delivery"],
+                    "gateway_session_key": key, "gateway_session_id": row["native_id"],
+                    "gateway_route_epoch": row["epoch"], "gateway_session_strict": True,
+                })
+                event._native_plugin_proof = self.session_store._route_claim_proof
+                # Persist before crossing the scheduler boundary. If the process dies after this
+                # CAS, automatic replay could execute twice. Preserve the status but never retry.
+                if not queue.transition(row["candidate"], "queued", "dispatching"):
+                    continue
+                try:
+                    async with self._plugin_injection_scope(source):
+                        started = adapter._start_session_processing(event, key)
+                    if not started:
+                        queue.transition(row["candidate"], "dispatching", "execution_unknown")
+                except Exception:  # health: allow BLE001 -- adapter may have started before raising
+                    queue.transition(row["candidate"], "dispatching", "execution_unknown")
+                    logger.warning("Native plugin candidate execution outcome unavailable")
 
     def _schedule_plugin_message_injection(
         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,

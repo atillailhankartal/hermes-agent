@@ -4,9 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
-import yaml
-
-from scripts.ci.selfhosted_workflow_policy import UniqueBaseLoader, check, topology_digest
+from scripts.ci.selfhosted_workflow_policy import check, load_workflow, topology_digest
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -14,25 +12,37 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 
 def real_tree(tmp_path: Path):
     shutil.copytree(REPOSITORY / ".github" / "workflows", tmp_path / ".github" / "workflows")
-    manifest = json.loads((REPOSITORY / "scripts" / "ci" / "selfhosted_workflow_manifest.json").read_text())
+    manifest = json.loads((REPOSITORY / "scripts" / "ci" / "selfhosted_workflow_manifest.json").read_text(encoding="utf-8-sig"))
     return tmp_path / ".github" / "workflows", manifest
 
 
 def mutate(workflow: Path, before: str, after: str):
-    original = workflow.read_text()
+    original = workflow.read_text(encoding="utf-8-sig")
     changed = original.replace(before, after, 1)
     assert changed != original
-    workflow.write_text(changed)
+    workflow.write_text(changed, encoding="utf-8")
 
 
 def refresh_digest(manifest: dict, workflow: Path):
-    document = yaml.load(workflow.read_text(), Loader=UniqueBaseLoader)
+    document = load_workflow(workflow.read_text(encoding="utf-8-sig"))
     manifest["workflows"][workflow.name] = topology_digest(document)
 
 
 def test_actual_repository_passes_pinned_policy():
-    manifest = json.loads((REPOSITORY / "scripts" / "ci" / "selfhosted_workflow_manifest.json").read_text())
+    manifest = json.loads((REPOSITORY / "scripts" / "ci" / "selfhosted_workflow_manifest.json").read_text(encoding="utf-8-sig"))
     assert check(REPOSITORY, manifest) == []
+
+
+def test_parser_keeps_github_on_key_and_scalar_strings():
+    document = load_workflow("on:\n  push:\njobs:\n  gate:\n    if: false\n")
+    assert document == {"on": {"push": ""}, "jobs": {"gate": {"if": "false"}}}
+
+
+def test_duplicate_workflow_key_is_rejected(tmp_path):
+    workflows, manifest = real_tree(tmp_path)
+    workflow = workflows / "ci.yaml"
+    workflow.write_text(workflow.read_text(encoding="utf-8-sig") + "\non:\n  push:\n", encoding="utf-8")
+    assert any("invalid YAML" in issue for issue in check(tmp_path, manifest))
 
 
 def test_hosted_runner_mutation_makes_policy_red(tmp_path):
@@ -58,7 +68,7 @@ def test_replaced_arm64_matrix_row_makes_coverage_red(tmp_path):
 
 def test_new_workflow_and_new_event_fail_closed(tmp_path):
     workflows, manifest = real_tree(tmp_path)
-    (workflows / "extra.yml").write_text("on:\n  push:\njobs:\n  test:\n    runs-on: ubuntu-latest\n")
+    (workflows / "extra.yml").write_text("on:\n  push:\njobs:\n  test:\n    runs-on: ubuntu-latest\n", encoding="utf-8")
     assert any("workflow file set changed" in issue for issue in check(tmp_path, manifest))
     (workflows / "extra.yml").unlink()
     mutate(workflows / "ci.yaml", "  pull_request:\n  push:", "  pull_request:\n  issues:\n  push:")
@@ -137,9 +147,9 @@ def test_empty_workflow_set_and_empty_manifest_fail_closed(tmp_path):
 def test_required_ci_policy_job_cannot_be_removed_with_refreshed_digest(tmp_path):
     workflows, manifest = real_tree(tmp_path)
     workflow = workflows / "ci.yaml"
-    original = workflow.read_text()
+    original = workflow.read_text(encoding="utf-8-sig")
     start = original.index("  runner-policy:\n")
     end = original.index("  # ─", start)
-    workflow.write_text(original[:start] + original[end:])
+    workflow.write_text(original[:start] + original[end:], encoding="utf-8")
     refresh_digest(manifest, workflow)
     assert any("required jobs missing" in issue for issue in check(tmp_path, manifest))

@@ -248,11 +248,24 @@ def _manual_compress_turn(sid: str, session: dict):
     with session["history_lock"]:
         if session.get("running"):
             raise CompressionBusy(busy_message("compress", bool(session.get("_manual_compress_active"))))
+        old_key = session.get("session_key")
+        old_version = session.get("history_version")
+        had_lease = session.get("active_session_lease") is not None
+        session["_manual_compress_sid"] = sid
         session["running"] = session["_manual_compress_active"] = True
     try:
+        if (ownership_refusal := _prove_active_session_slot(sid, session)) is not None:
+            raise RuntimeError(ownership_refusal)
         yield
     finally:
+        # A no-op/preview has no persistent writer. Drop a newly claimed slot while the manual
+        # turn is still busy, before a queued prompt can run and make that slot its own.
         with session["history_lock"]:
+            unchanged = (session.get("session_key") == old_key
+                         and session.get("history_version") == old_version)
+            if not had_lease and unchanged:
+                _release_active_session_slot(session)
+            session.pop("_manual_compress_sid", None)
             session.pop("_manual_compress_active", None)
             session["running"] = False
         # The compaction emitted session.info with running=true; close that edge or Desktop latches busy.
@@ -301,13 +314,33 @@ def _compress_session_history(
         raise CompressionLockHeld(result.lock_holder)
     if result.status != "compressed":
         return 0, _get_usage(agent)
-    with session["history_lock"]:
-        if int(session.get("history_version", 0)) != history_version:
-            # External mutation during compaction — drop the result so we don't clobber concurrent edits.
+    # The model-bound summary runs without history_lock or the registry file lock. Check the
+    # original route again after it returns, before committing a changed transcript.
+    if (manual_sid := session.get("_manual_compress_sid")) is not None:
+        if (ownership_refusal := _prove_active_session_slot(manual_sid, session)) is not None:
             finalize_context_engine_compression_notification(agent, committed=False)
-            return 0, _get_usage(agent)
-        session["history"] = result.after_messages
-        session["history_version"] = history_version + 1
+            raise RuntimeError(ownership_refusal)
+    from hermes_cli.active_sessions import ActiveSessionRegistryError, active_session_lease_guard
+    try:
+        with session["history_lock"]:
+            if int(session.get("history_version", 0)) != history_version:
+                # External mutation during compaction — drop the result so we don't clobber concurrent edits.
+                finalize_context_engine_compression_notification(agent, committed=False)
+                return 0, _get_usage(agent)
+            if manual_sid is not None:
+                # Existing paths already take history_lock before the active-session file lock.
+                # Keep that order, and hold the file lock only across this short commit.
+                with active_session_lease_guard(
+                    session["active_session_lease"], session_id=str(session.get("session_key") or ""),
+                    live_session_id=manual_sid, registry_home=session.get("profile_home")):
+                    session["history"] = result.after_messages
+                    session["history_version"] = history_version + 1
+            else:
+                session["history"] = result.after_messages
+                session["history_version"] = history_version + 1
+    except ActiveSessionRegistryError as exc:
+        finalize_context_engine_compression_notification(agent, committed=False)
+        raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE) from exc
     return result.removed, _get_usage(agent)
 
 
@@ -328,6 +361,7 @@ def _sync_session_key_after_compress(
             "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
             sid, old_key, new_session_id,
         )
+        raise RuntimeError(_SESSION_OWNERSHIP_UNAVAILABLE)
     # Even if the approval module fails to import, anchor session_key on the continuation id.
     session["session_key"] = new_session_id
     with contextlib.suppress(Exception):

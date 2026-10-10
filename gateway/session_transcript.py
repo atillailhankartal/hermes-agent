@@ -11,6 +11,7 @@ import threading
 import time
 from agent.turn_context import extract_api_content_sidecar
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from gateway.route_claim import new_route_epoch
 
 if TYPE_CHECKING:
     from gateway.session import SessionEntry
@@ -127,10 +128,19 @@ class SessionTranscriptMixin:
             return False
         if entry.session_id != original_session_id or canonical_session_id == original_session_id:
             return False
+        candidate = entry.to_dict()
+        candidate["session_id"] = canonical_session_id
+        candidate["route_epoch"] = new_route_epoch()
+        candidate["route_claim_blocked"] = True
+        candidate["route_claim_recoverable"] = False
+        self._save_entry(entry.session_key, entry_data=candidate, lock_held=True)
         logger.info(
             "SessionStore healed compressed session mapping: %s -> %s", entry.session_id,
             canonical_session_id)
         entry.session_id = canonical_session_id
+        entry.route_epoch = candidate["route_epoch"]
+        entry.route_claim_blocked = True
+        entry.route_claim_recoverable = False
         return True
 
     def advance_compression_session(
@@ -150,7 +160,6 @@ class SessionTranscriptMixin:
                 return entry
             if not self._heal_compression_tip_locked(entry, expected_session_id, target_session_id):
                 return None  # route moved (session_id != expected) or nothing to heal
-            self._save()  # bookkeeping, not user activity: leave ``updated_at`` alone
             return entry
 
     def _get_transcript_drain_lock(self):
@@ -262,12 +271,24 @@ class SessionTranscriptMixin:
         return pending
 
     def _publish_transcript_reroute(self, session_id: str, child_id: str) -> None:
-        """Repoint every route at the compression child and save (index authoritative again)."""
+        """Persist all child repoints and epochs before exposing them in the routing index."""
         with self._lock:
-            for entry in self._entries.values():
-                if entry.session_id == session_id:
+            data, generation = self._snapshot_routing_locked()
+            moving = [entry for entry in self._entries.values() if entry.session_id == session_id]
+            for entry in moving:
+                candidate = entry.to_dict()
+                candidate["session_id"] = child_id
+                candidate["route_epoch"] = new_route_epoch()
+                candidate["route_claim_blocked"] = True
+                candidate["route_claim_recoverable"] = False
+                data[entry.session_key] = candidate
+            if moving:
+                self._persist_routing_data(data, generation)
+                for entry in moving:
                     entry.session_id = child_id
-            self._save()
+                    entry.route_epoch = data[entry.session_key]["route_epoch"]
+                    entry.route_claim_blocked = True
+                    entry.route_claim_recoverable = False
         (getattr(self, "_session_owner_hints", None) or {}).pop(child_id, None)
 
     def _append_to_transcript_serialized(self, session_id: str, message: dict[str, Any]) -> None:
@@ -604,6 +625,56 @@ class SessionTranscriptMixin:
         child already is, anything else gets *messages* written by the destructive rewrite."""
         return (self.is_published_compression_child(parent_session_id, child_session_id)
                 or self.rewrite_transcript(child_session_id, messages))
+
+    def publish_compression_child_route(
+        self, session_key: str, expected_entry: "SessionEntry", parent_session_id: str,
+        child_session_id: str, *, still_current=None,
+    ) -> bool:
+        """Persist a compression repoint before exposing it through the live routing entry.
+
+        The caller must already hold a turn lease rebound to ``child_session_id``. Keep the
+        identity/CAS check, one-row durable write, and in-memory publication under the routing
+        lock. The Gateway caller holds its awaited per-session admission gate until the offloaded
+        write and live assignment finish, so /new cannot invalidate the owner mid-publication.
+        No compressor or agent work runs under this lock. A failed write leaves the parent route
+        live; there is no second, fallible compensation write after the child becomes durable.
+        """
+        if not session_key or not parent_session_id or not child_session_id:
+            return False
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if (current is not expected_entry or current.session_id != parent_session_id
+                    or (still_current is not None and not still_current())):
+                return False
+            candidate = current.to_dict()
+            candidate["session_id"] = child_session_id
+            candidate["route_epoch"] = new_route_epoch()
+            candidate["route_claim_blocked"] = False
+            candidate["route_claim_recoverable"] = False
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            current.session_id = child_session_id
+            current.route_epoch = candidate["route_epoch"]
+            current.route_claim_blocked = False
+            current.route_claim_recoverable = False
+            return True
+
+    def publish_in_place_compaction_epoch(
+        self, session_key: str, expected_entry: "SessionEntry", session_id: str,
+    ) -> bool:
+        """Publish a fresh epoch for a committed compaction that retained its native ID."""
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if current is not expected_entry or current.session_id != session_id:
+                return False
+            candidate = current.to_dict()
+            candidate["route_epoch"] = new_route_epoch()
+            candidate["route_claim_blocked"] = False
+            candidate["route_claim_recoverable"] = False
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            current.route_epoch = candidate["route_epoch"]
+            current.route_claim_blocked = False
+            current.route_claim_recoverable = False
+            return True
 
     def has_input_owner(self, session_id: str, owner: str) -> bool:
         """Find this accepted input on the canonical live continuation and its ancestors.

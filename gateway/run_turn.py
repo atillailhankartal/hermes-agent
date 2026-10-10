@@ -434,7 +434,7 @@ class GatewayTurnMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
-            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
+            if not self._strict_plugin_session_matches(session_entry, pinned_session_id, event_metadata):
                 logger.warning(
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
@@ -1132,13 +1132,14 @@ class GatewayTurnMixin:
                 _hyg_rotated = False
                 _hyg_in_place = False
             else:
-                session_entry.session_id = _hyg_new_sid
-                # The held turn lease follows the rotation (alias keys still serialize on this turn).
-                self._rebind_turn_lease(_quick_key, run_generation, _hyg_new_sid)
-                await self.async_session_store._save()
+                await self._hmwa_publish_compression_child_route(
+                    session_entry, _hyg_new_sid, _quick_key, run_generation,
+                )
                 await asyncio.to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="hygiene-compression",
                 )
+        elif _hyg_in_place:
+            await self._hmwa_publish_in_place_compaction_epoch(session_entry, _quick_key, run_generation)
 
         if _hyg_rotated or _hyg_in_place:
             # Persisted (rotation) or persisted by archive_and_compact() (in-place): reset token count.
@@ -1567,14 +1568,11 @@ class GatewayTurnMixin:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
 
-        # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
-        # if the binding still points at the session this run was launched against.
         if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
             if session_entry.session_id == _run_start_session_id:
-                session_entry.session_id = agent_result["session_id"]
-                # The held turn lease follows the rotation (persistence writes to the NEW id).
-                self._rebind_turn_lease(_quick_key, run_generation, session_entry.session_id)
-                await self.async_session_store._save()
+                await self._hmwa_publish_compression_child_route(
+                    session_entry, agent_result["session_id"], _quick_key, run_generation,
+                )
                 await self.async_session_store._record_gateway_session_peer(
                     session_entry.session_id, session_key, source,
                 )
@@ -1587,6 +1585,8 @@ class GatewayTurnMixin:
                     "moved from %s to %s before compression finished",
                     session_key or "?", _run_start_session_id, session_entry.session_id,
                 )
+        elif agent_result.get("compacted_in_place") and session_entry.session_id == _run_start_session_id:
+            await self._hmwa_publish_in_place_compaction_epoch(session_entry, _quick_key, run_generation)
         return response, _intentional_silence, agent_messages
 
     # reasoning_style → (header catalog key, per-line quote prefix for blank / non-blank lines)
@@ -2084,7 +2084,7 @@ class GatewayTurnMixin:
         if _is_new_session and _auto:
             self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
 
-        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
+        await self._hmwa_acquire_native_turn_lease(event, _quick_key, run_generation, session_entry, _session_env_tokens)
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
