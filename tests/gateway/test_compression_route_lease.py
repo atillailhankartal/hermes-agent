@@ -159,27 +159,42 @@ async def test_new_during_durable_route_write_cannot_unlock_child_or_publish_sta
 
     monkeypatch.setattr(store, "_save_entry", gated_save)
     task = asyncio.create_task(_hygiene(runner, entry, source))
+    reset_entry = []
+
+    def do_new():
+        runner._invalidate_session_run_generation("route", reason="test /new")
+        runner._release_turn_lease("route", 1)
+        reset_entry.append(store.reset_session("route"))
+
+    invalidator = threading.Thread(target=do_new)
     try:
         assert await asyncio.to_thread(entered.wait, 3)
         assert token.session_id == "child"
         assert runner._turn_leases._leases["old"] is runner._turn_leases._leases["child"]
         with pytest.raises(TurnLeaseTimeoutError):
             await runner._turn_leases.acquire("old", owner_key="alias-old", generation=1, timeout=0.02)
-        runner._invalidate_session_run_generation("route", reason="test /new")
-        assert runner._release_turn_lease("route", 1) is True
+        invalidator.start()
         assert token.lease.lock.locked()
         with pytest.raises(TurnLeaseTimeoutError):
             await runner._turn_leases.acquire("child", owner_key="alias", generation=1, timeout=0.02)
         release.set()
-        with pytest.raises(RuntimeError, match="compression route changed"):
+        try:
             await asyncio.wait_for(task, 3)
-        assert store.peek_session_id("route") == "old"
-        assert json.loads((tmp_path / "sessions" / "sessions.json").read_text())["route"]["session_id"] == "old"
+        except RuntimeError as exc:
+            assert "compression route changed" in str(exc)
+        await asyncio.to_thread(invalidator.join, 3)
+        assert not invalidator.is_alive()
+        assert len(reset_entry) == 1
+        assert store.lookup_by_session_key("route") is reset_entry[0]
+        assert store.peek_session_id("route") == reset_entry[0].session_id
+        assert json.loads((tmp_path / "sessions" / "sessions.json").read_text())["route"]["session_id"] == reset_entry[0].session_id
         assert token.released is True
     finally:
         release.set()
         if not task.done():
             task.cancel()
+        if invalidator.ident is not None and invalidator.is_alive():
+            await asyncio.to_thread(invalidator.join, 3)
         runner._turn_leases.release(token)
 
 
@@ -202,13 +217,18 @@ async def test_cancelled_handoff_keeps_child_lease_until_offloaded_write_finishe
 
     monkeypatch.setattr(store, "_save_entry", gated_save)
     task = asyncio.create_task(_hygiene(runner, entry, source))
+    def invalidate_and_drop():
+        runner._invalidate_session_run_generation("route", reason="test cancellation")
+        if release_mode == "new_drop":
+            runner._drop_turn_slot("route", run_generation=2)
+
+    invalidator = threading.Thread(target=invalidate_and_drop)
     try:
         assert await asyncio.to_thread(entered.wait, 3)
-        runner._invalidate_session_run_generation("route", reason="test cancellation")
+        invalidator.start()
         if release_mode == "new_drop":
             runner._persist_active_agents = Mock()
             runner._evict_cached_agent = Mock()
-            runner._drop_turn_slot("route", run_generation=2)
         else:
             assert runner._release_turn_lease("route", 1) is True
         task.cancel()
@@ -219,12 +239,20 @@ async def test_cancelled_handoff_keeps_child_lease_until_offloaded_write_finishe
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 3)
-        assert store.peek_session_id("route") == "old"
+        await asyncio.to_thread(invalidator.join, 3)
+        assert not invalidator.is_alive()
+        assert store.peek_session_id("route") == "child"
+        assert json.loads((tmp_path / "sessions" / "sessions.json").read_text())["route"]["session_id"] == "child"
+        reopened = SessionStore(tmp_path / "sessions", GatewayConfig())
+        reopened._db = None
+        assert reopened.peek_session_id("route") == "child"
         assert token.released is True
     finally:
         release.set()
         if not task.done():
             task.cancel()
+        if invalidator.ident is not None and invalidator.is_alive():
+            await asyncio.to_thread(invalidator.join, 3)
         runner._turn_leases.release(token)
 
 
@@ -255,4 +283,125 @@ async def test_reset_during_child_persistence_cannot_republish_old_turn(tmp_path
         release.set()
         if not task.done():
             task.cancel()
+        runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
+async def test_new_cannot_invalidate_between_durable_child_write_and_route_publish(tmp_path, monkeypatch):
+    runner, store, entry, _source, token = await _runner(tmp_path, monkeypatch)
+    child_written = threading.Event()
+    finish_write = threading.Event()
+    generation_invalidated = threading.Event()
+    reset_done = threading.Event()
+    restore_attempts = []
+    original_save = store._save_entry
+
+    def gated_save(*args, **kwargs):
+        target = kwargs.get("entry_data", {}).get("session_id")
+        if target == "child":
+            original_save(*args, **kwargs)
+            child_written.set()
+            assert finish_write.wait(3)
+            return
+        if target == "old":
+            restore_attempts.append(target)
+            raise OSError("restore write failed")
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_save_entry", gated_save)
+    task = asyncio.create_task(runner._hmwa_publish_compression_child_route(entry, "child", "route", 1))
+
+    def do_new():
+        runner._invalidate_session_run_generation("route", reason="test /new")
+        generation_invalidated.set()
+        runner._release_turn_lease("route", 1)
+        store.reset_session("route")
+        reset_done.set()
+
+    invalidator = threading.Thread(target=do_new)
+    try:
+        assert await asyncio.to_thread(child_written.wait, 3)
+        assert entry.session_id == "old"
+        assert token.lease.lock.locked()
+        invalidator.start()
+        invalidated_during_write = await asyncio.to_thread(generation_invalidated.wait, 0.05)
+        finish_write.set()
+        try:
+            await asyncio.wait_for(task, 3)
+            outcome = None
+        except (RuntimeError, OSError) as exc:
+            outcome = exc
+        await asyncio.to_thread(invalidator.join, 3)
+        assert not invalidator.is_alive()
+        assert restore_attempts == []
+        assert not invalidated_during_write
+        assert not isinstance(outcome, OSError)
+        assert reset_done.is_set()
+        assert token.released is True
+        assert store.peek_session_id("route") != "child"
+        reopened = SessionStore(tmp_path / "sessions", GatewayConfig())
+        reopened._db = None
+        assert reopened.peek_session_id("route") == store.peek_session_id("route")
+    finally:
+        finish_write.set()
+        if not task.done():
+            task.cancel()
+        if invalidator.ident is not None and invalidator.is_alive():
+            await asyncio.to_thread(invalidator.join, 3)
+        runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
+async def test_new_cannot_invalidate_after_final_check_before_live_assignment(tmp_path, monkeypatch):
+    runner, store, entry, _source, token = await _runner(tmp_path, monkeypatch)
+    assigning = threading.Event()
+    finish_assignment = threading.Event()
+    generation_invalidated = threading.Event()
+    reset_done = threading.Event()
+    original_setattr = SessionEntry.__setattr__
+
+    def gated_setattr(self, name, value):
+        if self is entry and name == "session_id" and value == "child":
+            assigning.set()
+            assert finish_assignment.wait(3)
+        return original_setattr(self, name, value)
+
+    monkeypatch.setattr(SessionEntry, "__setattr__", gated_setattr)
+    task = asyncio.create_task(runner._hmwa_publish_compression_child_route(entry, "child", "route", 1))
+
+    def do_new():
+        runner._invalidate_session_run_generation("route", reason="test /new")
+        generation_invalidated.set()
+        runner._release_turn_lease("route", 1)
+        store.reset_session("route")
+        reset_done.set()
+
+    invalidator = threading.Thread(target=do_new)
+    try:
+        assert await asyncio.to_thread(assigning.wait, 3)
+        assert token.lease.lock.locked()
+        invalidator.start()
+        invalidated_during_assignment = await asyncio.to_thread(generation_invalidated.wait, 0.05)
+        finish_assignment.set()
+        try:
+            await asyncio.wait_for(task, 3)
+            outcome = None
+        except RuntimeError as exc:
+            outcome = exc
+        await asyncio.to_thread(invalidator.join, 3)
+        assert not invalidator.is_alive()
+        assert not invalidated_during_assignment
+        assert reset_done.is_set()
+        assert token.released is True
+        assert store.peek_session_id("route") != "child"
+        assert outcome is None or "compression route changed" in str(outcome)
+        reopened = SessionStore(tmp_path / "sessions", GatewayConfig())
+        reopened._db = None
+        assert reopened.peek_session_id("route") == store.peek_session_id("route")
+    finally:
+        finish_assignment.set()
+        if not task.done():
+            task.cancel()
+        if invalidator.ident is not None and invalidator.is_alive():
+            await asyncio.to_thread(invalidator.join, 3)
         runner._turn_leases.release(token)

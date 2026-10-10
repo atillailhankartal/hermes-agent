@@ -514,13 +514,19 @@ class GatewayAgentCacheMixin:
 
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh, monotonically increasing run generation token (NEVER reset): a late result
-        from a worker /stop or /new invalidated is recognized and dropped."""
+        from a worker /stop or /new invalidated is recognized and dropped.
+
+        Share the routing lock with compression child publication. A boundary cannot invalidate
+        the owner while its durable route write and live assignment are in progress.
+        """
         if not session_key:
             return 0
-        persistent = self._session_state(session_key).persistent
-        # Monotonic by design (#28686): incremented here, NEVER reset.
-        persistent.run_generation = int(persistent.run_generation) + 1
-        return persistent.run_generation
+        store = getattr(self, "session_store", None)
+        with store._lock if store is not None else nullcontext():
+            persistent = self._session_state(session_key).persistent
+            # Monotonic by design (#28686): incremented here, NEVER reset.
+            persistent.run_generation = int(persistent.run_generation) + 1
+            return persistent.run_generation
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``.

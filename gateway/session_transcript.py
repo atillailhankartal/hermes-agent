@@ -613,9 +613,10 @@ class SessionTranscriptMixin:
 
         The caller must already hold a turn lease rebound to ``child_session_id``. Keep the
         identity/CAS check, one-row durable write, and in-memory publication under the routing
-        lock so /new cannot interleave between those steps. No compressor or agent work runs under
-        this lock. A displaced generation is checked again after the write; its candidate is
-        restored to the parent before the lock is released.
+        lock. Gateway run generation changes use this same lock, so /new cannot invalidate the
+        owner between the pre-write check and live publication. No compressor or agent work runs
+        under this lock. A failed write leaves the parent route live; there is no second, fallible
+        compensation write after the child candidate has become durable.
         """
         if not session_key or not parent_session_id or not child_session_id:
             return False
@@ -627,9 +628,6 @@ class SessionTranscriptMixin:
             candidate = current.to_dict()
             candidate["session_id"] = child_session_id
             self._save_entry(session_key, entry_data=candidate, lock_held=True)
-            if still_current is not None and not still_current():
-                self._save_entry(session_key, entry_data=current.to_dict(), lock_held=True)
-                return False
             current.session_id = child_session_id
             return True
 
