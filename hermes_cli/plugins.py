@@ -26,7 +26,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Set, Tuple, Union
 
 from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_home_key
 from registration_lifecycle import replacement_coordinator
@@ -49,6 +49,12 @@ from hermes_cli.plugins_discovery import (  # noqa: F401 — re-exported
 from hermes_cli.plugins_loader import (
     PluginLoaderMixin, _BARE_MODULE_SCOPE, _MODULE_NAMESPACE_LOCK, _NS_PARENT, _evict_modules,
     _plugin_home_scope, _serialized_replacement, in_plugin_load_worker,
+)
+from hermes_cli.plugins_injection import (
+    AdmissionReceipt, TuiPluginHostMixin, inject_plugin_message_admitted,
+    publish_admission_host, clear_published_admission_host,
+    publish_keyed_lifecycle_host, clear_published_keyed_lifecycle_host,
+    attach_published_host_apis, reset_published_host_apis,
 )
 from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS, HERMES_EVENT_NAMESPACE, MAX_SYSTEM_PROMPT_SECTION_CHARS,
@@ -131,6 +137,8 @@ VALID_HOOKS: Set[str] = {
     # error_body may be unredacted.
     "transform_api_error_classification", "on_session_start", "on_session_end",
     "on_session_finalize", "on_session_reset",
+    # TUI/Desktop route observers are delivered only through a bounded host guard.
+    "on_session_compacted", "on_session_resumed",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
@@ -205,7 +213,9 @@ VALID_HOOKS: Set[str] = {
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "transform_api_error_classification", "on_session_compacted", "on_session_resumed",
+}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()
@@ -603,21 +613,32 @@ class PluginContext:
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
         origin: Mapping[str, Any] | None = None,
+        expected_session_id: str | None = None,
+        surface: Literal["gateway", "tui"] | None = None,
+        route_claim: Mapping[str, Any] | None = None,
     ) -> bool:
-        """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
+        """Inject into the selected live host while preserving CLI and origin routing.
 
-        CLI uses the attached REPL queues. Ink TUI and desktop use a separate injector
-        from the messaging gateway and queue onto the live session named by ``session_key``
-        (the durable key, not the ephemeral UI session id). ``origin`` (a
-        ``SessionSource.to_dict()``-shaped mapping: platform, chat_id, chat_type, thread_id,
-        user_id, ...) instead names a messaging chat: the gateway starts (or continues) that
-        chat's session in THIS plugin's own profile and runs a turn there; the plugin cannot
-        target another profile. Non-CLI injection needs ``session_key`` or ``origin`` plus
-        ``plugins.entries.<plugin_id>.allow_gateway_injection`` in the plugin's profile config.
-        ``True`` means a host accepted the request, not that the turn completed.
+        The explicit TUI surface requires a separate grant and exact native session id;
+        denial never falls through to Gateway. ``origin`` retains the v0.21.6 Gateway
+        profile and chat semantics. A Gateway True is a scheduling receipt only; a TUI
+        True is the host callback's admission result, never a model completion receipt.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        return inject_plugin_message(
+            self, content, role, session_key=session_key, origin=origin,
+            expected_session_id=expected_session_id, surface=surface, route_claim=route_claim,
+        )
+
+    def inject_message_admitted(
+        self, content: str, *, surface: Literal["cli", "gateway", "tui"], route_claim: Any,
+        expected_session_id: str, delivery_id: str,
+    ) -> AdmissionReceipt:
+        """Request exact host admission; never infer it from a scheduler bool."""
+        return inject_plugin_message_admitted(
+            self, content, surface=surface, route_claim=route_claim,
+            expected_session_id=expected_session_id, delivery_id=delivery_id,
+        )
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns (read from the plugin's
@@ -950,7 +971,13 @@ class PluginContext:
             logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                            key, ", ".join(sorted(valid)))
         mapping.setdefault(key, []).append(callback)
-        handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
+
+        def release() -> None:
+            self._manager._remove_callback(mapping, key, callback)
+            if kind == "hook" and key in {"on_session_compacted", "on_session_resumed"}:
+                self._manager._invalidate_tui_hook_wrapper(key, callback)
+
+        handle = self._track(kind, key, release)
         logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
 
@@ -1150,7 +1177,7 @@ def _resolve_hook_callback_timeout() -> float:
     return timeout
 
 
-class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
+class PluginManager(PluginLoaderMixin, PluginDispatchMixin, TuiPluginHostMixin, PluginLedgerMixin):
     """Central manager that discovers, loads, and invokes plugins."""
 
     def __init__(self, scope_key: Optional[str] = None) -> None:
@@ -1171,6 +1198,11 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # Ink TUI / desktop. Must not alias ``_gateway_message_injector``: a live
         # messaging gateway and a TUI in one process would otherwise clobber each other.
         self._tui_message_injector: tuple[object, Callable] | None = None
+        self._tui_injector_lock = threading.Lock()
+        self._admission_hosts: dict[str, tuple[object, Callable[..., AdmissionReceipt], str]] = {}
+        self._admission_host_lock = threading.Lock()
+        self._keyed_lifecycle_hosts: dict[str, tuple[object, str]] = {}
+        self._keyed_lifecycle_lock = threading.Lock()
         self._context_engine = None  # Set by a plugin via register_context_engine()
         # Manager-local registries keyed by name (see the matching ``PluginContext.register_*``):
         # plugins, hooks, middleware, CLI + slash commands, prompt sections, skills (qualified name ->
@@ -1213,6 +1245,9 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
+        # Stable wrappers preserve timeout suppression and retire a delayed observer on unload.
+        self._tui_hook_wrappers: Dict[tuple[str, int], tuple[Callable, Callable, object]] = {}
+        self._tui_hook_wrapper_lock = threading.Lock()
         # (hook_name, id(cb), repr(exc)) already reported at WARNING; identical repeats go to DEBUG.
         self._hook_failures_reported: set = set()
         # Ledger per plugin (ownership) plus global order (reverse teardown across plugins). Process-
@@ -1237,44 +1272,6 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # and contributed tool names (so `hermes plugins list` still attributes them).
         self._predeclared_modules: Dict[str, types.ModuleType] = {}
         self._predeclared_tools: Dict[str, List[str]] = {}
-
-    @property
-    def has_gateway_message_injector(self) -> bool:
-        """Return whether a live gateway can accept plugin-triggered turns."""
-        return self._gateway_message_injector is not None
-
-    def set_gateway_message_injector(self, owner: object, injector: Callable[..., bool]) -> None:
-        """Publish a live gateway injector and its lifecycle owner."""
-        self._gateway_message_injector = (owner, injector)
-
-    def clear_gateway_message_injector(self, owner: object) -> None:
-        """Clear the injector only when it still belongs to ``owner``."""
-        if self._gateway_message_injector is not None and self._gateway_message_injector[0] is owner:
-            self._gateway_message_injector = None
-
-    def inject_gateway_message(self, **kwargs: Any) -> bool:
-        """Submit a plugin-triggered turn to the live gateway."""
-        registered = self._gateway_message_injector
-        return registered is not None and bool(registered[1](**kwargs))
-
-    @property
-    def has_tui_message_injector(self) -> bool:
-        """Return whether a live Ink TUI / desktop host can accept plugin-triggered turns."""
-        return self._tui_message_injector is not None
-
-    def set_tui_message_injector(self, owner: object, injector: Callable[..., bool]) -> None:
-        """Publish a live TUI/desktop injector. Does not touch the messaging-gateway slot."""
-        self._tui_message_injector = (owner, injector)
-
-    def clear_tui_message_injector(self, owner: object) -> None:
-        """Clear the TUI injector only when it still belongs to ``owner``."""
-        if self._tui_message_injector is not None and self._tui_message_injector[0] is owner:
-            self._tui_message_injector = None
-
-    def inject_tui_message(self, **kwargs: Any) -> bool:
-        """Submit a plugin-triggered turn to the live TUI/desktop host."""
-        registered = self._tui_message_injector
-        return registered is not None and bool(registered[1](**kwargs))
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found; ``force`` unloads first so config
@@ -1675,8 +1672,8 @@ def publish_tui_message_host(owner: object, injector: Callable[..., bool]) -> No
     global _published_tui_message_injector
     with _published_tui_host_lock:
         _published_tui_message_injector = (owner, injector)
-    for manager in _known_plugin_managers():
-        manager.set_tui_message_injector(owner, injector)
+        for manager in _known_plugin_managers():
+            manager.set_tui_message_injector(owner, injector)
 
 
 def clear_published_tui_message_host(owner: object) -> None:
@@ -1686,16 +1683,16 @@ def clear_published_tui_message_host(owner: object) -> None:
         if (_published_tui_message_injector is not None
                 and _published_tui_message_injector[0] is owner):
             _published_tui_message_injector = None
-    for manager in _known_plugin_managers():
-        manager.clear_tui_message_injector(owner)
+        for manager in _known_plugin_managers():
+            manager.clear_tui_message_injector(owner)
 
 
 def _attach_published_tui_host(manager: PluginManager) -> None:
     """Give a newly resolved manager the process TUI host, if one is installed and the slot is empty."""
     with _published_tui_host_lock:
         host = _published_tui_message_injector
-    if host is not None and manager._tui_message_injector is None:
-        manager._tui_message_injector = host
+        if host is not None and manager._tui_message_injector is None:
+            manager.set_tui_message_injector(*host)
 
 
 def get_plugin_manager() -> PluginManager:
@@ -1717,6 +1714,7 @@ def get_plugin_manager() -> PluginManager:
             _plugin_manager = manager
     _attach_published_gateway_host(manager)
     _attach_published_tui_host(manager)
+    attach_published_host_apis(manager)
     return manager
 
 
@@ -1739,6 +1737,7 @@ def _reset_plugin_managers_for_tests() -> None:
         _published_gateway_message_injector = None
     with _published_tui_host_lock:
         _published_tui_message_injector = None
+    reset_published_host_apis()
     # Dashboard-auth providers are persistent and survive a routine unload, so the clean-slate
     # reset must clear that process-global registry explicitly or a test's provider leaks.
     try:
