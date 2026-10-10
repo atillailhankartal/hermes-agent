@@ -109,8 +109,20 @@ def _settle_candidate(host, row):
         raise RuntimeError("CLI native candidate already consumed")
     from hermes_cli.trusted_inbound_broker import NativeCandidateSnapshot, TrustedInboundBrokerClient
     running = host.queue.lookup(row["profile"], row["epoch"], row["delivery"])
+    immutable_fields = ("sequence", "profile", "epoch", "delivery", "session_key", "native_id",
+                        "owner", "plugin", "content", "payload_digest", "candidate", "reason")
+    if running is None or any(running[field] != row[field] for field in immutable_fields):
+        raise RuntimeError("CLI native candidate changed")
+    claim = host.claim()
+    active = host.active_turn
+    if (claim is None or active is None or active[3:] != (host.native, host.epoch)
+            or (running["profile"], running["session_key"], running["native_id"],
+                running["epoch"], running["owner"]) !=
+               (host.profile, claim.session_key, claim.native_session_id,
+                claim.route_epoch, claim.host_owner_id)):
+        raise RuntimeError("CLI native candidate route changed")
     try:
-        snapshot = NativeCandidateSnapshot.from_running_row(running or {}, surface="cli", content=row["content"])
+        snapshot = NativeCandidateSnapshot.from_running_row(running, surface="cli", content=row["content"])
     except ValueError as exc:
         raise RuntimeError("CLI native candidate changed") from exc
     if snapshot.candidate_id != row["candidate"] or snapshot.host_owner_id != host.owner:

@@ -196,6 +196,35 @@ def test_forged_local_digest_never_reaches_broker_observer(shell, monkeypatch):
     assert not host.drain_one()
 
 
+def test_running_route_change_never_reaches_observer_or_local_admission(shell, monkeypatch):
+    from hermes_cli.trusted_inbound_broker import TrustedInboundBrokerClient
+
+    host, ctx = context(shell)
+    claim = host.claim()
+    assert deliver(ctx, claim).state == "unknown"
+    original_transition = host.queue.transition
+
+    def change_after_dispatch(candidate, expected, execution):
+        changed = original_transition(candidate, expected, execution)
+        if changed and (expected, execution) == ("dispatching", "running"):
+            with host.queue._connection() as db:
+                db.execute("UPDATE candidates SET session_key=?, native_id=? WHERE candidate=?",
+                           ("forged-key", "forged-native", candidate))
+        return changed
+
+    monkeypatch.setattr(host.queue, "transition", change_after_dispatch)
+    observed = []
+    monkeypatch.setattr(TrustedInboundBrokerClient, "observe_native_turn",
+                        lambda *args: observed.append(args))
+    model_calls = []
+    bind_real_agent_thread(shell, lambda **kwargs: model_calls.append(kwargs))
+    assert host.drain_one()
+    assert observed == model_calls == []
+    row = host.queue.lookup(host.profile, claim.route_epoch, "delivery")
+    assert row["state"] == "unknown" and row["execution"] == "handler_returned"
+    assert not host.drain_one()
+
+
 def test_slot_failure_never_settles_or_requeues(shell, monkeypatch):
     host, ctx = context(shell)
     claim = host.claim()
