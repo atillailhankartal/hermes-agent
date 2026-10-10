@@ -57,6 +57,7 @@ def _make_runner(session_db=None, current_session_id="current_session_001",
     mock_session_entry.session_key = session_key
     mock_store = MagicMock()
     mock_store.get_or_create_session.return_value = mock_session_entry
+    mock_store.lookup_by_session_key.return_value = mock_session_entry
     mock_store.load_transcript.return_value = []
     mock_store.switch_session.return_value = mock_session_entry
     runner.session_store = mock_store

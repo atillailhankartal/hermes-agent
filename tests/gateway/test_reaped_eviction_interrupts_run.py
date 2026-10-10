@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from unittest.mock import AsyncMock, Mock
 
 from gateway.run import (
     GatewayRunner,
@@ -54,7 +55,8 @@ def _build_gateway(agent, events: list[tuple]):
 
 
 @pytest.mark.parametrize("entrypoint", ("direct", "reaped"))
-def test_eviction_interrupts_before_release_and_drops_cached_agent(entrypoint: str) -> None:
+@pytest.mark.asyncio
+async def test_eviction_interrupts_before_release_and_drops_cached_agent(entrypoint: str) -> None:
     events: list[tuple] = []
     gateway = None
 
@@ -73,9 +75,9 @@ def test_eviction_interrupts_before_release_and_drops_cached_agent(entrypoint: s
     gateway._release_running_agent_state = release_with_record
     if entrypoint == "reaped":
         gateway.session_store = _ReapedStore()
-        gateway._hm_evict_reaped_agent(KEY)
+        await gateway._hm_evict_reaped_agent(KEY)
     else:
-        gateway._hm_evict_running_agent(KEY, "stale_running_agent_eviction")
+        await gateway._hm_evict_running_agent(KEY, "stale_running_agent_eviction")
 
     assert agent.interrupted
     assert events[0] == ("interrupt", _INTERRUPT_REASON_EVICTED, True)
@@ -87,12 +89,41 @@ def test_eviction_interrupts_before_release_and_drops_cached_agent(entrypoint: s
     assert _is_control_interrupt_message(_INTERRUPT_REASON_EVICTED)
 
 
+@pytest.mark.asyncio
+async def test_inbound_reaped_slot_eviction_reaches_cold_dispatch() -> None:
+    events: list[tuple] = []
+    gateway = None
+
+    def current_agent():
+        state = gateway._peek_session_state(KEY)
+        return state.turn.agent if state else None
+
+    agent = _RecordingAgent(events, current_agent)
+    gateway, _state = _build_gateway(agent, events)
+    gateway.session_store = _ReapedStore()
+    event = object()
+    source = object()
+    gateway._hm_admit_event = AsyncMock(return_value=(event, source, True))
+    gateway._hm_estop_gate = Mock(return_value=None)
+    gateway._session_key_for_source = Mock(return_value=KEY)
+    gateway._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    gateway._hm_dispatch_idle_commands = AsyncMock(return_value=(True, "cold dispatch"))
+    gateway._hm_handle_running_session_message = AsyncMock(return_value="busy")
+
+    assert await gateway._handle_message(event) == "cold dispatch"
+    assert events[0] == ("interrupt", _INTERRUPT_REASON_EVICTED, True)
+    assert gateway._peek_session_state(KEY).turn.agent is None
+    gateway._hm_handle_running_session_message.assert_not_awaited()
+    gateway._hm_dispatch_idle_commands.assert_awaited_once()
+
+
 @pytest.mark.parametrize("agent", (None, _AGENT_PENDING_SENTINEL, _RaisingAgent()))
-def test_eviction_cleanup_survives_empty_pending_or_failed_interrupt(agent) -> None:
+@pytest.mark.asyncio
+async def test_eviction_cleanup_survives_empty_pending_or_failed_interrupt(agent) -> None:
     events: list[tuple] = []
     gateway, state = _build_gateway(agent, events)
 
-    gateway._hm_evict_running_agent(KEY, "reaped_session_eviction")
+    await gateway._hm_evict_running_agent(KEY, "reaped_session_eviction")
 
     assert state.turn.agent is None
     assert KEY not in gateway._agent_cache

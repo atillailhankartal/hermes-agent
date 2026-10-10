@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 import contextlib
+import threading
 
 from .method_ctx import bind_module
 
@@ -118,23 +119,72 @@ def _install_borrowed_lease(sid: str, session: dict, frame: dict) -> None:
         surface=str(frame.get("source") or "desktop"), enabled=False)
 
 
-def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
+def _ensure_active_session_slot(sid: str, session: dict, *, created_leases: list | None = None) -> str | None:
     """Claim this session's cap slot on its first real turn; None when ok. session.create/resume deliberately
     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
     that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible. An
-    inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream."""
-    if session.get("active_session_lease") is not None:
-        return None
-    key = str(session.get("session_key") or "")
-    lease, limit_message = _claim_active_session_slot(
-        key, live_session_id=sid, surface=_session_source(session), profile_home=session.get("profile_home"))
-    if limit_message is None:
-        _attach_lease(session, lease)
-        return None
+    inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream.
+
+    All TUI claimants share this per-session lock. `created_leases`, when supplied,
+    receives only the exact registry lease created and attached by this call; an
+    observed pre-existing lease is never reported as this caller's acquisition.
+    """
+    claim_lock = session.setdefault("_active_session_slot_claim_lock", threading.Lock())
+    with claim_lock:
+        if session.get("active_session_lease") is not None:
+            return None
+        key = str(session.get("session_key") or "")
+        lease, limit_message = _claim_active_session_slot(
+            key, live_session_id=sid, surface=_session_source(session), profile_home=session.get("profile_home"))
+        if limit_message is None:
+            _attach_lease(session, lease)
+            if created_leases is not None:
+                created_leases.append(lease)
+            return None
+    # Detached-runtime takeover can interrupt an old turn. That callback must
+    # run after the short claim lock is released.
     from hermes_cli.active_sessions import SESSION_NOT_OWNED
     if getattr(limit_message, "reason", None) == SESSION_NOT_OWNED and _take_over_detached_runtime_lease(sid, session, key):
         return None
     return limit_message
+
+
+def _prove_active_session_slot(sid: str, session: dict) -> str | None:
+    """Reserve or verify the stored route before an off-turn operation mutates its history."""
+    if (refusal := _ensure_active_session_slot(sid, session)) is not None:
+        return str(refusal)
+    lease = session.get("active_session_lease")
+    key = str(session.get("session_key") or "")
+    if (not key or lease is None or getattr(lease, "released", False)
+            or str(getattr(lease, "session_id", "")) != key):
+        return _SESSION_OWNERSHIP_UNAVAILABLE
+    from pathlib import Path
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+    from hermes_constants import get_hermes_home
+
+    home = Path(session.get("profile_home") or get_hermes_home())
+    if getattr(lease, "enabled", False):
+        pinned = getattr(lease, "state_path", None)
+        if pinned is None or Path(pinned).resolve() != (home / "runtime" / "active_sessions.json").resolve():
+            return _SESSION_OWNERSHIP_UNAVAILABLE
+        lease_id = str(lease.lease_id)
+    else:
+        # Compute-host children borrow a parent token; the token alone is inert. Its parent row
+        # must still be live in this profile before the child may mutate history off-turn.
+        lease_id = str(lease.lease_id).removeprefix("borrowed:")
+        if lease_id == str(lease.lease_id):
+            return _SESSION_OWNERSHIP_UNAVAILABLE
+    try:
+        rows = active_session_registry_snapshot(home, strict=True)
+    except Exception:
+        logger.warning("Could not verify active session slot for sid=%s", sid, exc_info=True)
+        return _SESSION_OWNERSHIP_UNAVAILABLE
+    if not any(str(row.get("lease_id") or "") == lease_id
+               and str(row.get("session_id") or "") == key
+               and str((row.get("metadata") or {}).get("live_session_id") or "") == sid
+               for row in rows):
+        return _SESSION_OWNERSHIP_UNAVAILABLE
+    return None
 
 
 def _attach_lease(session: dict, lease) -> None:
@@ -278,11 +328,12 @@ def _other_runtime_lease_guard(session_id: str, session: dict):
 
 
 def _transfer_active_session_slot(sid: str, session: dict, *, new_session_id: str) -> bool:
-    if not new_session_id:
+    if not new_session_id or not session.get("session_key"):
         return False
     lease = session.get("active_session_lease")
-    if lease is None:
-        return True
+    if (lease is None or getattr(lease, "released", False)
+            or str(getattr(lease, "session_id", "")) != str(session.get("session_key") or "")):
+        return False
     try:
         from hermes_cli.active_sessions import transfer_active_session
         if transfer_active_session(lease, session_id=new_session_id, metadata=_lease_metadata(sid)):

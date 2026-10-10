@@ -196,6 +196,7 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
 
 def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):
     calls = []
+    leases = []
 
     import cli as cli_mod
 
@@ -226,6 +227,13 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
 
         def _claim_active_session(self, surface, *, stderr=False):
             calls.append(("claim", surface, stderr))
+            if not getattr(self, "_active_session_lease", None):
+                from hermes_cli.active_sessions import try_acquire_active_session
+                self._active_session_lease, error = try_acquire_active_session(
+                    session_id=self.session_id, surface=surface, config={},
+                    metadata={"live_session_id": self.session_id})
+                assert self._active_session_lease is not None, error
+                leases.append(self._active_session_lease)
             return True
 
         def _ensure_runtime_credentials(self):
@@ -258,6 +266,8 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     with pytest.raises(SystemExit) as exc_info:
         cli_mod.main(query="hello", quiet=True, toolsets="terminal")
 
+    for lease in leases:
+        lease.release()
     assert exc_info.value.code == 1
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls

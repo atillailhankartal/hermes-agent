@@ -15,6 +15,7 @@ import sys
 from agent.i18n import t
 from hermes_constants import get_hermes_home
 from hermes_state_ids import new_session_id
+from hermes_cli.cli_plugin_turn import cli_route_transition
 from pathlib import Path
 from rich.console import Console
 from rich.markup import escape as _escape
@@ -484,6 +485,7 @@ class CLISessionMixin:
             return None
         return history_snapshot
 
+    @cli_route_transition
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
         from cli import (
@@ -889,6 +891,7 @@ class CLISessionMixin:
             state = f"{_Colors.BOLD}{_Colors.RED}{t('cli.shared.label_off_upper')}{_Colors.RESET}"
             _cprint(f"  {t('cli.session.yolo_off', state=state)}")
 
+    @cli_route_transition
     def _manual_compress(self, cmd_original: str = ""):
         """Manually trigger context compression.
 

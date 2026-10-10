@@ -9,7 +9,7 @@ import json
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Dict, List, Optional, Any
 
 from .config import Platform, GatewayConfig, HomeChannel
@@ -20,6 +20,7 @@ from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pi
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
+from gateway.route_claim import new_route_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -540,6 +541,14 @@ class SessionEntry:
     # Gateway ``/yolo`` bypass for this lane, mirrored from ``tools.approval``'s in-memory set so a restart
     # keeps it; cleared with it at every conversation boundary (``_clear_session_boundary_security_state``).
     yolo: bool = False
+    # Opaque durable route publication generation. Native IDs can repeat after /resume.
+    route_epoch: Optional[str] = field(default_factory=new_route_epoch)
+    # A store-level compression heal has no proof that the active turn lease followed the child.
+    # Such routes stay closed to Bee until an explicitly leased publication replaces them.
+    route_claim_blocked: bool = False
+    # Generic repoints can reopen only after a later exact durable readback and held native lease.
+    # Compression heals lack a proven parent→child transfer and are never auto-recoverable.
+    route_claim_recoverable: bool = False
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -560,6 +569,8 @@ class SessionEntry:
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type, "metadata": self.metadata,
+            "route_epoch": self.route_epoch, "route_claim_blocked": self.route_claim_blocked,
+            "route_claim_recoverable": self.route_claim_recoverable,
         }
         result.update((name, getattr(self, name)) for name in self._PLAIN_FIELDS)
         result["last_resume_marked_at"] = _iso(self.last_resume_marked_at)
@@ -617,6 +628,9 @@ class SessionEntry:
             model_override=sanitize_model_override(data.get("model_override")),
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
+            route_epoch=data.get("route_epoch") if isinstance(data.get("route_epoch"), str) and data.get("route_epoch") else None,
+            route_claim_blocked=data.get("route_claim_blocked") is True,
+            route_claim_recoverable=data.get("route_claim_recoverable") is True,
             **plain,
         )
 
@@ -796,6 +810,14 @@ class SessionStore(
         self._routing_db_loaded = False
         self._routing_fallback_baseline: Optional[dict[str, Any]] = None
         self._lock = threading.Lock()  # guards _entries / _loaded only
+        # Process-local issuer proof complements the durable epoch: an old process cannot issue
+        # a claim for a new boot even if its copied routing data names the same native session.
+        self._route_owner_id = new_route_epoch()
+        self._route_claim_proof = object()
+        self._route_owner_retired = False
+        # Process-local continuations of a published compression route. A copied tool scope
+        # may follow only these exact epochs; /new and /resume mint unrelated epochs.
+        self._route_compression_lineage: dict[tuple[str, str, str], tuple[str, str]] = {}
         self._save_lock = threading.Lock()  # whole-index persistence, never held with _lock
         # Fast (single-entry) and full saves share one generation counter so they are totally
         # ordered; _fast_persisted_entries: key -> (revision, entry_json) since the last rewrite.
@@ -854,6 +876,10 @@ class SessionStore(
         except Exception:
             self._routing_home = None
         self._open_session_db_for_active_scope()
+
+    def retire_route_owner(self) -> None:
+        """Revoke this process's claims at shutdown without waiting on a route-store write."""
+        self._route_owner_retired = True
 
     def _lazy(self, name: str, factory):
         """``self.<name>``, created via *factory* when missing/None (suites build bare stores via
@@ -1032,8 +1058,14 @@ class SessionStore(
             return
         self._reopen_session_row(session_key, recovered.session_id)
         with self._lock:
-            decision.entry = self._entries.setdefault(session_key, recovered)
-        decision.needs_save = True
+            current = self._entries.get(session_key)
+            if current is None:
+                data, generation = self._snapshot_routing_locked()
+                data[session_key] = recovered.to_dict()
+                self._persist_routing_data(data, generation)
+                self._entries[session_key] = current = recovered
+        decision.entry = current
+        decision.needs_save = False
 
     def _route_create(
         self, decision: _RouteDecision, session_key: str, source: SessionSource, now: datetime,
@@ -1052,9 +1084,12 @@ class SessionStore(
         with self._lock:
             current = self._entries.get(session_key)
             if current is None or (force_new and current is observed):
+                data, generation = self._snapshot_routing_locked()
+                data[session_key] = candidate.to_dict()
+                self._persist_routing_data(data, generation)
                 self._entries[session_key] = current = candidate
         decision.entry = current
-        decision.needs_save = True
+        decision.needs_save = False
         if current is not candidate:
             return None
         return self._session_create_kwargs(
@@ -1156,15 +1191,106 @@ class SessionStore(
         )
         return new_entry
 
+    def reconcile_failed_reset(self, session_key: str, old_session_id: str) -> Optional[SessionEntry]:
+        """Adopt a reset only when its new route is proven by the authoritative routing index.
+
+        A writer can commit the routing row and then report an error before publishing its
+        in-memory candidate. Called after that writer has drained, while Gateway holds the
+        per-key route gate. An unproven result leaves the already-revoked route closed.
+        """
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if current is None or (current.session_id != old_session_id and not current.is_fresh_reset):
+                return None
+            try:
+                loader = self._routing_db_method("load_gateway_routing_entries")
+                if loader is not None:
+                    raw = loader(scope=self._routing_scope()).get(session_key)
+                    durable_data = json.loads(raw) if raw else None
+                else:
+                    durable_data = json.loads(
+                        (self.sessions_dir / "sessions.json").read_text(encoding="utf-8-sig")
+                    ).get(session_key)
+                durable = SessionEntry.from_dict(durable_data) if isinstance(durable_data, dict) else None
+            except Exception:
+                logger.warning("Gateway reset route readback failed for %s", session_key, exc_info=True)
+                return None
+            if (durable is None or durable.session_key != session_key
+                    or durable.session_id == old_session_id or not durable.is_fresh_reset
+                    or not durable.route_epoch or durable.route_claim_blocked
+                    or durable.origin != current.origin
+                    or current.session_id not in (old_session_id, durable.session_id)
+                    or (current.session_id == old_session_id and not current.route_claim_blocked)
+                    or (current.session_id == durable.session_id
+                        and current.route_epoch != durable.route_epoch)):
+                return None
+            self._entries[session_key] = durable
+            return replace(durable)
+
+    def reconcile_failed_switch(
+        self, session_key: str, old_session_id: str, old_route_epoch: Optional[str],
+        target_session_id: str,
+    ) -> Optional[SessionEntry]:
+        """Resolve an ambiguous /resume write from the authoritative routing index.
+
+        A route write may commit before its worker reports an error. The caller holds the
+        per-key route gate after draining that worker. Adopt only the exact target with a
+        fresh epoch and the boundary's cleared model pin; close the live route if storage
+        cannot prove either the old route or that committed target.
+        """
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if current is None:
+                return None
+            if current.session_id not in (old_session_id, target_session_id):
+                current.route_claim_blocked = True
+                current.route_claim_recoverable = False
+                return None
+            try:
+                loader = self._routing_db_method("load_gateway_routing_entries")
+                if loader is not None:
+                    raw = loader(scope=self._routing_scope()).get(session_key)
+                    durable_data = json.loads(raw) if raw else None
+                else:
+                    durable_data = json.loads(
+                        (self.sessions_dir / "sessions.json").read_text(encoding="utf-8-sig")
+                    ).get(session_key)
+                durable = SessionEntry.from_dict(durable_data) if isinstance(durable_data, dict) else None
+            except Exception:
+                logger.warning("Gateway resume route readback failed for %s", session_key, exc_info=True)
+                durable = None
+
+            if (durable is not None and durable.session_key == session_key
+                    and durable.origin == current.origin):
+                if (durable.session_id == target_session_id and durable.route_epoch
+                        and durable.route_epoch != old_route_epoch
+                        and durable.model_override is None and not durable.route_claim_blocked
+                        and current.session_id in (old_session_id, target_session_id)
+                        and (current.session_id != target_session_id
+                             or current.route_epoch == durable.route_epoch)):
+                    self._entries[session_key] = durable
+                    return replace(durable)
+                if (durable.session_id == old_session_id
+                        and durable.route_epoch == old_route_epoch
+                        and current.session_id == old_session_id
+                        and current.route_epoch == old_route_epoch):
+                    return None  # The old route is durably unchanged; the switch failed.
+
+            current.route_claim_blocked = True
+            current.route_claim_recoverable = False
+            return None
+
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
-        """Publish a fresh entry (inheriting origin/platform/chat_type) and save. Lock held."""
+        """Persist a fresh route and epoch before publishing either in memory. Lock held."""
         new_entry = SessionEntry(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=old_entry.origin, platform=old_entry.platform, chat_type=old_entry.chat_type,
             transport_profile=old_entry.transport_profile, **fields,
         )
+        data, generation = self._snapshot_routing_locked()
+        data[session_key] = new_entry.to_dict()
+        self._persist_routing_data(data, generation)
         self._entries[session_key] = new_entry
-        self._save()
         return new_entry
 
     def rekey_profile_routing(self, old_name: str, new_name: str) -> int:
@@ -1245,7 +1371,8 @@ class SessionStore(
     # restart-resume freshness gate (#85709).
     def switch_session(
         self, session_key: str, target_session_id: str, *, expected_session_id: Optional[str] = None,
-        preserve_prompt_pin: bool = True,
+        preserve_prompt_pin: bool = True, preserve_model_override: bool = True,
+        route_claim_blocked: bool = True,
     ) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
         reopens the target so resume matches the CLI.
@@ -1253,8 +1380,9 @@ class SessionStore(
         ``expected_session_id`` makes the repoint a compare-and-swap: ``None`` is returned when
         the key no longer points at that session, so a caller that resolved against a snapshot
         across an await (async-delegation re-pin) cannot overwrite a concurrent /new or /resume.
-        Prompt pins follow non-boundary repoints by default; /resume opts out explicitly because it
-        starts a different conversation on the same routing key.
+        Prompt and model pins follow non-boundary repoints by default; /resume opts out explicitly
+        because it starts a different conversation on the same routing key. Clearing the model pin
+        in this same routing write prevents a delayed boundary from clearing a successor's pin.
         """
         with self._lock:
             old_entry = self._entry_locked(session_key)
@@ -1270,8 +1398,11 @@ class SessionStore(
                 return old_entry
             new_entry = self._replace_route_locked(
                 session_key, old_entry, target_session_id, _now(),
-                display_name=old_entry.display_name, model_override=old_entry.model_override,
+                display_name=old_entry.display_name,
+                model_override=old_entry.model_override if preserve_model_override else None,
                 yolo=old_entry.yolo,
+                route_claim_blocked=route_claim_blocked,
+                route_claim_recoverable=route_claim_blocked,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
                     if preserve_prompt_pin and old_entry.prompt_pin is not None else None
@@ -1296,6 +1427,139 @@ class SessionStore(
                 transport_profile=new_entry.transport_profile,
             )
         return new_entry
+
+    def publish_compression_child_route(
+        self, session_key: str, expected_entry: SessionEntry, parent_session_id: str,
+        child_session_id: str, *, still_current=None,
+    ) -> bool:
+        parent_epoch = expected_entry.route_epoch
+        committed = super().publish_compression_child_route(
+            session_key, expected_entry, parent_session_id, child_session_id,
+            still_current=still_current,
+        )
+        if not committed:
+            return False
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if (current is expected_entry and parent_epoch and current.route_epoch
+                    and current.session_id == child_session_id
+                    and parent_session_id != child_session_id):
+                self._route_compression_lineage[
+                    (session_key, parent_session_id, parent_epoch)
+                ] = (child_session_id, current.route_epoch)
+                # Old scopes fail closed if a long-running host exceeds this bounded lineage.
+                if len(self._route_compression_lineage) > 512:
+                    self._route_compression_lineage.pop(next(iter(self._route_compression_lineage)))
+        return True
+
+    def _bound_gateway_tool_epoch(
+        self, session_key: str, initial_session_id: str, initial_epoch: str,
+        native_session_id: str,
+    ) -> Optional[str]:
+        """Resolve only a live, durably published compression descendant of a scope epoch."""
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if current is None:
+                return None
+            node = (initial_session_id, initial_epoch)
+            for _ in range(513):
+                if node == (current.session_id, current.route_epoch):
+                    return node[1] if native_session_id == node[0] else None
+                successor = self._route_compression_lineage.get((session_key, *node))
+                if successor is None:
+                    return None
+                node = successor
+            return None
+
+    def _reopen_route_claim_with_lease(
+        self, session_key: str, native_session_id: str, token, *,
+        expected_route_epoch: Optional[str] = None,
+    ) -> bool:
+        """Mint or reopen with the exact lease and optional scope epoch under one lock."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if (entry is None or entry.session_id != native_session_id
+                    or (expected_route_epoch is not None
+                        and entry.route_epoch != expected_route_epoch)
+                    or token is None or token.released or token.lease.holder is not token
+                    or token.owner_key != session_key or token.session_id != native_session_id):
+                return False
+            if not entry.route_epoch:
+                # Pre-epoch routing rows may issue a first proof only after this turn owns their
+                # native session. Persist the epoch before publishing it in memory or returning a
+                # claim; a blocked repoint cannot be made recoverable by this migration.
+                if entry.route_claim_blocked or self._route_owner_retired:
+                    return False
+                candidate = entry.to_dict()
+                candidate["route_epoch"] = new_route_epoch()
+                try:
+                    self._save_entry(session_key, entry_data=candidate, lock_held=True)
+                except Exception:
+                    logger.warning("Gateway legacy route epoch save failed for %s", session_key, exc_info=True)
+                    return False
+                entry.route_epoch = candidate["route_epoch"]
+                if token.released or token.lease.holder is not token:
+                    return False
+            if not entry.route_claim_blocked:
+                return True
+            if not entry.route_claim_recoverable:
+                return False
+            try:
+                loader = self._routing_db_method("load_gateway_routing_entries")
+                if loader is not None:
+                    raw = loader(scope=self._routing_scope()).get(session_key)
+                    durable = json.loads(raw) if raw else None
+                else:
+                    durable = json.loads((self.sessions_dir / "sessions.json").read_text(encoding="utf-8-sig")).get(session_key)
+            except (OSError, ValueError, TypeError, KeyError):
+                logger.warning("Gateway route readback failed for %s", session_key, exc_info=True)
+                return False
+            if (not isinstance(durable, dict) or durable.get("session_id") != native_session_id
+                    or durable.get("route_epoch") != entry.route_epoch
+                    or durable.get("route_claim_blocked") is not True
+                    or durable.get("route_claim_recoverable") is not True):
+                return False
+            candidate = entry.to_dict()
+            candidate["route_claim_blocked"] = False
+            candidate["route_claim_recoverable"] = False
+            try:
+                self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            except OSError:
+                logger.warning("Gateway route reopen save failed for %s", session_key, exc_info=True)
+                return False
+            if token.released or token.lease.holder is not token:
+                # The durable reopen is harmless without an issued proof; the next turn must
+                # independently acquire its own lease before it can issue one.
+                entry.route_claim_blocked = False
+                entry.route_claim_recoverable = False
+                return False
+            entry.route_claim_blocked = False
+            entry.route_claim_recoverable = False
+            return True
+
+    def revoke_route_claim(self, session_key: str) -> bool:
+        """Fence old proofs for /new, /stop or eviction before releasing route admission."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return True
+            candidate = entry.to_dict()
+            recoverable = not entry.route_claim_blocked or entry.route_claim_recoverable
+            candidate.update(route_epoch=new_route_epoch(), route_claim_blocked=True,
+                             route_claim_recoverable=recoverable)
+            try:
+                self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            except Exception:
+                # The old process must reject the old proof even if durable storage failed.
+                # A restarted process has a different owner proof and cannot reuse it.
+                entry.route_claim_blocked = True
+                entry.route_claim_recoverable = False
+                logger.warning("Gateway route revocation save failed for %s", session_key, exc_info=True)
+                return False
+            entry.route_epoch = candidate["route_epoch"]
+            entry.route_claim_blocked = True
+            entry.route_claim_recoverable = recoverable
+            return True
 
     def list_sessions(self, active_minutes: Optional[int] = None) -> list[SessionEntry]:
         """List all sessions, optionally filtered by activity."""
@@ -1322,6 +1586,14 @@ class SessionStore(
             return None
         with self._lock:
             return self._entry_locked(session_key)
+
+    def snapshot_route_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Copy a route's immutable identity while the routing lock is held."""
+        if not session_key:
+            return None
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return replace(entry) if entry is not None else None
 
     def peek_session_id(self, session_key: str) -> Optional[str]:
         """Lock-held accessor for the key -> session_id mapping (None if unknown)."""

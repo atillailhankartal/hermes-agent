@@ -28,9 +28,9 @@ from gateway.slash_commands_status import history_unreadable
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
 
-# Bound on the off-loop agent cleanup during /new; past it the reset proceeds and the teardown
-# finishes (or leaks) in its worker thread rather than blocking the event loop.
+# Bound on the off-loop old-agent cleanup after /new has durably published its new route.
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+_RESET_AGENT_UNSET = object()
 # chat_type values whose session key is per-user (DM-like), incl. the unknown/blank case.
 _DM_CHAT_TYPES = {"dm", "direct", "private", ""}
 
@@ -117,12 +117,12 @@ class GatewaySessionCommandsMixin:
 
     # ------------------------------------------------------------------ /new, /reset
 
-    async def _cleanup_old_agent_for_reset(self, session_key: str) -> None:
-        """Close the old agent's tool resources (sandboxes, browsers, subprocesses) before eviction.
+    async def _cleanup_old_agent_for_reset(self, session_key: str, old_agent=_RESET_AGENT_UNSET) -> None:
+        """Close the captured old agent's tool resources (sandboxes, browsers, subprocesses).
         Blocking work on the event loop (confirm-button click) → offloaded with a bounded timeout.
         wait_for cancels the await, not the worker thread: a wedged teardown keeps running (or
         leaks); the reset proceeds either way."""
-        _old_agent = self._cached_agent_for(session_key)
+        _old_agent = self._cached_agent_for(session_key) if old_agent is _RESET_AGENT_UNSET else old_agent
         if _old_agent is None:
             return
         try:
@@ -139,62 +139,123 @@ class GatewaySessionCommandsMixin:
                 "Agent resource cleanup for session %s failed during /new reset: %s (#35994)",
                 session_key, cleanup_exc)
 
-    async def _fire_session_reset_hooks(self, source: SessionSource, session_key: str, old_sid,
-                                        new_sid) -> None:
+    async def _fire_session_reset_hooks(self, source: SessionSource, session_key: str, old_entry,
+                                        new_entry) -> None:
         """Session-boundary hooks: plugin finalize (off-loop + bounded — trace exports can block
         arbitrarily), then session:end and session:reset."""
+        from gateway.route_lifecycle import emit_route_lifecycle, route_lifecycle_payload
+
         platform_value = source.platform.value if source.platform else ""
-        with contextlib.suppress(Exception):
+        old_sid = old_entry.session_id if old_entry else None
+        new_sid = new_entry.session_id if new_entry else None
+        if old_entry is not None:
+            old_route = route_lifecycle_payload(self, old_entry, source)
             messages = await self._finalize_session_off_loop(
-                session_id=old_sid, platform=platform_value, reason="new_session",
-                old_session_id=old_sid, new_session_id=new_sid)
-            await self._deliver_session_end_messages(messages, source=source, session_key=session_key)
+                session_id=old_sid, platform=platform_value, reason="new_session", session_key=session_key,
+                old_session_id=old_sid, new_session_id=new_sid,
+                route_epoch=old_route["route_epoch"], host_owner_id=old_route["host_owner_id"],
+                profile_home_key=old_route["profile_home_key"], native_session_id=old_sid,
+                route_is_current=old_route["route_is_current"], surface="gateway",
+            )
+            with contextlib.suppress(Exception):
+                await self._deliver_session_end_messages(messages, source=source, session_key=session_key)
         hook_payload = {"platform": platform_value, "user_id": source.user_id, "session_key": session_key}
         await self.hooks.emit("session:end", dict(hook_payload))
         await self.hooks.emit("session:reset", dict(hook_payload))
+        if new_entry is not None:
+            new_route = route_lifecycle_payload(self, new_entry, source)
+            await emit_route_lifecycle(self, "on_session_reset", {
+                **new_route, "reason": "new_session", "old_session_id": old_sid,
+                "old_route_epoch": old_entry.route_epoch if old_entry else None,
+                "new_session_id": new_sid, "user_id": source.user_id,
+            })
 
     async def _handle_reset_command(self, event: MessageEvent) -> str | EphemeralReply:
         """Handle /new or /reset command."""
         source = event.source
         session_key = self._session_key_for_source(source)
-        self._invalidate_session_run_generation(session_key, reason="session_reset")
-        # Evict the running-agent slot now that the generation is bumped: the in-flight run's own
-        # guarded release (old generation) returns False and would leave a zombie slot that silently
-        # drops all later messages. Idempotent, so the run's finally calling it again is harmless.
-        self._release_running_agent_state(session_key)
-        # Snapshot the old entry so on_session_finalize can report the expiring session id.
-        # Evict the running-agent slot now that the generation is bumped. The in-flight run's own guarded
-        # release (run_generation=old) will return False and leave its dead agent behind; clearing here
-        # keeps the slot from becoming a zombie that silently drops all later messages (#28686). Idempotent,
-        # so the run's finally calling it again is harmless.
-        old_entry = self.session_store._entries.get(session_key)
-        await self._cleanup_old_agent_for_reset(session_key)
-        self._evict_cached_agent(session_key)
-        # Conversation boundary: ALL conversation-scoped per-session state + security state in one
-        # funnel call (see _CONVERSATION_SCOPED_STATE in gateway/run.py).
-        self._clear_conversation_scope(session_key, reason="session_reset")
-        # In-flight async delegations end WITH the conversation: once the id rotates their
-        # completions have no live owner. Expire by durable id, routing key as legacy fallback.
-        with contextlib.suppress(Exception):
-            from tools.async_delegation import interrupt_for_session
-            interrupt_for_session(session_key=session_key, reason="session_reset",
-                                  parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
-        _reset_process_scoped_tool_state()
+        # Keep the old identity, durable reset, and conversation boundary in one admission
+        # interval. /resume must see either the old route or the fully published new route.
+        cancelled = False
+        async with self._session_route_gate(session_key):
+            old_entry = await self.async_session_store.snapshot_route_entry(session_key)
+            old_agent = self._cached_agent_for(session_key)
+            self._invalidate_session_run_generation(session_key, reason="session_reset")
+            try:
+                try:
+                    await self._revoke_route_claim_async(session_key)
+                except asyncio.CancelledError:
+                    cancelled = True
+                try:
+                    new_entry, write_cancelled = await self._drain_reset_boundary_operation(
+                        self.async_session_store.reset_session(session_key))
+                    cancelled |= write_cancelled
+                except Exception:
+                    # The writer has finished, but its completion may have been lost after the
+                    # durable routing commit. Only exact authoritative readback can publish it.
+                    cancelled |= bool(asyncio.current_task().cancelling())
+                    new_entry, read_cancelled = await self._drain_reset_boundary_operation(
+                        self.async_session_store.reconcile_failed_reset(
+                            session_key, old_entry.session_id if old_entry else ""))
+                    cancelled |= read_cancelled
+                    if new_entry is None:
+                        raise
+                    logger.warning("Gateway reset writer reported an error after durable route commit for %s",
+                                   session_key, exc_info=True)
+                was_reset = new_entry is not None
+                if new_entry is None:
+                    new_entry, write_cancelled = await self._drain_reset_boundary_operation(
+                        self.async_session_store.get_or_create_session(source, force_new=True))
+                    cancelled |= write_cancelled
+            except BaseException:
+                # A failed boundary cannot leave the displaced turn's slot pinning this key.
+                self._release_running_agent_state(session_key)
+                self._evict_cached_agent(session_key)
+                raise
+            # Clear the displaced turn and conversation before a successor can enter. Keep the
+            # old agent object for bounded resource cleanup after the route gate is released.
+            self._release_running_agent_state(session_key)
+            detached_agent = self._evict_cached_agent(session_key, defer_release=True)
+            self._clear_conversation_scope(session_key, reason="session_reset")
+            with contextlib.suppress(Exception):
+                from tools.async_delegation import interrupt_for_session
+                interrupt_for_session(session_key=session_key, reason="session_reset",
+                                      parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
+            _reset_process_scoped_tool_state()
 
-        new_entry = await self.async_session_store.reset_session(session_key)
-        _old_sid = old_entry.session_id if old_entry else None
-        await self._fire_session_reset_hooks(source, session_key, _old_sid,
-                                             new_entry.session_id if new_entry else None)
+        try:
+            _, cleanup_cancelled = await self._drain_reset_boundary_operation(
+                self._cleanup_old_agent_for_reset(session_key, old_agent))
+            cancelled |= cleanup_cancelled
+        except Exception:
+            logger.warning("Agent resource cleanup for %s failed after /new publication", session_key,
+                           exc_info=True)
+        finally:
+            if detached_agent is old_agent and old_agent is not None:
+                try:
+                    self._spawn_release_thread(
+                        self._release_evicted_agent_soft, (old_agent,),
+                        f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
+                        session_key=session_key,
+                    )
+                except Exception:
+                    logger.warning("Old agent client release failed after /new for %s", session_key,
+                                   exc_info=True)
+
+        _, hook_cancelled = await self._drain_reset_boundary_operation(
+            self._fire_session_reset_hooks(source, session_key, old_entry, new_entry))
+        cancelled |= hook_cancelled
+        if cancelled:
+            raise asyncio.CancelledError
         # Scoped to the profile serving this source so a multiplexed /new banner reports the
         # profile's model, not the base config's.
         try:
             session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
         except Exception:
             session_info = ""
-        if new_entry:
+        if was_reset:
             default_header = t("gateway.reset.header_default")
         else:  # no existing session: create one
-            new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
             default_header = t("gateway.reset.header_new")
         header = await asyncio.to_thread(self._telegram_topic_new_header, source) or default_header
         _title_arg = event.get_command_args().strip()
@@ -208,14 +269,6 @@ class GatewaySessionCommandsMixin:
             except Exception:
                 logger.debug("Failed to rebind Telegram topic after /new", exc_info=True)
         _new_sid = new_entry.session_id if new_entry else None
-        # Plugin on_session_reset hook (new session guaranteed to exist); best-effort.
-        try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _invoke_hook("on_session_reset", session_id=_new_sid, reason="new_session",
-                         platform=source.platform.value if source.platform else "",
-                         old_session_id=_old_sid, new_session_id=_new_sid)
-        except Exception:
-            pass
         try:
             from hermes_cli.tips import get_random_tip
             _tip_line = t("gateway.reset.tip", tip=get_random_tip())
@@ -223,6 +276,18 @@ class GatewaySessionCommandsMixin:
             _tip_line = ""
         body = f"{header}\n\n{session_info}" if session_info else header
         return EphemeralReply(f"{body}{_tip_line}")
+
+    @staticmethod
+    async def _drain_reset_boundary_operation(operation):
+        """Finish a route write or boundary callback after caller cancellation."""
+        task = asyncio.create_task(operation)
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        return task.result(), cancelled
 
     async def _reset_titled_header(self, header: str, session_id: str, title_arg: str) -> str:
         """``/new <title>``: titled header on success, else the header plus a rejection note."""
@@ -546,9 +611,6 @@ class GatewaySessionCommandsMixin:
             return await self._compress_codex_app_server_session(session_key, session_entry.session_id)
         if not runtime_kwargs.get("api_key"):
             return t("gateway.compress.no_provider")
-        # FULL transcript (tool results included), like auto-compress: user/assistant-only starves
-        # tool-result pruning and can trip the protect-first/last early-return.
-        msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
         # Assign, not setdefault (a resolver value would be a stale placeholder); platform only when
         # known so None -> "cli" holds.
         if platform_key is not None:
@@ -558,26 +620,60 @@ class GatewaySessionCommandsMixin:
         # the transport applies its default effort — a 400 on non-reasoning models.
         runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
 
-        tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
+        # Claim A before reading the transcript or invoking the compressor. A different routing
+        # key may own the same native ID; a stale pre-lease read must never become a new child.
+        async with self._session_route_gate(session_key):
+            generation = self._current_session_run_generation(session_key)
+            current = await self.async_session_store.lookup_by_session_key(session_key)
+            if current is not session_entry or current.session_id != session_entry.session_id:
+                raise RuntimeError("manual compression route changed before admission")
+            token = await self._turn_leases.acquire(
+                session_entry.session_id, owner_key=session_key, generation=generation, timeout=0.05,
+            )
+            if token is None:
+                raise RuntimeError("manual compression lease unavailable")
         try:
-            # Not a bare run_in_executor: the profile secret scope is a contextvar the default
-            # executor hop would drop, failing aux-client credential resolution closed.
-            result = await self._run_in_executor_with_context(
-                lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
-                                     task_id=session_entry.session_id or "default"))
-            if result.status == "nothing_to_do":
-                return t("gateway.compress.nothing_to_do")
-            if result.status != "compressed":
-                return "\n".join(render_compress_result(result))
-            await self._persist_manual_compression(tmp_agent, session_entry, source, result.after_messages)
-            finalize_context_engine_compression_notification(tmp_agent, committed=True)
-            compressor = tmp_agent.context_compressor
-            summary = result.summary
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+            from agent.conversation_compression_manual import MIN_MESSAGES
+            if len(history) < MIN_MESSAGES:
+                return t("gateway.compress.not_enough")
+            # FULL transcript (tool results included), like auto-compress: user/assistant-only
+            # starves tool-result pruning and can trip the protect-first/last early-return.
+            msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
+            tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
+            try:
+                # The context-preserving executor hop may continue running after task cancellation.
+                # Drain it before releasing A's lease; a child write can happen in that worker.
+                worker = asyncio.create_task(self._run_in_executor_with_context(
+                    lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
+                                         task_id=session_entry.session_id or "default")))
+                cancelled = False
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                if cancelled:
+                    raise asyncio.CancelledError
+                result = worker.result()
+                if result.status == "nothing_to_do":
+                    return t("gateway.compress.nothing_to_do")
+                if result.status != "compressed":
+                    return "\n".join(render_compress_result(result))
+                await self._persist_manual_compression(
+                    tmp_agent, session_entry, source, result.after_messages,
+                    lease_token=token, expected_generation=generation,
+                )
+                finalize_context_engine_compression_notification(tmp_agent, committed=True)
+                compressor = tmp_agent.context_compressor
+                summary = result.summary
+            finally:
+                finalize_context_engine_compression_notification(tmp_agent, committed=False)
+                self._evict_cached_agent(session_key)  # next turn rebuilds the prompt from current files
+                # Off-loop + bounded: teardown can block on subprocess/network/SQLite.
+                await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
         finally:
-            finalize_context_engine_compression_notification(tmp_agent, committed=False)
-            self._evict_cached_agent(session_key)  # next turn rebuilds the prompt from current files
-            # Off-loop + bounded: teardown can block on subprocess/network/SQLite.
-            await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
+            self._turn_leases.release(token)
         return "\n".join(_manual_compression_reply_lines(summary, compressor, request.focus_topic))
 
     async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
@@ -620,26 +716,91 @@ class GatewaySessionCommandsMixin:
         tmp_agent._end_session_on_close = False
         return tmp_agent
 
-    async def _persist_manual_compression(self, tmp_agent, session_entry, source, compressed) -> None:
+    async def _persist_manual_compression(
+        self, tmp_agent, session_entry, source, compressed, *, lease_token=None, expected_generation=None,
+    ) -> None:
         """Commit a manual /compress result to the session store.  Rotation (new continuation id)
         makes the NEW session durable (already published, else rewritten) so the original stays searchable;
         persist BEFORE repointing so a failed write is fatal and old history stays reachable.
         In-place compaction already archived + inserted rows, and a rewrite would DELETE the
         archive; an unchanged id without in-place means rotation FAILED."""
-        new_session_id = tmp_agent.session_id
-        if new_session_id != session_entry.session_id:
-            # Published child is already durable; a rewrite would drop rows cloned at publish.
-            if not await self.async_session_store.persist_rotated_compression_child(
-                    session_entry.session_id, new_session_id, compressed):
-                raise RuntimeError(f"failed to persist compressed transcript for session {new_session_id}")
-            session_entry.session_id = new_session_id
-            await self.async_session_store._save()
+        key = session_entry.session_key
+        parent_id, new_session_id = session_entry.session_id, tmp_agent.session_id
+        old_epoch = session_entry.route_epoch
+        route_committed = False
+        route_cancelled = False
+        async with self._session_route_gate(key):
+            current = await self.async_session_store.lookup_by_session_key(key)
+            if current is not session_entry or current.session_id != parent_id:
+                raise RuntimeError("manual compression route changed before publication")
+            # A manual command has no running-agent turn token. Claim A itself, then require a
+            # conflict-free B rebind before the child can become routable. Short contention
+            # budget while the gate is held avoids blocking a live turn that needs this gate.
+            generation = self._current_session_run_generation(key)
+            if expected_generation is not None and generation != expected_generation:
+                raise RuntimeError("manual compression generation changed before publication")
+            owned_here = lease_token is None
+            token = lease_token or await self._turn_leases.acquire(
+                parent_id, owner_key=key, generation=generation, timeout=0.05,
+            )
+            if token is None:
+                raise RuntimeError("manual compression lease unavailable")
+            try:
+                if (token.released or token.lease.holder is not token or token.owner_key != key
+                        or token.generation != generation or token.session_id != parent_id):
+                    raise RuntimeError("manual compression lease changed before publication")
+                if new_session_id != parent_id:
+                    if not self._turn_leases.rebind(token, new_session_id):
+                        raise RuntimeError("manual compression child lease handoff refused")
+                    persist = asyncio.create_task(self.async_session_store.persist_rotated_compression_child(
+                        parent_id, new_session_id, compressed,
+                    ))
+                    cancelled = False
+                    while not persist.done():
+                        try:
+                            await asyncio.shield(persist)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    persisted = persist.result()
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    if not persisted:
+                        raise RuntimeError(f"failed to persist compressed transcript for session {new_session_id}")
+                    write = asyncio.create_task(self.async_session_store.publish_compression_child_route(
+                        key, session_entry, parent_id, new_session_id,
+                    ))
+                elif getattr(tmp_agent, "_last_compaction_in_place", False):
+                    write = asyncio.create_task(self.async_session_store.publish_in_place_compaction_epoch(
+                        key, session_entry, parent_id,
+                    ))
+                else:
+                    logger.warning(
+                        "Manual /compress: session rotation did not occur (session_id unchanged) and in-place "
+                        "mode is off — preserving original transcript instead of overwriting it (#44794).")
+                    write = None
+                if write is not None:
+                    cancelled = False
+                    while not write.done():
+                        try:
+                            await asyncio.shield(write)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    committed = write.result()
+                    if not committed:
+                        raise RuntimeError("manual compression route changed during publication")
+                    route_committed, route_cancelled = True, cancelled
+            finally:
+                if owned_here:
+                    self._turn_leases.release(token)
+        if route_committed:
+            await self._emit_compaction_route_lifecycle(
+                session_entry, parent_id, old_epoch, in_place=new_session_id == parent_id,
+            )
+        if route_cancelled:
+            raise asyncio.CancelledError
+        if new_session_id != parent_id:
             await asyncio.to_thread(self._sync_telegram_topic_binding, source, session_entry,
                                     reason="compress-command")
-        elif not getattr(tmp_agent, "_last_compaction_in_place", False):
-            logger.warning(
-                "Manual /compress: session rotation did not occur (session_id unchanged) and in-place "
-                "mode is off — preserving original transcript instead of overwriting it (#44794).")
         await self.async_session_store.update_session(session_entry.session_key, last_prompt_tokens=0)
 
     # ------------------------------------------------------------------------ /topic
@@ -903,24 +1064,56 @@ class GatewaySessionCommandsMixin:
         current_entry = await self.async_session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
-        self._release_running_agent_state(session_key)
-        new_entry = await self.async_session_store.switch_session(
-            session_key, target_id, preserve_prompt_pin=False,
-        )
-        if not new_entry:
-            return t("gateway.resume.switch_failed")
-        # Conversation boundary: all conversation-scoped state + security state in one funnel call.
-        # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
-        # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
-        # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
-        self._clear_conversation_scope(session_key, reason="resume")
-        # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
-        # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
-        # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
-        await self.async_session_store.set_model_override(session_key, None)
-        # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
-        # provider cached _session_id at initialize() and would keep writing to the wrong session.
-        self._evict_cached_agent(session_key)
+        old_sid = current_entry.session_id
+        old_epoch = current_entry.route_epoch
+        # Freeze generation invalidation and the durable route CAS under the same per-key gate.
+        # Cancellation drains the offloaded write before another /new or turn can enter.
+        cancelled = False
+        async with self._session_route_gate(session_key):
+            current = await self.async_session_store.lookup_by_session_key(session_key)
+            if current is not current_entry or current.session_id != old_sid:
+                return t("gateway.resume.switch_failed")
+            boundary_generation = self._begin_session_run_generation(session_key)
+            try:
+                new_entry, write_cancelled = await self._drain_reset_boundary_operation(
+                    self.async_session_store.switch_session(
+                        session_key, target_id, expected_session_id=old_sid,
+                        preserve_prompt_pin=False, preserve_model_override=False,
+                        route_claim_blocked=False,
+                    ))
+                cancelled |= write_cancelled
+            except Exception:
+                # The writer may have committed the new route before reporting failure.
+                # Resolve its result while this key is still gated; an unknown readback
+                # closes the in-process route instead of admitting an unproven owner.
+                cancelled |= bool(asyncio.current_task().cancelling())
+                new_entry, read_cancelled = await self._drain_reset_boundary_operation(
+                    self.async_session_store.reconcile_failed_switch(
+                        session_key, old_sid, old_epoch, target_id))
+                cancelled |= read_cancelled
+                if new_entry is None:
+                    raise
+                logger.warning("Gateway resume writer reported an error after durable route commit for %s",
+                               session_key, exc_info=True)
+            if not new_entry:
+                return t("gateway.resume.switch_failed")
+            self._release_running_agent_state(session_key, run_generation=boundary_generation)
+            # A successor may publish as soon as this gate opens. Complete every mutation
+            # of this shared key before the slow keyed lifecycle callback starts.
+            self._clear_conversation_scope(session_key, reason="resume")
+            self._evict_cached_agent(session_key)
+        # The route is durable now. Publish an immutable keyed transition before slow banner
+        # reads; a delayed observer can see a later /new and reject this exact epoch.
+        from gateway.route_lifecycle import emit_route_lifecycle, route_lifecycle_payload
+        _, hook_cancelled = await self._drain_reset_boundary_operation(
+            emit_route_lifecycle(self, "on_session_resumed", {
+                **route_lifecycle_payload(self, new_entry, source), "reason": "resume",
+                "old_session_id": old_sid, "old_route_epoch": old_epoch,
+                "new_session_id": new_entry.session_id, "user_id": source.user_id,
+            }))
+        cancelled |= hook_cancelled
+        if cancelled:
+            raise asyncio.CancelledError
         title = await self._session_db.get_session_title(target_id) or name
         try:
             history = await self.async_session_store.load_transcript(target_id)

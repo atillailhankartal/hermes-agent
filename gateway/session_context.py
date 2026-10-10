@@ -170,6 +170,23 @@ def reset_session_vars() -> None:
     _runtime_cwd("clear_session_cwd")
 
 
+def get_bound_session_key() -> str | None:
+    """Read a current Gateway tool route without borrowing ambient or child identity.
+
+    This is an observation for native plugin compatibility, never delivery admission.
+    The caller still needs the host-issued route claim for an actual operation.
+    """
+    value = _SESSION_KEY.get()
+    native_id = _SESSION_ID.get()
+    if not isinstance(value, str) or not value or not isinstance(native_id, str) or not native_id:
+        return None
+    from agent.delegation_context import is_delegated_child_process_context
+    if is_delegated_child_process_context():
+        return None
+    from gateway.route_claim import bound_session_key_for_tool
+    return bound_session_key_for_tool(native_id, value)
+
+
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session var by legacy ``HERMES_SESSION_*`` name; drop-in for os.getenv.  The
     ContextVar wins if ever set here (even to ``""``); else ``os.environ``; else *default*."""

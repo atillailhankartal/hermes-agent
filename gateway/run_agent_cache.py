@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import threading
@@ -11,6 +12,7 @@ import time
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from weakref import WeakValueDictionary
 
 from agent.interrupt_compat import _accepts_keyword
 from gateway.config import Platform
@@ -45,6 +47,17 @@ def _tuple_agent(entry: Any) -> Any:
 
 class GatewayAgentCacheMixin:
     """Agent cache, session model overrides, turn leases, run generations and conversation-scope reset for GatewayRunner."""
+
+    def _session_route_gate(self, session_key: str) -> asyncio.Lock:
+        """Per-loop, per-key admission gate; weak values do not retain idle loops or keys."""
+        gates = self.__dict__.get("_session_route_gates")
+        if gates is None:
+            gates = self.__dict__["_session_route_gates"] = WeakValueDictionary()
+        identity = (asyncio.get_running_loop(), session_key)
+        gate = gates.get(identity)
+        if gate is None:
+            gate = gates[identity] = asyncio.Lock()
+        return gate
 
     @classmethod
     def _extract_cache_busting_config(cls, user_config: dict | None) -> dict:
@@ -336,6 +349,10 @@ class GatewayAgentCacheMixin:
         current = int(state.persistent.run_generation or 0)
         tokens = state.turn.lease_tokens
         for gen in [g for g in tokens if int(g) < current]:
+            handoff = self.__dict__.get("_compression_lease_handoffs", {}).get((session_key, gen))
+            if handoff is not None:
+                handoff["release_deferred"] = True
+                continue
             token = tokens.pop(gen)
             try:
                 registry.release(token)
@@ -360,6 +377,10 @@ class GatewayAgentCacheMixin:
         held = self._held_turn_lease(session_key, run_generation)
         if held is None:
             return False
+        handoff = self.__dict__.get("_compression_lease_handoffs", {}).get((session_key, run_generation))
+        if handoff is not None:
+            handoff["release_deferred"] = True
+            return True
         registry, tokens = held
         token = tokens.pop(run_generation)
         try:
@@ -381,6 +402,112 @@ class GatewayAgentCacheMixin:
         except Exception:
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False
+
+    def _begin_compression_lease_handoff(self, session_key: str, run_generation: int, child_id: str) -> bool:
+        """Reserve the child alias and pin its lease across the offloaded route write.
+
+        /new may release the old turn while persistence is in flight. Its release is deferred
+        until the route CAS finishes, so a child can never be published with an unlocked lease.
+        """
+        held = self._held_turn_lease(session_key, run_generation)
+        if held is None or (session_key, run_generation) in self.__dict__.get("_compression_lease_handoffs", {}):
+            return False
+        registry, tokens = held
+        token = tokens[run_generation]
+        if not self._rebind_turn_lease(session_key, run_generation, child_id):
+            return False
+        self.__dict__.setdefault("_compression_lease_handoffs", {})[(session_key, run_generation)] = {
+            "registry": registry, "token": token, "release_deferred": False,
+        }
+        return True
+
+    def _end_compression_lease_handoff(self, session_key: str, run_generation: int) -> None:
+        handoff = self.__dict__.get("_compression_lease_handoffs", {}).pop((session_key, run_generation), None)
+        if handoff is None or not handoff["release_deferred"]:
+            return
+        held = self._held_turn_lease(session_key, run_generation)
+        if held is not None:
+            held[1].pop(run_generation, None)
+        handoff["registry"].release(handoff["token"])
+
+    async def _hmwa_publish_compression_child_route(
+        self, session_entry, child_session_id, session_key, run_generation,
+    ) -> None:
+        """Transfer the live turn lease before making a compression child routable."""
+        old_session_id, old_epoch = session_entry.session_id, session_entry.route_epoch
+        async with self._session_route_gate(session_key):
+            if not self._is_session_run_current(session_key, run_generation):
+                raise RuntimeError("compression route changed before lease handoff")
+            parent_session_id = session_entry.session_id
+            if not self._begin_compression_lease_handoff(session_key, run_generation, child_session_id):
+                raise RuntimeError("compression lease handoff refused")
+            try:
+                write = asyncio.create_task(
+                    self.async_session_store.publish_compression_child_route(
+                        session_entry.session_key, session_entry, parent_session_id, child_session_id,
+                        still_current=lambda: self._is_session_run_current(session_key, run_generation),
+                    )
+                )
+                cancelled = False
+                # asyncio.to_thread keeps running after its awaiter is cancelled. Keep both A and B
+                # leased and the admission gate closed until the offloaded CAS/write settles.
+                while not write.done():
+                    try:
+                        await asyncio.shield(write)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                committed = write.result()
+                routed_entry = (await self.async_session_store.lookup_by_session_key(session_entry.session_key)
+                                if committed else None)
+                if (not committed or not self._is_session_run_current(session_key, run_generation)
+                        or routed_entry is not session_entry
+                        or session_entry.session_id != child_session_id):
+                    raise RuntimeError("compression route changed during lease handoff")
+            finally:
+                self._end_compression_lease_handoff(session_key, run_generation)
+        await self._emit_compaction_route_lifecycle(session_entry, old_session_id, old_epoch, in_place=False)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _hmwa_publish_in_place_compaction_epoch(
+        self, session_entry, session_key, run_generation,
+    ) -> None:
+        """Rotate the durable route epoch after a same-ID compaction under the held A lease."""
+        old_session_id, old_epoch = session_entry.session_id, session_entry.route_epoch
+        async with self._session_route_gate(session_key):
+            held = self._held_turn_lease(session_key, run_generation)
+            if not self._is_session_run_current(session_key, run_generation) or held is None:
+                raise RuntimeError("in-place compaction route lost its turn lease")
+            token = held[1].get(run_generation)
+            native_id = session_entry.session_id
+            if (token is None or token.released or token.lease.holder is not token
+                    or token.owner_key != session_key or token.session_id != native_id):
+                raise RuntimeError("in-place compaction route lost its turn lease")
+            write = asyncio.create_task(self.async_session_store.publish_in_place_compaction_epoch(
+                session_entry.session_key, session_entry, native_id,
+            ))
+            cancelled = False
+            while not write.done():
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    cancelled = True
+            committed = write.result()
+            if (not committed or not self._is_session_run_current(session_key, run_generation)
+                    or session_entry.session_id != native_id):
+                raise RuntimeError("in-place compaction route changed during publication")
+        await self._emit_compaction_route_lifecycle(session_entry, old_session_id, old_epoch, in_place=True)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _emit_compaction_route_lifecycle(self, entry, old_session_id, old_epoch, *, in_place: bool) -> None:
+        from gateway.route_lifecycle import emit_route_lifecycle, route_lifecycle_payload
+        payload = route_lifecycle_payload(self, entry, entry.origin)
+        await emit_route_lifecycle(self, "on_session_compacted", {
+            **payload, "reason": "compression", "old_session_id": old_session_id,
+            "old_route_epoch": old_epoch, "new_session_id": entry.session_id,
+            "in_place": in_place,
+        })
 
     def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
         """THE single conversation-boundary funnel (/new, /resume, suspension replacement,
@@ -444,13 +571,21 @@ class GatewayAgentCacheMixin:
 
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh, monotonically increasing run generation token (NEVER reset): a late result
-        from a worker /stop or /new invalidated is recognized and dropped."""
+        from a worker /stop or /new invalidated is recognized and dropped.
+
+        Live Gateway callers hold ``_session_route_gate`` via the async wrapper below; direct
+        callers are limited to isolated setup/tests with no concurrent route publication.
+        """
         if not session_key:
             return 0
         persistent = self._session_state(session_key).persistent
         # Monotonic by design (#28686): incremented here, NEVER reset.
         persistent.run_generation = int(persistent.run_generation) + 1
         return persistent.run_generation
+
+    async def _begin_session_run_generation_async(self, session_key: str) -> int:
+        async with self._session_route_gate(session_key):
+            return self._begin_session_run_generation(session_key)
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``.
@@ -462,6 +597,29 @@ class GatewayAgentCacheMixin:
         if reason:
             logger.info("Invalidated run generation for %s → %d (%s)", session_key, generation, reason)
         return generation
+
+    async def _invalidate_session_run_generation_async(self, session_key: str, *, reason: str = "") -> int:
+        async with self._session_route_gate(session_key):
+            generation = self._invalidate_session_run_generation(session_key, reason=reason)
+            await self._revoke_route_claim_async(session_key)
+            return generation
+
+    async def _revoke_route_claim_async(self, session_key: str) -> None:
+        """Drain an offloaded durable fence before the per-key admission gate is released."""
+        store = getattr(self, "session_store", None)
+        if not callable(getattr(store, "revoke_route_claim", None)):
+            return
+        writer = asyncio.create_task(asyncio.to_thread(store.revoke_route_claim, session_key))
+        cancelled = False
+        while not writer.done():
+            try:
+                await asyncio.shield(writer)
+            except asyncio.CancelledError:
+                cancelled = True
+        if not writer.result():
+            logger.warning("Gateway route claim remains closed after failed revocation for %s", session_key)
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _current_session_run_generation(self, session_key: str) -> int:
         """Current run generation for ``session_key`` (0 when the key tracks no run)."""
@@ -521,6 +679,18 @@ class GatewayAgentCacheMixin:
             ).start()
         return _generation_at_interrupt
 
+    async def _interrupt_running_turn_async(
+        self, session_key: str, *, interrupt_reason: str, invalidation_reason: str,
+        tool_reason: str | None = None,
+    ) -> int:
+        async with self._session_route_gate(session_key):
+            generation = self._interrupt_running_turn(
+                session_key, interrupt_reason=interrupt_reason,
+                invalidation_reason=invalidation_reason, tool_reason=tool_reason,
+            )
+            await self._revoke_route_claim_async(session_key)
+            return generation
+
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
         invalidation_reason: str, release_running_state: bool = True,
@@ -530,7 +700,7 @@ class GatewayAgentCacheMixin:
             return
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
-        _generation_at_interrupt = self._interrupt_running_turn(
+        _generation_at_interrupt = await self._interrupt_running_turn_async(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -802,7 +972,7 @@ class GatewayAgentCacheMixin:
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 
-    def _evict_cached_agent(self, session_key: str) -> None:
+    def _evict_cached_agent(self, session_key: str, *, defer_release: bool = False) -> Any:
         """Remove a cached agent (/new, /model, ...) and soft-release its LLM client pool (AIAgent
         holds reference cycles; without it RSS grows across /new). Soft = frees clients and child
         subagents but PRESERVES terminal sandbox / browser / bg processes since the session may
@@ -813,7 +983,8 @@ class GatewayAgentCacheMixin:
         (sockets + held buffers) is freed promptly rather than waiting on CPython GC — AIAgent holds
         reference cycles (callbacks, tool state) that delay refcount collection, so a manual release is
         required to keep gateway RSS flat across many /new, /model, undo and reset operations (#29298, same
-        leak class as #25315).
+        leak class as #25315). ``defer_release`` detaches the old agent for /new's bounded resource
+        cleanup and returns it for release afterward.
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
         # Prompt-stability state rides the agent-cache lifecycle: a fresh agent must re-render its
@@ -836,11 +1007,16 @@ class GatewayAgentCacheMixin:
         agent = _first_agent(evicted)
         # Never tear down an agent that's mid-turn — its client, sandbox and child subagents are in use.
         if agent is None or agent is _AGENT_PENDING_SENTINEL or id(agent) in self._running_agent_ids():
-            return
+            return None
+        if defer_release:
+            # /new tears down session resources before releasing the old client's pool. Its
+            # route/cache boundary is already durable, so the slow teardown runs outside the gate.
+            return agent
         self._spawn_release_thread(
             self._release_evicted_agent_soft, (agent,), f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
             session_key=session_key,
         )
+        return None
 
     def _spawn_release_thread(self, target, args: tuple, name: str, *, inline_fallback: bool,
                               session_key: Optional[str] = None) -> None:

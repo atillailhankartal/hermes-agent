@@ -32,6 +32,9 @@ class CLITuiRuntimeMixin:
         """REPL worker thread: drain ``_pending_input``, run idle housekeeping, dispatch each input."""
         while not self._should_exit:
             try:
+                host = getattr(self, "_native_plugin_host", None)
+                if host is not None:
+                    host.drain_one()
                 try:
                     user_input = self._pending_input.get(timeout=0.1)
                 except queue.Empty:
@@ -441,6 +444,9 @@ class CLITuiRuntimeMixin:
         """Teardown after the app exits: interrupt agent, stop voice/pet, persist + close session, cleanup, exit summary."""
         from cli import _DIM, _RST, _cprint, _invoke_interrupted_session_end, _run_cleanup, set_approval_callback, set_secret_capture_callback, set_sudo_password_callback
         self._should_exit = True
+        host = getattr(self, "_native_plugin_host", None)
+        if host is not None:
+            host.close()
         self._pet_stop_anim()
         # Without this line the terminal sits silent through the whole cleanup window.
         with suppress(Exception):

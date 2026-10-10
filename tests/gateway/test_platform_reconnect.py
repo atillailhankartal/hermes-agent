@@ -98,6 +98,8 @@ class TestStartupPlatformIsolation:
             },
             sessions_dir=tmp_path,
         )
+        runner.session_store.sessions_dir = tmp_path
+        runner.session_store._route_owner_id = "platform-isolation-owner"
         runner.hooks = MagicMock()
         runner.hooks.loaded_hooks = []
         runner.hooks.emit = AsyncMock()
@@ -862,6 +864,8 @@ class TestVoiceInputCallbackWiring:
         runner._await_startup_boot_sends = AsyncMock()  # see TestStartupPlatformIsolation
         adapter = self._make_discord_voice_adapter()
         runner.config.sessions_dir = tmp_path
+        runner.session_store.sessions_dir = tmp_path
+        runner.session_store._route_owner_id = "voice-wiring-owner"
 
         def fake_create_task(coro):
             coro.close()

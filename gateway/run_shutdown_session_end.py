@@ -47,7 +47,7 @@ class GatewaySessionEndMixin:
         def _call() -> None:
             from hermes_cli.lifecycle import finalize_session, session_end_messages
             messages.extend(session_end_messages(
-                finalize_session(session_id=session_id, platform=platform, reason=reason, **extra)))
+                finalize_session(session_id=session_id, platform=platform, reason=reason, session_key=session_key, **extra)))
 
         try:
             await asyncio.wait_for(

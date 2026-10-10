@@ -824,6 +824,23 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
     dispatch_kwargs: dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
+    route_claim = None
+    if function_name.startswith("bee_"):
+        # Gateway proof is host-only. A model-authored argument, ambient session env, or
+        # detached subagent ID can never supply it; CLI tools have no Gateway route scope.
+        from gateway.route_claim import claim_for_direct_gateway_tool, gateway_route_bound
+        if gateway_route_bound():
+            route_claim = claim_for_direct_gateway_tool(ids.session_id)
+            if route_claim is None:
+                return tool_error("Gateway route is no longer current", error_type="session_closed")
+            dispatch_kwargs["route_claim"] = route_claim
+        else:
+            from hermes_cli.cli_plugin_turn import claim_for_cli_tool, cli_route_bound
+            if cli_route_bound():
+                route_claim = claim_for_cli_tool(ids.session_id)
+                if route_claim is None:
+                    return tool_error("CLI route is no longer current", error_type="session_closed")
+                dispatch_kwargs["route_claim"] = route_claim
     if function_name == "execute_code":
         # Prefer the caller's list so subagents can't overwrite the parent's
         # tool set via the process-global.
@@ -835,7 +852,15 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
         from tools.connectors import dispatch_connector_call, is_connector_name
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        if route_claim is not None and not route_claim.is_current(native_session_id=ids.session_id):
+            return tool_error("Gateway route is no longer current", error_type="session_closed")
+        result = registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        if route_claim is not None and not route_claim.is_current(native_session_id=ids.session_id):
+            # Dispatch may already have committed a Bee operation. A route change after that
+            # boundary makes its outcome uncertain; reporting session_closed would invite a
+            # duplicate retry. Pre-dispatch closure above remains a safe session_closed.
+            return tool_error("Gateway route changed during tool dispatch", error_type="outcome_unknown")
+        return result
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:

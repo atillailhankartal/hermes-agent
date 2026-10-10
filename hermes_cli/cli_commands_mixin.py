@@ -32,6 +32,8 @@ from agent.i18n import t
 from agent.message_metadata import message_identity
 from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.cli_agent_setup_mixin import _retire_agent
+from hermes_cli.cli_plugin_turn import cli_route_transition
+from hermes_cli.cli_commands_session_tools import _without_session_meta
 from hermes_cli.cli_commands_session_tools import (
     CLICommandsSessionToolsMixin, _TTYBuf, _accent, _accent_line, _command_arg, _cp, _dim,
     _dim_line, _gt, _lines, _pr, _probe, _save, _say_block, _shlex_args, _t, _tn)
@@ -271,10 +273,6 @@ def _sync_agent_to_session(cli, session_id: str, *, parent_session_id: str, reas
         if _mm is not None:
             _mm.on_session_switch(
                 session_id, parent_session_id=parent_session_id or "", reset=False, reason=reason)
-
-
-def _without_session_meta(messages) -> list:
-    return [m for m in (messages or []) if m.get("role") != "session_meta"]
 
 
 def _db_unavailable_line() -> str:
@@ -969,6 +967,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         return self._handoff_keep(f"  {_t('handoff.timed_out')}", f"  {_t('handoff.session_intact')}")
 
     # ---- /resume, /sessions, /branch ------------------------------------------------------
+    @cli_route_transition
     def _handle_resume_command(self, cmd_original: str) -> None:
         """Handle /resume <session_id_or_title> — switch to a previous session mid-conversation."""
         if getattr(self, "_agent_running", False):
@@ -1080,6 +1079,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         elif not self._show_recent_sessions(reason="sessions"):
             _cp(f"  {_t('sessions.none_yet')}")
 
+    @cli_route_transition
     def _handle_branch_command(self, cmd_original: str) -> None:
         """Handle /branch [name] — fork the current session into a new independent copy of the
         full history so a different approach can be explored without losing the original."""
