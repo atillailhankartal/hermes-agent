@@ -33,18 +33,25 @@ def main():
         target = Path(temporary)
         child = target / "a2a-child"
         suite = target / "a2a-suite"
+        fault_suite = target / "a2a-observer-fault"
+        native_sources = [str(NATIVE / name) for name in (
+            "launch_authority.c", "stage0.c", "release_manifest.c",
+            "fd_inventory.c", "socket_lineage.c")]
         run(CC + [str(TESTS / "a2a_child_fixture.c"), str(NATIVE / "stage0.c"),
                   str(NATIVE / "fd_inventory.c"), "-o", str(child)])
-        run(CC + [str(TESTS / "test_a2a_root.c"),
-                  *[str(NATIVE / name) for name in (
-                      "launch_authority.c", "stage0.c", "release_manifest.c",
-                      "fd_inventory.c", "socket_lineage.c")],
+        run(CC + [str(TESTS / "test_a2a_root.c"), *native_sources,
                   str(OBSERVER), "-o", str(suite)])
+        run(CC + ["-DBH_A2A_TEST_OBSERVER_FAULT", str(TESTS / "test_a2a_root.c"),
+                  *native_sources, "-o", str(fault_suite)])
         if sum(path.stat().st_size for path in target.iterdir()) >= 64 * 1024**2:
             raise SystemExit("UNAVAILABLE: A2a build exceeded 64 MiB")
         output = run([str(suite), str(child)], timeout=20)
-        if "cases=12 failures=0" not in output:
-            raise SystemExit("A2a suite did not report twelve passing cases")
+        if "cases=13 failures=0" not in output:
+            raise SystemExit("A2a suite did not report thirteen passing cases")
+        print(output, end="")
+        output = run([str(fault_suite), str(child), "observer_fault"], timeout=20)
+        if "cases=2 failures=0" not in output:
+            raise SystemExit("A2a observer fault suite did not report two passing cases")
         print(output, end="")
 
 

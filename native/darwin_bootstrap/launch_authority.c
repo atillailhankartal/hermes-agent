@@ -110,8 +110,6 @@ void bh_a2a_root_cancel(struct bh_a2a_root *root) {
      * cleanup. Before bind it belongs to the caller; never close slot 0 from
      * a zero-initialized context. */
 }
-#include "abi_v1.h"
-
 #include <CommonCrypto/CommonHMAC.h>
 #include <errno.h>
 #include <string.h>
@@ -217,7 +215,9 @@ enum bh_a2a_result bh_a2a_root_retire_and_signal(struct bh_a2a_child_map *map,
     size_t index;
     int type = -1;
     socklen_t length = (socklen_t)sizeof(type);
-    if (root == NULL) return BH_A2A_PAUSED;
+    /* Cancellation is irreversible for this launch; a later valid child may
+     * never retire the original aliases or emit a close proof. */
+    if (root == NULL || root->cancelled) return BH_A2A_PAUSED;
     if (map == NULL || frame == NULL || key == NULL ||
         remaining_fds == NULL || spawned_child <= 0 || control_fd < 0 ||
         control_fd == root->socket_fd ||

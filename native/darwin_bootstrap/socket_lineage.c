@@ -62,26 +62,41 @@ enum bh_a2a_result bh_a2a_root_bind_observe(struct bh_a2a_root *root,
     root->bound = 1;
     root->parent_fd = parent_fd; /* transfer: retain for no-follow cleanup */
     memcpy(root->leaf, manifest->leaf, strlen(manifest->leaf) + 1);
+    memset(&root->node, 0, sizeof(root->node));
+    /* Capture the leaf before later observation, so a failed observation can
+     * still remove exactly this inode. If readback itself fails, cleanup has
+     * no identity and must leave the leaf untouched. */
+    if (fstatat(parent_fd, root->leaf, &root->node, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISSOCK(root->node.st_mode)) {
+        root->cancelled = 1;
+        return BH_A2A_PAUSED;
+    }
     memset(&observed, 0, sizeof(observed));
     if (getsockname(BH_A2A_FD6, (struct sockaddr *)&observed, &observed_length) != 0 ||
         observed.sun_family != AF_UNIX ||
         observed_length < offsetof(struct sockaddr_un, sun_path) + path_length + 1 ||
-        memcmp(observed.sun_path, address.sun_path, path_length + 1) != 0 ||
-        fstatat(parent_fd, root->leaf, &root->node, AT_SYMLINK_NOFOLLOW) != 0 ||
-        !S_ISSOCK(root->node.st_mode)) return BH_A2A_PAUSED;
+        memcmp(observed.sun_path, address.sun_path, path_length + 1) != 0) {
+        root->cancelled = 1;
+        return BH_A2A_PAUSED;
+    }
     expected.directory_fd = parent_fd;
     expected.basename = root->leaf;
     expected.pathname = address.sun_path;
     expected.pathname_length = path_length;
     expected.node = root->node;
     result = bh_darwin_observe_fd6(&expected);
-    return result.state == BH_BOUND_OBSERVED ? BH_A2A_OK : BH_A2A_PAUSED;
+    if (result.state != BH_BOUND_OBSERVED) {
+        root->cancelled = 1;
+        return BH_A2A_PAUSED;
+    }
+    return BH_A2A_OK;
 }
 
 enum bh_a2a_result bh_a2a_root_cleanup_leaf(struct bh_a2a_root *root) {
     struct stat current;
     int parent_fd;
-    if (root == NULL || !root->cancelled || !root->bound || root->parent_fd < 0)
+    if (root == NULL || !root->cancelled || !root->bound || root->parent_fd < 0 ||
+        !S_ISSOCK(root->node.st_mode))
         return BH_A2A_PAUSED;
     if (fstatat(root->parent_fd, root->leaf, &current, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISSOCK(current.st_mode) || current.st_dev != root->node.st_dev ||

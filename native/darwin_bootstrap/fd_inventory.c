@@ -128,7 +128,7 @@ enum bh_a2a_result bh_a2a_child_map_retire(struct bh_a2a_child_map *map,
     size_t index;
     int clean = 1;
     struct stat subject;
-    if (map == NULL || root == NULL || !map->prepared || !root->bound ||
+    if (map == NULL || root == NULL || root->cancelled || !map->prepared || !root->bound ||
         !root->socket_owned || map->original[3] != BH_A2A_FD6 ||
         fstat(BH_A2A_FD6, &subject) != 0 ||
         subject.st_dev != root->socket_object.st_dev ||

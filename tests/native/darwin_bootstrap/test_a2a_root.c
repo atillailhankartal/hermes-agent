@@ -1,4 +1,5 @@
 #include "../../../native/darwin_bootstrap/abi_v1.h"
+#include "../../../native/trusted_inbound/darwin/socket_observer.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -13,6 +14,17 @@
 static int checks;
 static int failures;
 static const char *child_fixture;
+
+#ifdef BH_A2A_TEST_OBSERVER_FAULT
+static int observer_fault_calls;
+
+/* Link-time fault fixture: production socket_lineage.c executes the same path. */
+struct bh_socket_observation bh_darwin_observe_fd6(const struct bh_socket_expectation *expected) {
+    (void)expected;
+    observer_fault_calls++;
+    return (struct bh_socket_observation){BH_UNKNOWN, BH_RUNTIME};
+}
+#endif
 
 static void check(int condition, const char *name) {
     checks++;
@@ -255,7 +267,7 @@ static int set_cloexec(int fd) {
     return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
 }
 
-static void actual_spawn_map_case(void) {
+static void actual_spawn_map_case(int cancel_first) {
     struct bh_a2a_root root = { .socket_fd = -1, .parent_fd = -1 };
     struct bh_a2a_manifest_v1 manifest;
     struct bh_a2a_child_map map = {0};
@@ -274,6 +286,7 @@ static void actual_spawn_map_case(void) {
     struct bh_a2a_close_frame frame = {0};
     int parent_fd;
     int child_status = -1;
+    int index;
     pid_t child = -1;
     clean_child_table();
     check(child_fixture != NULL, "fixture_path_supplied");
@@ -343,23 +356,145 @@ static void actual_spawn_map_case(void) {
     frame.launch_nonce[0] = 1;
     frame.incarnation[0] = 2;
     key[0] = 4;
-    check(bh_a2a_root_retire_and_signal(&map, &root, child, control[1],
-                                         remaining, 7, &frame, key) == BH_A2A_OK,
-          "root_alias_retirement_precedes_authenticated_frame");
-    check(fcntl(6, F_GETFD) == -1 && errno == EBADF,
-          "root_fd6_absent_after_retirement");
-    check(read(control[1], &response, 1) == 1 && response == 'K',
-          "child_real_map_and_close_frame_validated");
-    check(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) &&
-          WEXITSTATUS(child_status) == 0, "owned_child_reaped_successfully");
+    if (cancel_first) {
+        check(bh_a2a_root_retire_and_signal(&map, &root, 0, control[1],
+                                             remaining, 7, &frame, key) == BH_A2A_PAUSED,
+              "invalid_child_latches_cancel");
+        check(root.cancelled == 1, "cancel_is_irreversible_for_launch");
+        check(bh_a2a_root_retire_and_signal(&map, &root, child, control[1],
+                                             remaining, 7, &frame, key) == BH_A2A_PAUSED,
+              "cancel_blocks_later_real_child_frame");
+        check(fcntl(6, F_GETFD) >= 0 && map.prepared,
+              "cancel_preserves_root6_and_child_aliases");
+        check(recv(control[1], &response, 1, MSG_DONTWAIT) == -1 &&
+              (errno == EAGAIN || errno == EWOULDBLOCK),
+              "cancel_emits_no_frame_or_child_ack");
+        for (index = 0; index < 4; index++)
+            if (map.temporary[index] >= 64) (void)close(map.temporary[index]);
+        (void)close(sources[0]);
+        (void)close(sources[1]);
+        (void)close(sources[2]);
+        (void)close(control[1]);
+        check(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) &&
+              WEXITSTATUS(child_status) == 42, "cancelled_child_saw_control_eof");
+    } else {
+        check(bh_a2a_root_retire_and_signal(&map, &root, child, control[1],
+                                             remaining, 7, &frame, key) == BH_A2A_OK,
+              "root_alias_retirement_precedes_authenticated_frame");
+        check(fcntl(6, F_GETFD) == -1 && errno == EBADF,
+              "root_fd6_absent_after_retirement");
+        check(read(control[1], &response, 1) == 1 && response == 'K',
+              "child_real_map_and_close_frame_validated");
+        check(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) &&
+              WEXITSTATUS(child_status) == 0, "owned_child_reaped_successfully");
+    }
     (void)close(bootstrap[1]);
-    (void)close(control[1]);
+    if (!cancel_first) (void)close(control[1]);
     (void)close(status_pipe[0]);
     bh_a2a_root_cancel(&root);
     check(bh_a2a_root_cleanup_leaf(&root) == BH_A2A_OK,
           "spawn_leaf_cleanup_after_reap");
     check(rmdir(parent) == 0, "spawn_parent_removed");
 }
+
+static void actual_spawn_success(void) { actual_spawn_map_case(0); }
+static void actual_spawn_cancel(void) { actual_spawn_map_case(1); }
+
+#ifdef BH_A2A_TEST_OBSERVER_FAULT
+static void observer_fault_case(int replace_leaf) {
+    struct bh_a2a_root root = { .socket_fd = -1, .parent_fd = -1 };
+    struct bh_a2a_manifest_v1 manifest = {0};
+    struct bh_a2a_child_map map = {0};
+    struct bh_a2a_close_frame frame = {0};
+    struct stat directory, original, current;
+    char parent[] = "/private/tmp/bee-a2a-fault-XXXXXX";
+    unsigned char key[32] = {0};
+    int sources[] = {3, 4, 5, 6};
+    int remaining[6];
+    int pair[2];
+    int parent_fd;
+    int index;
+    char received;
+    clean_child_table();
+    check(mkdtemp(parent) != NULL, "fault_parent_created");
+    for (index = 0; index < 3; index++)
+        check(open("/dev/null", O_RDONLY) == index + 3, "fault_source_slots");
+    check(bh_a2a_root_prepare_fd6(&root, 0) == BH_A2A_OK, "fault_root6_prepared");
+    parent_fd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    check(parent_fd >= 0 && parent_fd != 6 && fstat(parent_fd, &directory) == 0,
+          "fault_parent_distinct");
+    manifest.version = 1;
+    (void)snprintf(manifest.parent_path, sizeof(manifest.parent_path), "%s", parent);
+    (void)snprintf(manifest.leaf, sizeof(manifest.leaf), "%s", "protected.sock");
+    (void)snprintf(manifest.stage0_path, sizeof(manifest.stage0_path), "%s", "/usr/bin/true");
+    manifest.parent_uid = directory.st_uid;
+    manifest.parent_gid = directory.st_gid;
+    manifest.parent_mode = directory.st_mode & 07777;
+    manifest.parent_device = directory.st_dev;
+    manifest.parent_inode = directory.st_ino;
+    manifest.broker_uid = getuid();
+    manifest.broker_gid = getgid();
+    manifest.release_digest[0] = 1;
+    check(bh_a2a_root_bind_observe(&root, parent_fd, &manifest) == BH_A2A_PAUSED,
+          "post_bind_observer_failure_paused");
+    check(observer_fault_calls == 1 && root.bound && root.parent_fd == parent_fd,
+          "post_bind_failure_retains_cleanup_parent");
+    check(root.cancelled, "post_bind_observer_failure_latches_cancel");
+    check(fstatat(parent_fd, manifest.leaf, &original, AT_SYMLINK_NOFOLLOW) == 0 &&
+          S_ISSOCK(original.st_mode) && original.st_dev == root.node.st_dev &&
+          original.st_ino == root.node.st_ino, "post_bind_original_node_recorded");
+    if (!replace_leaf) {
+        check(bh_a2a_child_map_prepare(&map, sources) == BH_A2A_OK,
+              "fault_child_map_prepared");
+        check(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0,
+              "fault_control_pair_created");
+        remaining[0] = 0; remaining[1] = 1; remaining[2] = 2;
+        remaining[3] = parent_fd; remaining[4] = pair[0]; remaining[5] = pair[1];
+        frame.version = BH_A2A_FRAME_VERSION;
+        frame.type = BH_A2A_FRAME_ROOT_CLOSED;
+        frame.sequence = 1;
+        frame.generation = 4;
+        frame.launch_nonce[0] = 1;
+        frame.incarnation[0] = 2;
+        key[0] = 4;
+        check(bh_a2a_root_retire_and_signal(&map, &root, getpid(), pair[0],
+                                             remaining, 6, &frame, key) == BH_A2A_PAUSED,
+              "post_bind_failure_blocks_close_frame");
+        check(fcntl(6, F_GETFD) >= 0, "post_bind_failure_preserves_fd6");
+        check(recv(pair[1], &received, 1, MSG_DONTWAIT) == -1 &&
+              (errno == EAGAIN || errno == EWOULDBLOCK),
+              "post_bind_failure_emits_no_frame");
+        for (index = 0; index < 4; index++)
+            if (map.temporary[index] >= 64) (void)close(map.temporary[index]);
+        (void)close(pair[0]);
+        (void)close(pair[1]);
+    } else {
+        int replacement;
+        check(unlinkat(parent_fd, manifest.leaf, 0) == 0,
+              "fault_fixture_removed_original");
+        replacement = openat(parent_fd, manifest.leaf,
+                             O_CREAT | O_EXCL | O_RDONLY, 0600);
+        check(replacement >= 0, "fault_replacement_created");
+        (void)close(replacement);
+        bh_a2a_root_cancel(&root);
+        check(bh_a2a_root_cleanup_leaf(&root) == BH_A2A_PAUSED,
+              "fault_replacement_cleanup_refused");
+        check(fstatat(parent_fd, manifest.leaf, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
+              S_ISREG(current.st_mode), "fault_replacement_preserved");
+        check(unlinkat(parent_fd, manifest.leaf, 0) == 0,
+              "fault_fixture_removed_replacement");
+    }
+    bh_a2a_root_cancel(&root);
+    if (!replace_leaf)
+        check(bh_a2a_root_cleanup_leaf(&root) == BH_A2A_OK,
+              "post_bind_failure_exact_leaf_cleanup");
+    else (void)close(parent_fd);
+    check(rmdir(parent) == 0, "fault_parent_removed");
+}
+
+static void observer_fault_exact(void) { observer_fault_case(0); }
+static void observer_fault_replaced(void) { observer_fault_case(1); }
+#endif
 
 static int run(void (*operation)(void), const char *name) {
     int status;
@@ -389,6 +524,15 @@ static void source64(void) { source_case(64); }
 
 int main(int argc, char **argv) {
     int passed = 0;
+#ifdef BH_A2A_TEST_OBSERVER_FAULT
+    if (argc == 3 && strcmp(argv[2], "observer_fault") == 0) {
+        child_fixture = argv[1];
+        passed += run(observer_fault_exact, "observer_fault_exact");
+        passed += run(observer_fault_replaced, "observer_fault_replaced");
+        fprintf(stdout, "cases=%d failures=%d\n", 2, 2 - passed);
+        return passed == 2 ? 0 : 1;
+    }
+#endif
     if (argc != 2) return 2;
     child_fixture = argv[1];
     passed += run(source3, "source3");
@@ -402,7 +546,8 @@ int main(int argc, char **argv) {
     passed += run(bound_case, "bound");
     passed += run(replaced_leaf_case, "replaced_leaf");
     passed += run(map_and_frame_case, "map_frame");
-    passed += run(actual_spawn_map_case, "actual_spawn_map");
-    fprintf(stdout, "cases=%d failures=%d\n", 12, 12 - passed);
-    return passed == 12 ? 0 : 1;
+    passed += run(actual_spawn_success, "actual_spawn_map");
+    passed += run(actual_spawn_cancel, "actual_spawn_cancel");
+    fprintf(stdout, "cases=%d failures=%d\n", 13, 13 - passed);
+    return passed == 13 ? 0 : 1;
 }
