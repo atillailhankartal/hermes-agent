@@ -225,6 +225,45 @@ def test_running_route_change_never_reaches_observer_or_local_admission(shell, m
     assert not host.drain_one()
 
 
+def test_post_read_route_change_cannot_settle_or_run_model(shell, monkeypatch):
+    from hermes_cli.trusted_inbound_broker import TrustedInboundBrokerClient
+
+    host, ctx = context(shell)
+    claim = host.claim()
+    assert deliver(ctx, claim).state == "unknown"
+    original_lookup = host.queue.lookup
+    mutated = []
+
+    def change_after_running_read(profile, epoch, delivery):
+        row = original_lookup(profile, epoch, delivery)
+        if row is not None and row["execution"] == "running" and not mutated:
+            with host.queue._connection() as db:
+                db.execute("UPDATE candidates SET session_key=? WHERE candidate=?",
+                           ("forged-key", row["candidate"]))
+            mutated.append(row["candidate"])
+        return row
+
+    monkeypatch.setattr(host.queue, "lookup", change_after_running_read)
+    observed = []
+    original_observe = TrustedInboundBrokerClient.observe_native_turn
+
+    def observe(client, snapshot):
+        observed.append(original_observe(client, snapshot))
+        return observed[-1]
+
+    monkeypatch.setattr(TrustedInboundBrokerClient, "observe_native_turn", observe)
+    model_calls = []
+    bind_real_agent_thread(shell, lambda **kwargs: model_calls.append(kwargs))
+    assert host.drain_one()
+    assert mutated and len(observed) == 1 and observed[0].state == "unknown"
+    assert model_calls == []
+    row = original_lookup(host.profile, claim.route_epoch, "delivery")
+    assert row["session_key"] == "forged-key"
+    assert row["state"] == "unknown" and row["execution"] == "handler_returned"
+    assert host.query(route_claim=claim, delivery_id="delivery",
+                      expected_content="native prompt").state == "unknown"
+
+
 def test_slot_failure_never_settles_or_requeues(shell, monkeypatch):
     host, ctx = context(shell)
     claim = host.claim()
@@ -416,9 +455,9 @@ def test_settlement_postcommit_error_has_durable_receipt_and_no_second_turn(shel
     calls = []
     bind_real_agent_thread(shell, lambda **kw: calls.append(kw))
     original = host.queue.settle
-    def settle_then_fail(candidate):
+    def settle_then_fail(row):
         assert host.active_turn is not None
-        assert original(candidate)
+        assert original(row)
         raise OSError("after native turn commit")
     monkeypatch.setattr(host.queue, "settle", settle_then_fail)
     deliver(ctx, claim)

@@ -257,7 +257,7 @@ class GatewayPluginInjectionMixin:
                     if snapshot.host_owner_id != self.session_store._route_owner_id:
                         return False
                     TrustedInboundBrokerClient().observe_native_turn(snapshot)
-                    return queue.settle(row["candidate"])
+                    return queue.settle(row)
             except ActiveSessionRegistryError:
                 return False
 

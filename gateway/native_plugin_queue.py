@@ -138,11 +138,17 @@ class NativePluginQueue:
             self._scan_after, self._scan_through = rows[-1]["sequence"], through
         return rows
 
-    def settle(self, candidate: str) -> bool:
-        """Called only while the real native slot, turn lease and route gate are held."""
+    def settle(self, original: dict) -> bool:
+        """Atomically settle only the exact candidate seen under the native turn lease."""
+        fields = ("sequence", "profile", "epoch", "delivery", "session_key", "native_id",
+                  "owner", "plugin", "content", "payload_digest", "candidate", "reason")
+        where = " AND ".join(f"{field}=?" for field in fields)
         with self._connection() as db:
-            changed = db.execute("""UPDATE candidates SET state='admitted', reason='native_turn_admitted'
-                WHERE candidate=? AND state='unknown' AND execution='running'""", (candidate,)).rowcount
+            changed = db.execute(
+                "UPDATE candidates SET state='admitted', reason='native_turn_admitted' "
+                f"WHERE state='unknown' AND execution='running' AND {where}",
+                tuple(original[field] for field in fields),
+            ).rowcount
         return changed == 1
 
     def transition(self, candidate: str, expected: str, execution: str) -> bool:
