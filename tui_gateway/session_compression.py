@@ -5,10 +5,14 @@ onto server.py's globals (method_ctx.bind_module) and reference them bare."""
 from __future__ import annotations
 
 import contextlib
+import uuid
 
 from utils import is_truthy_value
 
 from .method_ctx import bind_module
+
+
+_IN_PLACE_COMMIT_KEY = "_tui_in_place_compression_commit_id"
 
 
 def _tui_compression_config_signature(cfg: dict | None) -> tuple:
@@ -246,6 +250,8 @@ class _CompressionSnapshotStale(Exception):
 class _TuiCompressionCommit:
     """Pin the host route and registry row across the short core DB + TUI publication."""
 
+    in_place_commit_key = _IN_PLACE_COMMIT_KEY
+
     def __init__(self, sid: str, session: dict, history_version: int):
         self.sid = sid
         self.session = session
@@ -257,6 +263,7 @@ class _TuiCompressionCommit:
         self._route_staged = None
         self._registry_guard = None
         self._owner = None
+        self._in_place_before = None
 
     def __enter__(self):
         from hermes_cli.active_sessions import ActiveSessionRegistryError, active_session_lease_guard
@@ -310,6 +317,60 @@ class _TuiCompressionCommit:
         """Transfer the pinned JSON row while SQLite can still roll its child back."""
         self._owner.transfer(child_id, metadata=_lease_metadata(self.sid))
         self._route_staged = child_id
+
+    def _read_in_place_state(self, agent, *, include_messages: bool) -> tuple[str | None, tuple, list | None]:
+        """Read one authoritative SQLite snapshot on a fresh, read-only connection."""
+        from hermes_state import SessionDB
+        from hermes_state_sessions import _parse_model_config
+
+        fresh = SessionDB(db_path=agent._session_db.db_path, read_only=True)
+        try:
+            # get_session and get_messages_as_conversation share this handle in read-only mode.
+            # BEGIN pins both reads to one WAL snapshot, even if another process writes later.
+            fresh._conn.execute("BEGIN")
+            try:
+                row = fresh.get_session(self.key)
+                if row is None:
+                    raise RuntimeError("in-place compression session disappeared during readback")
+                marker = _parse_model_config(row.get("model_config")).get(_IN_PLACE_COMMIT_KEY)
+                signature = (row.get("message_count"), row.get("tool_call_count"), row.get("system_prompt_hash"))
+                messages = (fresh.get_messages_as_conversation(self.key, include_row_ids=True)
+                            if include_messages else None)
+                return marker, signature, messages
+            finally:
+                fresh._conn.rollback()
+        finally:
+            fresh.close()
+
+    def prepare_in_place(self, agent) -> str:
+        """Capture constant-size old state before the in-place transaction starts."""
+        self._in_place_before = self._read_in_place_state(agent, include_messages=False)[:2]
+        return uuid.uuid4().hex
+
+    def reconcile_failed_in_place(self, agent, commit_id: str) -> list | None:
+        """Resolve an uncertain COMMIT without trusting the throwing writer connection.
+
+        A matching commit id proves that the archive transaction committed. Its transcript
+        becomes the live transcript. The old id and counters prove rollback: the id is
+        written in the SAME transaction as the archive, under the host and DB leases.
+        Every other result keeps the host record faulted.
+        """
+        try:
+            marker, signature, messages = self._read_in_place_state(agent, include_messages=True)
+            if marker == commit_id:
+                if not messages:
+                    raise RuntimeError("committed in-place compression has no readable transcript")
+                for message in messages:
+                    message.pop("_row_id", None)
+                return messages
+            if (self._in_place_before is not None
+                    and marker == self._in_place_before[0]
+                    and signature == self._in_place_before[1]):
+                return None
+            raise RuntimeError("in-place compression SQLite outcome is ambiguous")
+        except BaseException:
+            self.session["_compression_faulted"] = True
+            raise
 
     def reconcile_failed_rotation(self, agent, child_id: str) -> bool:
         """Resolve a SQLite COMMIT error before leaving the registry lock.

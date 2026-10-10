@@ -3611,62 +3611,7 @@ def _held_watermark(agent: Any, watermark: Optional[int], messages: list, verbat
     return held_archive_watermark(agent._session_db, agent.session_id, watermark, messages, verbatim_tail)
 
 
-def held_archive_watermark(
-    session_db: Any, session_id: str, watermark: Optional[int], messages: list, verbatim_tail: Optional[list] = None,
-    *, stale_raises: bool = False,
-) -> Optional[int]:
-    """The in-place archive watermark, capped at the newest durable row the compressor was handed.
-
-    The lease watermark is the newest row in state.db, but a surface compacts the history it holds, and that
-    can be older: a Desktop/TUI or CLI ``/compress`` does not hold turns another surface appended to the same
-    session since it loaded. Archived under the watermark, those rows would leave every surface's
-    history and search, and the summary never saw them. Above the cap they take the concurrent-append path
-    instead (cloned after the compacted set).
-
-    Only while the held history is a live prefix of the session: its LAST row names an exact ``_row_id``, and
-    that row is still active (after another surface compacted, the held rows are archived and every live row
-    would be cloned beside the new summary). An id is exact while its dict is unchanged since it was loaded: a
-    dict loaded from the DB is born carrying both the id and the persist marker, and a pass that rewrote its
-    content drops the marker and keeps the id (the user/assistant merges in ``repair_message_sequence``, or a
-    context engine that rewrites in place). Such a row absorbed later durable rows whose ids are gone from the
-    held set, so its id no longer names what the summary covered: capped there, those rows would be cloned
-    live beside a summary that already contains them. A trailing row of unknown provenance may be durable
-    under the lease watermark without any stamp (the TUI model-switch marker, written with a bare
-    ``append_message``); capped below it, the clone would land beside its own carried copy. A ``here N`` tail
-    is marker-swept copies, so ``compress_now`` keeps a copy's id only when its source still carried the
-    marker; their ids are trusted as given.
-
-    *stale_raises*: the newest exact held row being inactive means another compaction already committed.
-    Under the in-place lease that cannot overlap a live compaction, so the lease watermark is returned; a
-    lease-less caller (prune, micro-compaction) passes ``True`` and gets :class:`StaleHeldHistory` instead,
-    because for it the fallback would publish a stale generation beside the winner.
-    """
-    if watermark is None:
-        return None
-    from agent.context_compressor import _DB_PERSISTED_MARKER, StaleHeldHistory
-
-    def _exact_id(m: dict, copied: bool) -> Optional[int]:
-        rid = m.get("_row_id")
-        if not isinstance(rid, int) or isinstance(rid, bool) or rid <= 0:
-            return None
-        return rid if copied or m.get(_DB_PERSISTED_MARKER) else None
-
-    ids = [_exact_id(m, False) for m in messages if isinstance(m, dict)]
-    ids += [_exact_id(m, True) for m in (verbatim_tail or ()) if isinstance(m, dict)]
-    held = [rid for rid in ids if rid is not None]
-    if not ids or ids[-1] is None:
-        return watermark
-    newest_held = max(held)
-    # A lease-less caller checks liveness even when nothing was appended: a commit-time re-check against a
-    # watermark read before the slow step never sees newest_held < watermark, yet the winner may have landed.
-    if newest_held >= watermark and not stale_raises:
-        return watermark
-    if session_db.get_message_role(session_id, newest_held) is None:
-        if stale_raises:
-            raise StaleHeldHistory(f"held row {newest_held} of session {session_id} is no longer active")
-        return watermark
-    return min(newest_held, watermark)
-
+from agent.conversation_compression_host_commit import held_archive_watermark
 
 def _commit_compaction(
     agent: Any, messages: list, compressed: list, *, in_place: bool, lease: _CompressionLease,
@@ -3676,7 +3621,7 @@ def _commit_compaction(
     defer_memory_commit: bool = False, prepared_candidate: Optional[tuple] = None,
     host_commit: Any = None,
 ) -> _CommitOutcome:
-    """Commit an in-place archive or rotated child and roll back the live list on failure.
+    """Commit an in-place archive or rotated child; settle host COMMIT faults before publication.
     A grown candidate returns ``refused_prompt``; ``verbatim_tail`` remains durable after success.
     """
     session_commit_succeeded = False
@@ -3749,13 +3694,25 @@ def _commit_compaction(
                     agent._session_db, agent.session_id,
                     messages_before_compression if messages_before_compression is not None else messages,
                     verbatim_tail)
-                agent._session_db.archive_and_compact(
-                    agent.session_id, persisted, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
-                    watermark=_held_watermark(agent, lease.watermark, messages, verbatim_tail),
-                    lock_holder=lease.holder, tail_count=tail_count, carried_messages=carried_messages,
-                    covered_ids=covered_ids, unresolved_held=unresolved_held,
-                    **({"system_prompt": new_system_prompt} if host_commit is not None else {}),
-                )
+                commit_id = host_commit.prepare_in_place(agent) if host_commit is not None else None
+                model_config_patch = {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None}
+                if commit_id is not None:
+                    model_config_patch[host_commit.in_place_commit_key] = commit_id
+                try:
+                    agent._session_db.archive_and_compact(
+                        agent.session_id, persisted, model_config_patch=model_config_patch,
+                        watermark=_held_watermark(agent, lease.watermark, messages, verbatim_tail),
+                        lock_holder=lease.holder, tail_count=tail_count, carried_messages=carried_messages,
+                        covered_ids=covered_ids, unresolved_held=unresolved_held,
+                        **({"system_prompt": new_system_prompt} if host_commit is not None else {}),
+                    )
+                except BaseException:
+                    if host_commit is None:
+                        raise
+                    reconciled = host_commit.reconcile_failed_in_place(agent, commit_id)
+                    if reconciled is None:  # fresh SQLite proved that the transaction rolled back
+                        raise
+                    persisted = reconciled
                 compressed = persisted
                 split_status = "in_place_committed"
                 # compress() returned marker-swept copies; stamp them as persisted or the next
@@ -3804,35 +3761,18 @@ def _commit_compaction(
                 agent._flushed_db_message_session_id = agent.session_id
             session_commit_succeeded = True
         except Exception as e:
-            # Rotation: atomic publication failed (including lease loss) — keep the parent live and discard the stale
-            # compacted snapshot. In-place: archive_and_compact is atomic so old rows stay active, but marker-swept
-            # `compressed` would re-INSERT on top of them (doubling each try); gate on split_status (set right after
-            # commit). Either way the deepcopy keeps markers/identity and only the prune runway rolls back (the full
-            # snapshot restore is for pre-commit cancels; telemetry keeps the failed values). _db_flush_scan_prefix is
-            # intentionally NOT cleared: the scan is identity-based and the deepcopy replaces every row.
+            # A host's uncertain in-place COMMIT was settled above, or its live record was faulted.
+            # Restore old markers on a failed publication so a later flush cannot re-INSERT a
+            # marker-swept compressed transcript beside the old rows. The faulted TUI record
+            # refuses subsequent prompts until a fresh restart reads the durable transcript.
             rotation_rollback = not in_place and old_session_id and agent.session_id == old_session_id
             if rotation_rollback or (
                 in_place and split_status != "in_place_committed" and messages_before_compression is not None
             ):
                 if rotation_rollback:
                     old_session_id = None
-                # In-place sibling of the rotation rollback above (#99477). archive_and_compact() is atomic,
-                # so a raise before it returned means EVERY pre-compaction row is still ``active = 1`` in
-                # state.db — nothing was archived and the compacted set was never inserted. But
-                # ``compressed`` is the marker-swept output of compress() (_strip_persistence_markers,
-                # #57491) and the post-commit ``stamp_db_persisted_markers`` never ran, so handing it back
-                # makes the next append-only flush treat the whole compacted transcript as new and INSERT it
-                # ON TOP of the rows it was supposed to replace. The active set then holds the summary AND
-                # the turns it summarized; the next resume reloads both, the token count goes UP, preflight
-                # fires again, and each failed attempt appends another copy of the protected head + tail
-                # (#99477: ~15 real turns stored as 3,814 rows, the first user message repeated 893 times).
-                # Gate on ``split_status`` rather than ``compacted_in_place``: it is assigned on the
-                # statement immediately after the atomic commit returns, so a committed compaction can never
-                # be rolled back into a live/durable mismatch of the opposite sign. The deepcopy carries
-                # each row's _DB_PERSISTED_MARKER from the pre-compression snapshot, so the restored
-                # transcript is correctly skipped by the flush, and replacing every dict breaks
-                # _db_flush_scan_prefix identity (same reasoning as the rotation branch — no explicit clear
-                # needed).
+                # The deepcopy carries persistence markers from the pre-compression snapshot.
+                # Replacing each dict also breaks the identity-based flush scan prefix.
                 messages[:] = copy.deepcopy(messages_before_compression)
                 compressed = messages
                 made_progress = False
@@ -3845,6 +3785,8 @@ def _commit_compaction(
                     "Compression rotation aborted and rolled back to the parent session (%s): %s",
                     agent.session_id or "?", e,
                 )
+            elif in_place:
+                logger.warning("In-place session DB compression failed: %s", e)
             else:
                 logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
             # Arm the failure cooldown so the next turn can't rerun the doomed compression;

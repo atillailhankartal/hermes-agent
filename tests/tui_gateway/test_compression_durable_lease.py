@@ -378,6 +378,147 @@ def test_registry_transfer_then_sqlite_commit_error_reconciles_from_readback(
         db.close()
 
 
+@pytest.mark.parametrize("settlement", ["committed", "rolled_back", "unreadable", "cancelled_after_commit"])
+def test_in_place_sqlite_commit_error_reconciles_or_faults_before_prompt(
+        tmp_path, monkeypatch, settlement):
+    """The real DB can commit and still raise; the host must publish or reject the next turn."""
+    db, agent, session, before, home, compressor, hooks = _real_session(
+        tmp_path, monkeypatch, in_place=True)
+    parent = session["session_key"]
+    compressor.compress.side_effect = lambda _messages, *_a, **_kw: [
+        {"role": "user", "content": SUMMARY_PREFIX + " earlier turns"}, before[-1].copy()]
+    real_conn = db._conn
+    real_archive = db.archive_and_compact
+    real_get_messages = SessionDB.get_messages_as_conversation
+    armed = fired = False
+
+    def arm_archive(*args, **kwargs):
+        nonlocal armed
+        armed = True
+        return real_archive(*args, **kwargs)
+
+    class CommitFaultConnection:
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+        def commit(self):
+            nonlocal fired
+            if armed and not fired:
+                fired = True
+                if settlement != "rolled_back":
+                    real_conn.commit()
+                if settlement == "cancelled_after_commit":
+                    raise KeyboardInterrupt("injected cancellation after SQLite COMMIT")
+                raise OSError("injected in-place COMMIT result failure")
+            return real_conn.commit()
+
+    def unreadable_after_commit(handle, *args, **kwargs):
+        if settlement == "unreadable" and fired and handle.read_only:
+            raise OSError("injected fresh SQLite readback failure")
+        return real_get_messages(handle, *args, **kwargs)
+
+    try:
+        db._conn = CommitFaultConnection()
+        db.archive_and_compact = arm_archive
+        with patch.object(SessionDB, "get_messages_as_conversation", unreadable_after_commit):
+            if settlement in {"committed", "cancelled_after_commit"}:
+                with server._manual_compress_turn("ui", session):
+                    removed, _usage = server._compress_session_history(session)
+                    assert removed > 0
+            else:
+                with pytest.raises(RuntimeError, match="persistence failed"):
+                    with server._manual_compress_turn("ui", session):
+                        server._compress_session_history(session)
+        assert armed and fired
+        db._conn = real_conn
+        db.archive_and_compact = real_archive
+        fresh = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            durable = fresh.get_messages_as_conversation(parent)
+            if settlement in {"committed", "cancelled_after_commit"}:
+                assert session["history"] == durable
+                assert len(durable) < len(before)
+                assert session["history_version"] == 1
+                assert session.get("_compression_faulted") is not True
+                assert hooks.count("session:compress") == 1
+                assert server._ensure_active_session_slot("ui", session) is None
+            elif settlement == "rolled_back":
+                assert durable == before == session["history"]
+                assert session["history_version"] == 0
+                assert session.get("_compression_faulted") is not True
+                assert "session:compress" not in hooks
+                assert server._ensure_active_session_slot("ui", session) is None
+                with server._manual_compress_turn("ui", session):
+                    removed, _usage = server._compress_session_history(session)
+                    assert removed > 0
+                assert hooks.count("session:compress") == 1
+                replayed = fresh.get_messages_as_conversation(parent)
+                assert [(m["role"], m["content"]) for m in session["history"]] == [
+                    (m["role"], m["content"]) for m in replayed
+                ]
+                assert len(replayed) < len(before)
+                assert session["history_version"] == 1
+            else:
+                assert len(durable) < len(before)
+                assert session["history_version"] == 0
+                assert session["_compression_faulted"] is True
+                assert "session:compress" not in hooks
+                assert server._ensure_active_session_slot("ui", session) is not None
+                previous = server._sessions.get("ui")
+                server._sessions["ui"] = session
+                try:
+                    refused = server.handle_request(
+                        {"id": "faulted-in-place-prompt", "method": "prompt.submit",
+                         "params": {"session_id": "ui", "text": "continue"}})
+                    assert refused["error"]["code"] == 4090
+                finally:
+                    if previous is None:
+                        server._sessions.pop("ui", None)
+                    else:
+                        server._sessions["ui"] = previous
+                with pytest.raises(RuntimeError, match="could not safely reserve"):
+                    with server._manual_compress_turn("ui", session):
+                        pass
+                # A new process constructs its history from the committed SQLite rows.
+                # Once the old runtime lease is gone, a fresh record can own that tip.
+                resumed_history, _display, _prefix = server._load_resume_transcript(
+                    fresh, parent, model_history_only=True)
+                assert len(resumed_history) == len(durable)
+                if session.get("active_session_lease") is not None:
+                    session["active_session_lease"].release()
+                restart_db = SessionDB(db_path=tmp_path / "state.db")
+                resumed_agent = AIAgent(
+                    api_key="fixture-only", base_url="http://127.0.0.1:9/v1", model="test/model",
+                    platform="tui", quiet_mode=True, session_db=restart_db, session_id=parent,
+                    skip_context_files=True, skip_memory=True, enabled_toolsets=[],
+                )
+                resumed = {
+                    "agent": resumed_agent, "history_lock": threading.Lock(),
+                    "history": resumed_history, "history_version": 0, "running": False,
+                    "session_key": parent, "profile_home": home, "source": "tui",
+                    "active_session_lease": None,
+                }
+                try:
+                    assert server._ensure_active_session_slot("restarted", resumed) is None
+                    assert server._prove_active_session_slot("restarted", resumed) is None
+                    assert resumed.get("_compression_faulted") is None
+                finally:
+                    if resumed.get("active_session_lease") is not None:
+                        resumed["active_session_lease"].release()
+                    resumed_agent.close()
+                    restart_db.close()
+            _resume_in_fresh_tui_record(monkeypatch, fresh, parent, parent)
+        finally:
+            fresh.close()
+    finally:
+        db._conn = real_conn
+        db.archive_and_compact = real_archive
+        if session.get("active_session_lease") is not None:
+            session["active_session_lease"].release()
+        agent.close()
+        db.close()
+
+
 @pytest.mark.parametrize("fault", ["unreadable_sqlite", "failed_registry_compensation"])
 def test_unresolved_commit_fault_blocks_live_route_and_restart_resolves_from_db(
         tmp_path, monkeypatch, fault):
