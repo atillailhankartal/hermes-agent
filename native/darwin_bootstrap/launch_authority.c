@@ -106,11 +106,9 @@ void bh_a2a_root_cancel(struct bh_a2a_root *root) {
         root->socket_fd = -1;
         (void)close(fd);
     }
-    if (root->parent_fd >= 0 && !root->bound) {
-        int fd = root->parent_fd;
-        root->parent_fd = -1;
-        (void)close(fd);
-    }
+    /* The parent FD transfers only after bind and is retained for exact-node
+     * cleanup. Before bind it belongs to the caller; never close slot 0 from
+     * a zero-initialized context. */
 }
 #include "abi_v1.h"
 

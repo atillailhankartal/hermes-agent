@@ -43,8 +43,8 @@ def main():
         if sum(path.stat().st_size for path in target.iterdir()) >= 64 * 1024**2:
             raise SystemExit("UNAVAILABLE: A2a build exceeded 64 MiB")
         output = run([str(suite), str(child)], timeout=20)
-        if "cases=11 failures=0" not in output:
-            raise SystemExit("A2a suite did not report eleven passing cases")
+        if "cases=12 failures=0" not in output:
+            raise SystemExit("A2a suite did not report twelve passing cases")
         print(output, end="")
 
 

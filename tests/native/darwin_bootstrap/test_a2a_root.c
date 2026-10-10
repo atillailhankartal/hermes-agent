@@ -71,6 +71,17 @@ static void sentinel_case(void) {
     (void)close(sentinel);
 }
 
+static void zero_cancel_case(void) {
+    struct bh_a2a_root root = {0};
+    struct stat before;
+    struct stat after;
+    clean_child_table();
+    check(fstat(0, &before) == 0, "stdio_before_zero_cancel");
+    bh_a2a_root_cancel(&root);
+    check(fstat(0, &after) == 0 && before.st_dev == after.st_dev &&
+          before.st_ino == after.st_ino, "zero_context_cancel_preserves_stdio");
+}
+
 static void inventory_case(void) {
     const int allowed[] = {0, 1, 2};
     struct bh_a2a_inventory snapshot;
@@ -386,11 +397,12 @@ int main(int argc, char **argv) {
     passed += run(source6, "source6");
     passed += run(source64, "source64");
     passed += run(sentinel_case, "sentinel6");
+    passed += run(zero_cancel_case, "zero_cancel");
     passed += run(inventory_case, "inventory");
     passed += run(bound_case, "bound");
     passed += run(replaced_leaf_case, "replaced_leaf");
     passed += run(map_and_frame_case, "map_frame");
     passed += run(actual_spawn_map_case, "actual_spawn_map");
-    fprintf(stdout, "cases=%d failures=%d\n", 11, 11 - passed);
-    return passed == 11 ? 0 : 1;
+    fprintf(stdout, "cases=%d failures=%d\n", 12, 12 - passed);
+    return passed == 12 ? 0 : 1;
 }
