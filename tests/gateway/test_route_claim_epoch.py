@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from contextvars import copy_context
 from datetime import datetime
 from dataclasses import replace
 import json
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
+from agent.delegation_context import delegated_child_context
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, SessionStore
@@ -362,6 +364,157 @@ async def test_bee_tool_dispatch_gets_private_current_claim_not_model_args(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_copied_gateway_tool_context_cannot_reopen_resumed_same_id_route(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    stale_lease = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = stale_lease
+    called = []
+    monkeypatch.setattr(registry, "dispatch", lambda *_args, **_kwargs: called.append(True) or "ok")
+    ids = _CallIds(session_id="A", task_id="turn", tool_call_id="tool")
+
+    try:
+        with gateway_route_scope(runner, "route", 1, entry.origin):
+            stale_context = copy_context()
+            original_epoch = entry.route_epoch
+            assert store.switch_session("route", "B", expected_session_id="A")
+            resumed = store.switch_session("route", "A", expected_session_id="B")
+            assert resumed and resumed.route_epoch != original_epoch
+            before = store.snapshot_route_entry("route")
+            assert (before.route_claim_blocked, before.route_claim_recoverable) == (True, True)
+            assert stale_context.run(claim_for_tool, "A") is None
+            denied = stale_context.run(
+                _execute_tool, "bee_peers", {}, {}, ids, user_task=None,
+                enabled_tools=None, skip_tool_execution_middleware=True,
+            )
+            after = store.snapshot_route_entry("route")
+            durable = _durable(tmp_path)
+            assert "route" in denied.lower() or "session" in denied.lower()
+            assert called == []
+            assert (after.route_epoch, after.route_claim_blocked, after.route_claim_recoverable) == (
+                before.route_epoch, True, True,
+            )
+            assert (durable["route_epoch"], durable["route_claim_blocked"],
+                    durable["route_claim_recoverable"]) == (before.route_epoch, True, True)
+    finally:
+        runner._turn_leases.release(stale_lease)
+        runner._session_state("route").turn.lease_tokens.pop(1, None)
+
+    runner._session_state("route").persistent.run_generation = 2
+    fresh_lease = await runner._turn_leases.acquire("A", owner_key="route", generation=2, timeout=1)
+    runner._session_state("route").turn.lease_tokens[2] = fresh_lease
+    try:
+        with gateway_route_scope(runner, "route", 2, resumed.origin):
+            assert _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                                 enabled_tools=None, skip_tool_execution_middleware=True) == "ok"
+            assert called == [True]
+            assert (_durable(tmp_path)["route_claim_blocked"],
+                    _durable(tmp_path)["route_claim_recoverable"]) == (False, False)
+    finally:
+        runner._turn_leases.release(fresh_lease)
+
+
+@pytest.mark.asyncio
+async def test_gateway_direct_dispatch_denies_foreign_profile_child_and_replaced_lease(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._session_state("route").persistent.run_generation = 1
+    lease = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = lease
+    assert store.revoke_route_claim("route")
+    called = []
+    monkeypatch.setattr(registry, "dispatch", lambda *_args, **_kwargs: called.append(True) or "ok")
+    ids = _CallIds(session_id="A", task_id="turn", tool_call_id="tool")
+
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path / "foreign"
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        denied = _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                               enabled_tools=None, skip_tool_execution_middleware=True)
+        assert "route" in denied.lower() or "session" in denied.lower()
+
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        with delegated_child_context("A"):
+            denied = _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                                   enabled_tools=None, skip_tool_execution_middleware=True)
+            assert "route" in denied.lower() or "session" in denied.lower()
+        child_ids = _CallIds(session_id="child", task_id="turn", tool_call_id="tool")
+        denied = _execute_tool("bee_peers", {}, {}, child_ids, user_task=None,
+                               enabled_tools=None, skip_tool_execution_middleware=True)
+        assert "route" in denied.lower() or "session" in denied.lower()
+        copied = copy_context()
+        runner._turn_leases.release(lease)
+        replacement = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+        runner._session_state("route").turn.lease_tokens[1] = replacement
+        try:
+            denied = copied.run(_execute_tool, "bee_peers", {}, {}, ids, user_task=None,
+                                enabled_tools=None, skip_tool_execution_middleware=True)
+            assert "route" in denied.lower() or "session" in denied.lower()
+            assert called == []
+            assert (_durable(tmp_path)["route_claim_blocked"],
+                    _durable(tmp_path)["route_claim_recoverable"]) == (True, True)
+        finally:
+            runner._turn_leases.release(replacement)
+            runner._session_state("route").turn.lease_tokens.pop(1, None)
+
+    fresh = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = fresh
+    try:
+        with gateway_route_scope(runner, "route", 1, entry.origin):
+            assert _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                                 enabled_tools=None, skip_tool_execution_middleware=True) == "ok"
+            assert called == [True]
+    finally:
+        runner._turn_leases.release(fresh)
+
+
+@pytest.mark.asyncio
+async def test_gateway_direct_epoch_check_happens_inside_durable_reopen_lock(tmp_path, monkeypatch):
+    store, entry = _store(tmp_path, monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_state("route").persistent.run_generation = 1
+    lease = await runner._turn_leases.acquire("A", owner_key="route", generation=1, timeout=1)
+    runner._session_state("route").turn.lease_tokens[1] = lease
+    assert store.revoke_route_claim("route")
+    captured_epoch = entry.route_epoch
+    called = []
+    monkeypatch.setattr(registry, "dispatch", lambda *_args, **_kwargs: called.append(True) or "ok")
+    reopen = store._reopen_route_claim_with_lease
+
+    def repoint_before_reopen(session_key, native_id, token, *, expected_route_epoch=None):
+        assert expected_route_epoch == captured_epoch
+        assert store.switch_session("route", "B", expected_session_id="A")
+        assert store.switch_session("route", "A", expected_session_id="B")
+        return reopen(session_key, native_id, token, expected_route_epoch=expected_route_epoch)
+
+    monkeypatch.setattr(store, "_reopen_route_claim_with_lease", repoint_before_reopen)
+    try:
+        with gateway_route_scope(runner, "route", 1, entry.origin):
+            ids = _CallIds(session_id="A", task_id="turn", tool_call_id="tool")
+            denied = _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                                   enabled_tools=None, skip_tool_execution_middleware=True)
+            assert "route" in denied.lower() or "session" in denied.lower()
+            assert called == []
+            current = store.snapshot_route_entry("route")
+            durable = _durable(tmp_path)
+            assert current.route_epoch != captured_epoch
+            assert (current.route_claim_blocked, current.route_claim_recoverable) == (True, True)
+            assert (durable["route_epoch"], durable["route_claim_blocked"],
+                    durable["route_claim_recoverable"]) == (current.route_epoch, True, True)
+    finally:
+        runner._turn_leases.release(lease)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("writer", ["advance", "retry_reroute"])
 async def test_unleased_store_level_compression_repoint_stays_closed_to_bee(tmp_path, monkeypatch, writer):
     """These background writers lack a proven A→B turn-lease transfer: deny claims."""
@@ -451,9 +604,17 @@ async def test_child_compaction_lifecycle_follows_durable_lease_handoff(tmp_path
     runner._session_state("route").turn.lease_tokens[1] = token
     emitted = AsyncMock()
     monkeypatch.setattr("gateway.route_lifecycle.emit_route_lifecycle", emitted)
+    dispatched = []
+    monkeypatch.setattr(registry, "dispatch", lambda *_args, **_kwargs: dispatched.append(True) or "ok")
     old_epoch = entry.route_epoch
     try:
-        await runner._hmwa_publish_compression_child_route(entry, "B", "route", 1)
+        with gateway_route_scope(runner, "route", 1, entry.origin):
+            await runner._hmwa_publish_compression_child_route(entry, "B", "route", 1)
+            ids = _CallIds(session_id="B", task_id="turn", tool_call_id="tool")
+            assert _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                                 enabled_tools=None, skip_tool_execution_middleware=True) == "ok"
+            assert dispatched == [True]
+            assert _durable(tmp_path)["route_claim_blocked"] is False
         emitted.assert_awaited_once()
         _, name, payload = emitted.await_args.args
         assert name == "on_session_compacted"
@@ -697,6 +858,12 @@ async def test_legacy_route_epoch_requires_held_exact_lease_and_durable_save(tmp
         assert claim_for_tool("A") is None
     assert entry.route_epoch is None and _durable(tmp_path)["route_epoch"] is None
     monkeypatch.setattr(store, "_save_entry", real_save)
+    with gateway_route_scope(runner, "route", 1, entry.origin):
+        ids = _CallIds(session_id="A", task_id="turn", tool_call_id="tool")
+        denied = _execute_tool("bee_peers", {}, {}, ids, user_task=None,
+                               enabled_tools=None, skip_tool_execution_middleware=True)
+        assert "route" in denied.lower() or "session" in denied.lower()
+    assert entry.route_epoch is None and _durable(tmp_path)["route_epoch"] is None
     with gateway_route_scope(runner, "route", 1, entry.origin):
         claim = claim_for_tool("A")
     assert claim and claim.is_current()

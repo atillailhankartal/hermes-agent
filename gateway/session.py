@@ -815,6 +815,9 @@ class SessionStore(
         self._route_owner_id = new_route_epoch()
         self._route_claim_proof = object()
         self._route_owner_retired = False
+        # Process-local continuations of a published compression route. A copied tool scope
+        # may follow only these exact epochs; /new and /resume mint unrelated epochs.
+        self._route_compression_lineage: Dict[tuple[str, str, str], tuple[str, str]] = {}
         self._save_lock = threading.Lock()  # whole-index persistence, never held with _lock
         # Fast (single-entry) and full saves share one generation counter so they are totally
         # ordered; _fast_persisted_entries: key -> (revision, entry_json) since the last rewrite.
@@ -1424,6 +1427,49 @@ class SessionStore(
                 transport_profile=new_entry.transport_profile,
             )
         return new_entry
+
+    def publish_compression_child_route(
+        self, session_key: str, expected_entry: SessionEntry, parent_session_id: str,
+        child_session_id: str, *, still_current=None,
+    ) -> bool:
+        parent_epoch = expected_entry.route_epoch
+        committed = super().publish_compression_child_route(
+            session_key, expected_entry, parent_session_id, child_session_id,
+            still_current=still_current,
+        )
+        if not committed:
+            return False
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if (current is expected_entry and parent_epoch and current.route_epoch
+                    and current.session_id == child_session_id
+                    and parent_session_id != child_session_id):
+                self._route_compression_lineage[
+                    (session_key, parent_session_id, parent_epoch)
+                ] = (child_session_id, current.route_epoch)
+                # Old scopes fail closed if a long-running host exceeds this bounded lineage.
+                if len(self._route_compression_lineage) > 512:
+                    self._route_compression_lineage.pop(next(iter(self._route_compression_lineage)))
+        return True
+
+    def _bound_gateway_tool_epoch(
+        self, session_key: str, initial_session_id: str, initial_epoch: str,
+        native_session_id: str,
+    ) -> Optional[str]:
+        """Resolve only a live, durably published compression descendant of a scope epoch."""
+        with self._lock:
+            current = self._entry_locked(session_key)
+            if current is None:
+                return None
+            node = (initial_session_id, initial_epoch)
+            for _ in range(513):
+                if node == (current.session_id, current.route_epoch):
+                    return node[1] if native_session_id == node[0] else None
+                successor = self._route_compression_lineage.get((session_key, *node))
+                if successor is None:
+                    return None
+                node = successor
+            return None
 
     def _reopen_route_claim_with_lease(
         self, session_key: str, native_session_id: str, token, *,

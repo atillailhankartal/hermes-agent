@@ -828,9 +828,9 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
     if function_name.startswith("bee_"):
         # Gateway proof is host-only. A model-authored argument, ambient session env, or
         # detached subagent ID can never supply it; CLI tools have no Gateway route scope.
-        from gateway.route_claim import claim_for_tool, gateway_route_bound
+        from gateway.route_claim import claim_for_direct_gateway_tool, gateway_route_bound
         if gateway_route_bound():
-            route_claim = claim_for_tool(ids.session_id)
+            route_claim = claim_for_direct_gateway_tool(ids.session_id)
             if route_claim is None:
                 return tool_error("Gateway route is no longer current", error_type="session_closed")
             dispatch_kwargs["route_claim"] = route_claim

@@ -60,6 +60,7 @@ class _BoundGatewayRoute:
     profile_matches: bool
     initial_session_id: Optional[str]
     initial_route_epoch: Optional[str]
+    turn_lease_token: Any = None
     agent_holder: Any = None
 
 
@@ -82,11 +83,17 @@ def gateway_route_scope(
     except Exception:
         logger.debug("Gateway route snapshot failed", exc_info=True)
         route = None
+    try:
+        held = runner._held_turn_lease(session_key, run_generation)
+        lease_token = held[1].get(run_generation) if held else None
+    except Exception:
+        logger.debug("Gateway turn lease snapshot failed", exc_info=True)
+        lease_token = None
     token = _BOUND_ROUTE.set(_BoundGatewayRoute(
         runner, session_key, run_generation, actual_home, actual_home == expected_home,
         route.session_id if route is not None else None,
         route.route_epoch if route is not None else None,
-        agent_holder,
+        lease_token, agent_holder,
     ))
     try:
         yield
@@ -116,6 +123,24 @@ def bound_session_key_for_tool(native_session_id: str, session_key: str) -> Opti
             or not claim.is_current(session_key=session_key, native_session_id=native_session_id)):
         return None
     return session_key
+
+
+def claim_for_direct_gateway_tool(native_session_id: str) -> Optional[RouteClaim]:
+    """Bind Bee dispatch to this turn's route epoch or a published compression child."""
+    bound = _BOUND_ROUTE.get()
+    if (bound is None or not bound.profile_matches or not bound.initial_route_epoch
+            or not bound.initial_session_id or bound.turn_lease_token is None):
+        return None
+    from agent.delegation_context import is_delegated_child_context
+    if is_delegated_child_context():
+        return None
+    expected_epoch = bound.runner.session_store._bound_gateway_tool_epoch(
+        bound.session_key, bound.initial_session_id, bound.initial_route_epoch,
+        native_session_id,
+    )
+    if expected_epoch is None:
+        return None
+    return claim_for_tool(native_session_id, expected_route_epoch=expected_epoch)
 
 
 def claim_for_route(runner: Any, entry: Any, source: Any) -> Optional[RouteClaim]:
@@ -159,6 +184,13 @@ def claim_for_tool(
         return None
     runner, key, generation = bound.runner, bound.session_key, bound.run_generation
     store = runner.session_store
+    if expected_route_epoch is None and bound.initial_route_epoch:
+        expected_route_epoch = store._bound_gateway_tool_epoch(
+            key, bound.initial_session_id, bound.initial_route_epoch,
+            native_session_id,
+        )
+        if expected_route_epoch is None:
+            return None
 
     def compacted_in_place() -> bool:
         holder = bound.agent_holder
@@ -172,7 +204,8 @@ def claim_for_tool(
         if held is None:
             return False
         token = held[1].get(generation)
-        return bool(token and not token.released and token.lease.holder is token
+        return bool(token is not None and token is bound.turn_lease_token and not token.released
+                    and token.lease.holder is token
                     and token.session_id == native_session_id)
 
     if getattr(store, "_route_owner_retired", False) or compacted_in_place() or not owns_turn():
