@@ -1782,8 +1782,10 @@ class TurnRunner:
             logger.debug("Failed to restore thread_id from binding after session split", exc_info=True)
 
     def _sync_session_after_run(self, agent_history):
-        """Sync session_id right after run_conversation(): compression can rotate before a follow-up
-        model call fails, and the failure return must still point at the compressed child.
+        """Return a compression candidate after run_conversation(), including failure returns.
+
+        Route publication belongs to the outer async turn, which owns the admission gate,
+        turn lease and durable compare-and-swap. The executor must never mutate the entry.
         Returns (compacted_in_place, effective_session_id, effective_history_offset)."""
         ctx = self._ctx
         runner = self._runner
@@ -1794,41 +1796,7 @@ class TurnRunner:
         agent_session_id = getattr(agent, 'session_id', ctx.session_id) if agent else ctx.session_id
         session_was_split = bool(agent and ctx.session_key and agent_session_id != ctx.session_id)
         if session_was_split:
-            logger.info("Session split detected: %s → %s (compression)", ctx.session_id, agent_session_id)
-            entry = runner.session_store._entries.get(ctx.session_key)
-            persisted = False
-            if entry:
-                entry_session_id = getattr(entry, "session_id", None)
-                if not ctx._run_still_current():
-                    logger.info(
-                        "Skipping session split sync for stale run %s — "
-                        "generation %s is no longer current",
-                        ctx.session_key or "?", ctx.run_generation,
-                    )
-                elif entry_session_id == agent_session_id:
-                    persisted = True
-                elif entry_session_id != ctx.session_id:
-                    logger.info(
-                        "Skipping session split sync for %s because the "
-                        "session binding moved from %s to %s before "
-                        "compression finished",
-                        ctx.session_key or "?", ctx.session_id, entry_session_id,
-                    )
-                else:
-                    entry.session_id = agent_session_id
-                    runner.session_store._save()
-                    runner.session_store._record_gateway_session_peer(agent_session_id, ctx.session_key, ctx.source)
-                    persisted = True
-            # Only after this run published its split — a stale /stop→/new predecessor must not
-            # mutate routing state.
-            if persisted:
-                src = ctx.source
-                if (
-                    getattr(src, "platform", None) == Platform.TELEGRAM and getattr(src, "chat_type", None) == "dm"
-                    and getattr(src, "thread_id", None) is None and runner._session_db is not None
-                ):
-                    self._restore_telegram_thread_id_after_split(agent_session_id)
-                runner._sync_telegram_topic_binding(src, entry, reason="agent-run-compression")
+            logger.info("Session split candidate: %s → %s (compression)", ctx.session_id, agent_session_id)
         runner._sync_session_model_from_agent(agent_session_id, agent)
         # history_offset=0 whenever the agent's message list lost the original history prefix
         # (split OR in-place compaction): the returned `messages` is the compacted set, persist all

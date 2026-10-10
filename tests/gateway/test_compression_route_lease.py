@@ -14,6 +14,8 @@ from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
 from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, SessionStore
 from gateway.turn_lease import SessionTurnLeaseRegistry, TurnLeaseTimeoutError
+from gateway.run_turn_runner import TurnRunner
+from gateway.turn_context import TurnContext
 
 
 _HISTORY = [{"role": "user", "content": "a" * 1000}] * 4
@@ -40,6 +42,7 @@ async def _runner(tmp_path, monkeypatch):
     runner._async_session_store = AsyncSessionStore(store)
     runner._turn_leases = SessionTurnLeaseRegistry()
     runner._sync_telegram_topic_binding = Mock()
+    runner._session_db = None
     runner._session_state("route").persistent.run_generation = 1
     token = await runner._turn_leases.acquire("old", owner_key="route", generation=1, timeout=1)
     runner._session_state("route").turn.lease_tokens[1] = token
@@ -65,6 +68,73 @@ async def _agent_result(runner, entry, source):
         {"final_response": "done", "session_id": "child", "messages": [], "api_calls": 1},
         source, _HISTORY, entry, "route", "route", 1, "old", "telegram", 0.0,
     )
+
+
+async def _run_sync_split(runner, source, monkeypatch, *, failed=False):
+    """Drive the real executor body while replacing only model/progress plumbing."""
+    agent = SimpleNamespace(session_id="child", _last_compaction_in_place=False)
+    ctx = TurnContext(
+        source=source, message="continue", history=[], session_id="old", session_key="route",
+        run_generation=1, user_config={}, _run_still_current=lambda: True,
+    )
+    turn = TurnRunner(runner, ctx)
+    runner._provider_routing = {}
+    runner._resolve_session_agent_runtime = Mock(return_value=("test-model", {}))
+    runner._resolve_session_reasoning_config = Mock(return_value=None)
+    runner._resolve_session_service_tier = Mock(return_value=None)
+    runner._resolve_turn_agent_config = Mock(return_value={})
+    runner._sync_session_model_from_agent = Mock()
+    monkeypatch.setattr(turn, "_combined_ephemeral_prompt", lambda: "")
+    monkeypatch.setattr(turn, "_setup_stream_consumer", lambda *_: (None, None, None, False))
+    monkeypatch.setattr(turn, "_resolve_turn_agent", lambda *_: (agent, False))
+    monkeypatch.setattr(turn, "_wire_turn_agent_callbacks", lambda *_: None)
+    monkeypatch.setattr(turn, "_load_turn_history", lambda *_: ([], None, set()))
+    monkeypatch.setattr(turn, "_prepare_turn_message", lambda *_: (None, None))
+    conversation_result = (
+        {"final_response": "", "messages": [], "failed": True, "error": "model failed after compression"}
+        if failed else {"final_response": "done", "messages": []}
+    )
+    monkeypatch.setattr(turn, "_run_conversation_with_approval", lambda *_: conversation_result)
+    monkeypatch.setattr(turn, "_finish_stream_consumer", lambda *_: None)
+    monkeypatch.setattr(turn, "_append_auto_media_tags", lambda response, *_: response)
+    ctx.agent_holder[0] = agent
+    return await asyncio.to_thread(turn.run_sync)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_run_sync_cannot_publish_child_before_conflicting_lease_is_rebound(tmp_path, monkeypatch, failed):
+    runner, store, entry, source, token = await _runner(tmp_path, monkeypatch)
+    blocker = await runner._turn_leases.acquire("child", owner_key="alias", generation=1, timeout=1)
+    try:
+        result = await _run_sync_split(runner, source, monkeypatch, failed=failed)
+        assert result["session_id"] == "child"
+        assert result.get("failed", False) is failed
+        assert store.peek_session_id("route") == "old"
+        assert json.loads((tmp_path / "sessions" / "sessions.json").read_text())["route"]["session_id"] == "old"
+        assert token.session_id == "old"
+        with pytest.raises(RuntimeError, match="compression.*lease|lease.*compression"):
+            await _agent_result(runner, entry, source)
+    finally:
+        runner._turn_leases.release(blocker)
+        runner._turn_leases.release(token)
+
+
+@pytest.mark.asyncio
+async def test_run_sync_does_not_publish_child_when_outer_route_save_fails(tmp_path, monkeypatch):
+    runner, store, entry, source, token = await _runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "_save_entry", Mock(side_effect=OSError("routing storage failed")))
+    try:
+        result = await _run_sync_split(runner, source, monkeypatch)
+        assert result["session_id"] == "child"
+        assert store.peek_session_id("route") == "old"
+        assert token.session_id == "old"
+        with pytest.raises(OSError, match="routing storage failed"):
+            await _agent_result(runner, entry, source)
+        assert store.peek_session_id("route") == "old"
+        assert json.loads((tmp_path / "sessions" / "sessions.json").read_text())["route"]["session_id"] == "old"
+    finally:
+        runner._turn_leases.release(token)
 
 
 @pytest.mark.asyncio
