@@ -15,6 +15,7 @@ struct bh_a2c_control {
     int terminal;
     int reason;
     int64_t deadline_ms;
+    struct stat journal_identity;
 };
 enum bh_a2c_reason { BH_A2C_NONE, BH_A2C_LOST, BH_A2C_PROTOCOL,
                      BH_A2C_DEADLINE, BH_A2C_IO, BH_A2C_CANCELLED };

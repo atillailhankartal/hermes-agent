@@ -145,8 +145,15 @@ int bh_a2c_signals_match(void) {
     return 1;
 }
 
-#ifdef BH_A2C_PHASE2
+#if defined(BH_A2C_PHASE2) || defined(BH_A2C_PHASE3)
 #include <sys/wait.h>
+#ifdef BH_A2C_PHASE3
+#include "a2c_phase3_policy.h"
+#include "a2c_phase3_io.h"
+#include "launch_authority.h"
+#include <CommonCrypto/CommonDigest.h>
+#include <string.h>
+#endif
 #ifndef BH_A2C_STAGE0_IMAGE
 #define BH_A2C_STAGE0_IMAGE "/uninstalled/a2c/stage0"
 #endif
@@ -156,7 +163,7 @@ void bh_a2c_test_audit(const char *event, pid_t child, int status);
 #else
 #define AUDIT(event, child, status) ((void)0)
 #endif
-static int spawn_stage(const int source[4], pid_t *child) {
+static int spawn_stage(const int source[4], pid_t *child, struct bh_a2a_child_map *retained) {
     struct bh_a2a_child_map map = {0};
     struct proc_fdinfo entries[BH_A2A_MAX_FDS];
     posix_spawn_file_actions_t actions;
@@ -202,7 +209,8 @@ static int spawn_stage(const int source[4], pid_t *child) {
 done:
     if (actions_ready) (void)posix_spawn_file_actions_destroy(&actions);
     if (attr_ready) (void)posix_spawnattr_destroy(&attr);
-    /* No root-close/alias-retirement assertion in phase2. A exits after its child. */
+    if (okay) *retained = map;
+    /* Phase2 retains aliases until exit; Phase3 retires after guard4. */
     return okay;
 }
 static int reap_child(pid_t child, int *status) {
@@ -249,9 +257,45 @@ static int phase2_receive(struct bh_a2c_control *control, struct bh_a2a_root *ro
     }
     return 0;
 }
+#ifdef BH_A2C_PHASE3
+static int phase3_exchange(struct bh_a2c_control *control, struct bh_a2a_root *root,
+                           struct bh_a2a_child_map *map, int bootstrap, int transport,
+                           int status_fd, pid_t child) {
+    const int remaining[] = {0, 1, 2, 3, root->parent_fd, bootstrap, transport, status_fd};
+    struct bh_a2a_inventory inventory;
+    unsigned char wire[BH_A2C_PHASE3_WIRE], expected[33] = {'R'}, receipt[33];
+    struct bh_a2c_phase3_io output = {bootstrap, control->deadline_ms, control, root};
+    struct bh_a2c_phase3_io input = {transport, control->deadline_ms, control, root};
+    (void)child;
+    if (!bh_a2c_check_alive(control, root) ||
+        !bh_a2c_phase3_check_pending(root->parent_fd, &control->journal_identity, 1) ||
+        !bh_a2c_retire(map, root, remaining, sizeof(remaining) / sizeof(remaining[0]), &inventory) ||
+        !bh_a2c_check_alive(control, root)) return 0;
+    AUDIT("RETIRED", child, (int)inventory.count);
+#ifdef BH_A2C_TEST_PARK_PREFRAME
+    AUDIT("PREFRAME", child, 0);
+    (void)raise(SIGSTOP);
+#endif
+    if (!bh_a2c_check_alive(control, root) ||
+        !bh_a2c_phase3_check_pending(root->parent_fd, &control->journal_identity, 1) ||
+        !bh_a2c_check_alive(control, root) ||
+        !bh_a2c_phase3_frame(wire, inventory.digest) || !CC_SHA256(wire, sizeof(wire), expected + 1) ||
+        !bh_a2c_channel_init(bootstrap) || !bh_a2c_phase3_write(&output, wire, sizeof(wire)) ||
+        !bh_a2c_phase3_shutdown(&output) ||
+        !bh_a2c_phase3_read_eof(&input, receipt, sizeof(receipt)) ||
+        memcmp(receipt, expected, sizeof(receipt)) || !bh_a2c_check_alive(control, root)) return 0;
+    AUDIT("RECEIPT_EOF", child, 33);
+#ifdef BH_A2C_TEST_PARK_RECEIPT
+    AUDIT("RECEIPT_PARK", child, 0);
+    (void)raise(SIGSTOP);
+#endif
+    return 1;
+}
+#endif
 int bh_a2c_phase2(struct bh_a2c_control *control, struct bh_a2a_root *root) {
     int bootstrap[2], transport[2], status_pipe[2];
     int status = 0, okay = 0;
+    struct bh_a2a_child_map map = {0};
     pid_t child = -1;
     unsigned char message;
     if (!bh_a2c_check_alive(control, root) ||
@@ -286,7 +330,7 @@ int bh_a2c_phase2(struct bh_a2c_control *control, struct bh_a2a_root *root) {
     AUDIT("PRESPAWN", getpid(), 0);
     (void)raise(SIGSTOP);
 #endif
-    if (!bh_a2c_check_alive(control, root) || !spawn_stage(source, &child)) return 0;
+    if (!bh_a2c_check_alive(control, root) || !spawn_stage(source, &child, &map)) return 0;
     /* Ownership is recorded before test synchronization or any progress. */
     AUDIT("OWN", child, 0);
 #ifdef BH_A2C_TEST_PARK_AFTER_SPAWN
@@ -309,6 +353,9 @@ int bh_a2c_phase2(struct bh_a2c_control *control, struct bh_a2a_root *root) {
     AUDIT("PREFINAL", child, 0);
     (void)raise(SIGSTOP);
 #endif
+#ifdef BH_A2C_PHASE3
+    if (!phase3_exchange(control, root, &map, bootstrap[0], transport[0], status_pipe[0], child)) goto done;
+#endif
     message = 'X';
     if (!bh_a2c_check_alive(control, root)) goto done;
     if (!bh_a2c_send(transport[0], &message, 1, control->deadline_ms)) goto done;
@@ -321,6 +368,9 @@ int bh_a2c_phase2(struct bh_a2c_control *control, struct bh_a2a_root *root) {
 done:
     if (!okay) { control->terminal = 1; root->cancelled = 1; }
     (void)close(transport[0]);
+#ifdef BH_A2C_PHASE3
+    (void)close(bootstrap[0]);
+#endif
 #ifdef BH_A2C_TEST_AUTO_REAP
     /* Negative fixture: kernel auto-reap makes real waitpid return ECHILD. */
     (void)signal(SIGCHLD, SIG_IGN);

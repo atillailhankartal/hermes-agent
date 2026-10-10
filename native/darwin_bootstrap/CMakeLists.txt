@@ -52,3 +52,29 @@ target_compile_definitions(bee_hermes_a2c_phase2_attempt PRIVATE BH_A2C_PHASE2
   BH_A2C_STAGE0_IMAGE="$<TARGET_FILE:bee_hermes_a2c_stage0>")
 target_link_libraries(bee_hermes_a2c_phase2_attempt PRIVATE bee_hermes_a2a)
 add_dependencies(bee_hermes_a2c_phase2_attempt bee_hermes_a2c_stage0)
+
+# Source mechanics only. These exact uninstalled images have no policy provider
+# that can authorize a launch. Fixture providers are never part of this graph.
+add_executable(bee_hermes_a2c_phase3_final final_entry.c
+  a2c_phase3_policy.c a2c_phase3_io.c a2c_phase3_unavailable.c)
+add_executable(bee_hermes_a2c_phase3_stage0 stage0_entry.c)
+target_link_libraries(bee_hermes_a2c_phase3_stage0 PRIVATE bee_hermes_a2c_phase1)
+target_compile_definitions(bee_hermes_a2c_phase3_stage0 PRIVATE
+  BH_A2C_FINAL_IMAGE="$<TARGET_FILE:bee_hermes_a2c_phase3_final>")
+add_dependencies(bee_hermes_a2c_phase3_stage0 bee_hermes_a2c_phase3_final)
+add_executable(bee_hermes_a2c_phase3_attempt attempt_entry.c launch_control.c a2c_policy.c
+  a2c_phase3_policy.c a2c_phase3_journal.c a2c_phase3_io.c a2c_phase3_unavailable.c)
+foreach(image bee_hermes_a2c_phase3_attempt bee_hermes_a2c_phase3_final)
+  target_compile_definitions(${image} PRIVATE BH_A2C_PHASE3
+    BH_A2C_STAGE0_IMAGE="$<TARGET_FILE:bee_hermes_a2c_phase3_stage0>")
+  target_link_options(${image} PRIVATE "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/${image}.map")
+endforeach()
+target_link_libraries(bee_hermes_a2c_phase3_attempt PRIVATE bee_hermes_a2a)
+target_link_libraries(bee_hermes_a2c_phase3_final PRIVATE bee_hermes_a2c_phase1)
+# F has no orchestration or parent manifest: compile control helpers separately
+# without the Phase3 orchestration definition.
+foreach(image bee_hermes_a2c_phase3_attempt bee_hermes_a2c_phase3_final bee_hermes_a2c_phase3_stage0)
+  target_compile_features(${image} PRIVATE c_std_11)
+  target_compile_options(${image} PRIVATE -Wall -Wextra -Werror -pedantic)
+endforeach()
+add_dependencies(bee_hermes_a2c_phase3_attempt bee_hermes_a2c_phase3_stage0)

@@ -1,4 +1,10 @@
 #include "launch_control.h"
+#ifdef BH_A2C_PHASE3
+#include "a2c_phase3_policy.h"
+#ifndef BH_A2C_STAGE0_IMAGE
+#define BH_A2C_STAGE0_IMAGE "/uninstalled/a2c/stage0"
+#endif
+#endif
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -37,17 +43,28 @@ int main(void) {
         terminal(&root, 101, parent_fd);
     if (!bh_a2c_send(3, &checkpoint, sizeof(checkpoint), control.deadline_ms) ||
         !bh_a2c_guard(&control, &root, checkpoint)) terminal(&root, control.reason, parent_fd);
+#ifdef BH_A2C_PHASE3
+    const struct bh_a2c_phase3_manifest *release = bh_a2c_phase3_manifest();
+    if (!bh_a2c_phase3_manifest_valid(bh_a2c_phase3_core(), release) ||
+        strcmp(release->stage, BH_A2C_STAGE0_IMAGE) || !bh_a2c_phase3_images(release))
+        terminal(&root, 106, parent_fd);
+#endif
+    if (!bh_a2c_check_alive(&control, &root)) terminal(&root, control.reason, parent_fd);
     /* Guard-to-syscall race is bounded by a post-bind guard, not made atomic. */
     if (bh_a2a_root_prepare_fd6(&root, 0) != BH_A2A_OK) terminal(&root, 102, parent_fd);
     parent_fd = open(config.parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (parent_fd < 0 || !bh_a2c_candidate(&config, parent_fd, &manifest)) terminal(&root, 103, parent_fd);
+#ifdef BH_A2C_PHASE3
+    if (!bh_a2c_phase3_check_pending(parent_fd, &control.journal_identity, 0))
+        terminal(&root, 107, parent_fd);
+#endif
     if (!bh_a2c_check_alive(&control, &root)) terminal(&root, control.reason, parent_fd);
     if (bh_a2a_root_bind_observe(&root, parent_fd, &manifest) != BH_A2A_OK)
         terminal(&root, 104, parent_fd);
     checkpoint = 2;
     if (!bh_a2c_send(3, &checkpoint, sizeof(checkpoint), control.deadline_ms) ||
         !bh_a2c_guard(&control, &root, checkpoint)) terminal(&root, control.reason, parent_fd);
-#ifdef BH_A2C_PHASE2
+#if defined(BH_A2C_PHASE2) || defined(BH_A2C_PHASE3)
     if (!bh_a2c_phase2(&control, &root)) terminal(&root, 105, parent_fd);
 #endif
     /* Successful measurement also terminates; P never clears pending. */

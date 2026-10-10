@@ -250,3 +250,40 @@ enum bh_a2a_result bh_a2a_root_retire_and_signal(struct bh_a2a_child_map *map,
     }
     return BH_A2A_OK;
 }
+
+/* Phase3 reuses the v1 canonical wire, independently of the legacy blocking send. */
+#include "launch_authority.h"
+void bh_a2c_frame_encode(const struct bh_a2a_close_frame *frame, unsigned char wire[152]) {
+    prefix(frame, wire);
+    memcpy(wire + 120, frame->mac, 32);
+}
+static uint64_t get_integer(const unsigned char *bytes, size_t count) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < count; i++) value = (value << 8) | bytes[i];
+    return value;
+}
+void bh_a2c_frame_decode(const unsigned char wire[152], struct bh_a2a_close_frame *frame) {
+    memset(frame, 0, sizeof(*frame));
+    frame->version = (uint32_t)get_integer(wire, 4);
+    frame->type = (uint32_t)get_integer(wire + 4, 4);
+    frame->sequence = get_integer(wire + 8, 8);
+    memcpy(frame->launch_nonce, wire + 16, 32);
+    memcpy(frame->incarnation, wire + 48, 32);
+    frame->generation = get_integer(wire + 80, 8);
+    memcpy(frame->inventory_digest, wire + 88, 32);
+    memcpy(frame->mac, wire + 120, 32);
+}
+int bh_a2c_retire(struct bh_a2a_child_map *map, struct bh_a2a_root *root,
+                  const int *remaining, size_t count, struct bh_a2a_inventory *inventory) {
+    if (!map || !root || !remaining || !inventory || root->cancelled) return 0;
+    for (size_t i = 0; i < 4; i++) if (map->original[i] == 3) return 0;
+    if (bh_a2a_child_map_retire(map, root) != BH_A2A_OK || root->socket_owned ||
+        !fd_is_absent(6) || bh_a2a_inventory_check(remaining, count, inventory) != BH_A2A_OK ||
+        inventory->count != count) return 0;
+    for (size_t i = 0; i < count; i++) {
+        struct stat info;
+        if (fstat(remaining[i], &info) || (S_ISSOCK(info.st_mode) &&
+            info.st_dev == root->socket_object.st_dev && info.st_ino == root->socket_object.st_ino)) return 0;
+    }
+    return 1;
+}
