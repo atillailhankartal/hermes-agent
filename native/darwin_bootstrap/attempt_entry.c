@@ -20,18 +20,6 @@ static void terminal(struct bh_a2a_root *root, int reason, int parent_fd) {
     (void)send(3, &status, sizeof(status), MSG_DONTWAIT | MSG_NOSIGNAL);
     _exit(20);
 }
-static int signals_match(void) {
-    sigset_t mask;
-    struct sigaction disposition;
-    if (sigprocmask(SIG_SETMASK, NULL, &mask)) return 0;
-    for (int signal_number = 1; signal_number < NSIG; signal_number++) {
-        if (signal_number == SIGKILL || signal_number == SIGSTOP) continue;
-        if (sigismember(&mask, signal_number) != 1 ||
-            sigaction(signal_number, NULL, &disposition) ||
-            disposition.sa_handler != SIG_DFL) return 0;
-    }
-    return 1;
-}
 int main(void) {
     const int allowed[] = {0, 1, 2, 3};
     struct bh_a2a_inventory inventory;
@@ -42,7 +30,7 @@ int main(void) {
     uint32_t checkpoint = 1;
     int parent_fd = -1;
     if (bh_a2a_inventory_check(allowed, 4, &inventory) != BH_A2A_OK || inventory.count != 4 ||
-        !signals_match() || !bh_a2c_channel_init(3)) terminal(&root, 100, parent_fd);
+        !bh_a2c_signals_match() || !bh_a2c_channel_init(3)) terminal(&root, 100, parent_fd);
     if (!bh_a2c_receive(3, &config, sizeof(config), control.deadline_ms) ||
         config.version != BH_A2C_VERSION || config.epoch != BH_A2C_EPOCH ||
         strnlen(config.parent, sizeof(config.parent)) == sizeof(config.parent))
@@ -59,6 +47,9 @@ int main(void) {
     checkpoint = 2;
     if (!bh_a2c_send(3, &checkpoint, sizeof(checkpoint), control.deadline_ms) ||
         !bh_a2c_guard(&control, &root, checkpoint)) terminal(&root, control.reason, parent_fd);
+#ifdef BH_A2C_PHASE2
+    if (!bh_a2c_phase2(&control, &root)) terminal(&root, 105, parent_fd);
+#endif
     /* Successful measurement also terminates; P never clears pending. */
     _exit(0);
 }

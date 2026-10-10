@@ -18,6 +18,8 @@ struct bh_a2c_control {
 };
 enum bh_a2c_reason { BH_A2C_NONE, BH_A2C_LOST, BH_A2C_PROTOCOL,
                      BH_A2C_DEADLINE, BH_A2C_IO, BH_A2C_CANCELLED };
+int bh_a2c_signals_match(void);
+int bh_a2c_phase2(struct bh_a2c_control *control, struct bh_a2a_root *root);
 int64_t bh_a2c_now(void);
 int bh_a2c_channel_init(int fd);
 int bh_a2c_send(int fd, const void *data, size_t size, int64_t deadline);

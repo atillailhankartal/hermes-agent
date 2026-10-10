@@ -33,3 +33,22 @@ add_executable(bee_hermes_a2c_attempt attempt_entry.c)
 target_compile_features(bee_hermes_a2c_attempt PRIVATE c_std_11)
 target_compile_options(bee_hermes_a2c_attempt PRIVATE -Wall -Wextra -Werror -pedantic)
 target_link_libraries(bee_hermes_a2c_attempt PRIVATE bee_hermes_a2c_phase1)
+
+# Separate dormant images. No installed identity policy or test drop adapter here.
+add_executable(bee_hermes_a2c_final final_entry.c)
+add_executable(bee_hermes_a2c_stage0 stage0_entry.c)
+foreach(image bee_hermes_a2c_final bee_hermes_a2c_stage0)
+  target_compile_features(${image} PRIVATE c_std_11)
+  target_compile_options(${image} PRIVATE -Wall -Wextra -Werror -pedantic)
+  target_link_libraries(${image} PRIVATE bee_hermes_a2c_phase1)
+endforeach()
+target_compile_definitions(bee_hermes_a2c_stage0 PRIVATE
+  BH_A2C_FINAL_IMAGE="$<TARGET_FILE:bee_hermes_a2c_final>")
+add_dependencies(bee_hermes_a2c_stage0 bee_hermes_a2c_final)
+add_executable(bee_hermes_a2c_phase2_attempt attempt_entry.c launch_control.c a2c_policy.c)
+target_compile_features(bee_hermes_a2c_phase2_attempt PRIVATE c_std_11)
+target_compile_options(bee_hermes_a2c_phase2_attempt PRIVATE -Wall -Wextra -Werror -pedantic)
+target_compile_definitions(bee_hermes_a2c_phase2_attempt PRIVATE BH_A2C_PHASE2
+  BH_A2C_STAGE0_IMAGE="$<TARGET_FILE:bee_hermes_a2c_stage0>")
+target_link_libraries(bee_hermes_a2c_phase2_attempt PRIVATE bee_hermes_a2a)
+add_dependencies(bee_hermes_a2c_phase2_attempt bee_hermes_a2c_stage0)
