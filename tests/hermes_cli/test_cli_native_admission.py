@@ -1,5 +1,6 @@
 """CLI native delivery admission through production startup and real SQLite."""
 from contextlib import ExitStack
+import time
 
 import pytest
 
@@ -43,6 +44,23 @@ def test_idle_candidate_is_not_a_native_turn_receipt(shell):
     assert not claim.is_route_current()
     assert deliver(ctx, claim, "after-close").state != "admitted"
     assert host.queue.lookup(host.profile, claim.route_epoch, "after-close") is None
+
+
+def test_cli_pre_model_grant_uses_bee_reserved_candidate_id(shell):
+    from hermes_cli.trusted_inbound_broker import PreModelBrokerGrant
+
+    host, ctx = context(shell)
+    claim = host.claim()
+    grant = PreModelBrokerGrant(
+        "delivery", "cli", host.profile, claim.session_key, claim.native_session_id,
+        claim.host_owner_id, claim.route_epoch, host.queue.payload_digest("native prompt"),
+        "enrollment", "bee-reserved-cli", "private-capability", int(time.time() * 1000) + 60_000,
+    )
+    assert host.queue.install_pre_model_grant(grant)
+    assert deliver(ctx, claim).state == "unknown"
+    row = host.queue.lookup(host.profile, claim.route_epoch, "delivery")
+    assert row["candidate"] == "bee-reserved-cli" and row["enrollment_id"] == "enrollment"
+    assert row["native_event_id"] is None
 
 
 def context(shell):
@@ -140,6 +158,7 @@ def test_actual_agent_thread_settles_only_with_native_slot(shell):
         return {"messages": [], "final_response": "done", "completed": True}
     bind_real_agent_thread(shell, model)
     assert deliver(ctx, claim).state == "unknown"
+    assert host.queue.lookup(host.profile, claim.route_epoch, "delivery")["native_event_id"] is None
     assert host.drain_one()
     assert len(seen) == 1 and seen[0][0] == "native prompt"
     assert seen[0][1].state == "admitted" and seen[0][1].candidate_id
@@ -169,6 +188,8 @@ def test_trusted_broker_observation_is_unavailable_even_after_local_turn(shell, 
     assert host.drain_one()
     assert len(observations) == 1
     snapshot = observations[0]
+    assert snapshot.native_event_id == host.queue.lookup(
+        host.profile, claim.route_epoch, "delivery")["native_event_id"]
     assert (snapshot.delivery_id, snapshot.candidate_id, snapshot.payload_sha256,
             snapshot.host_owner_id, snapshot.route_epoch) == (
         "delivery", host.queue.lookup(host.profile, claim.route_epoch, "delivery")["candidate"],
@@ -504,7 +525,7 @@ def test_observer_failure_after_settlement_has_same_id_readback_without_replay(s
     observed = []
 
     def fail_after_settlement(client, snapshot):
-        observed.append(snapshot.local_event_id)
+        observed.append(snapshot.native_event_id)
         raise OSError("broker unavailable")
 
     monkeypatch.setattr(TrustedInboundBrokerClient, "observe_native_turn", fail_after_settlement)
@@ -512,6 +533,7 @@ def test_observer_failure_after_settlement_has_same_id_readback_without_replay(s
     assert host.drain_one()
     receipt = host.query(route_claim=claim, delivery_id="delivery", expected_content="native prompt")
     assert len(observed) == 1 and receipt.state == "admitted" and receipt.candidate_id
+    assert observed[0] == host.queue.lookup(host.profile, claim.route_epoch, "delivery")["native_event_id"]
     assert model_calls == [] and host.active_turn is None
     assert deliver(ctx, claim) == receipt
     assert not host.drain_one()

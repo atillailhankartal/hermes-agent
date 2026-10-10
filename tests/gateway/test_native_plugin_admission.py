@@ -1,5 +1,6 @@
 """Native admission uses a real on-disk queue and real Gateway route store."""
 import asyncio
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -12,6 +13,88 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionStore, SessionSource
 from hermes_constants import hermes_home_key
 from hermes_cli.plugins import PluginManager, PluginManifest, LoadedPlugin
+
+
+def test_pre_model_grant_uses_exact_reserved_candidate_without_authorizing_proof(tmp_path):
+    from gateway.native_plugin_queue import NativePluginQueue
+    from hermes_cli.trusted_inbound_broker import PreModelBrokerGrant
+
+    queue = NativePluginQueue(tmp_path)
+    grant = PreModelBrokerGrant(
+        "delivery", "gateway", "profile", "key", "native", "owner", "epoch",
+        queue.payload_digest("payload"), "enrollment", "bee-reserved", "private-capability",
+        int(time.time() * 1000) + 60_000,
+    )
+    assert queue.install_pre_model_grant(grant)
+    row = queue.admit(profile="profile", epoch="epoch", delivery="delivery", session_key="key",
+                      native_id="native", owner="owner", plugin="bee", content="payload")
+    assert row["candidate"] == "bee-reserved" and row["enrollment_id"] == "enrollment"
+    assert row["state"] == "unknown" and row["native_event_id"] is None
+    assert queue.admit(profile="profile", epoch="epoch", delivery="delivery", session_key="key",
+                       native_id="native", owner="owner", plugin="bee", content="payload") == row
+    assert b"private-capability" not in queue.path.read_bytes()
+
+
+def test_pre_model_grant_route_change_fails_closed(tmp_path):
+    from gateway.native_plugin_queue import NativePluginQueue
+    from hermes_cli.trusted_inbound_broker import PreModelBrokerGrant
+
+    queue = NativePluginQueue(tmp_path)
+    grant = PreModelBrokerGrant(
+        "delivery", "gateway", "profile", "key", "native", "owner", "epoch",
+        queue.payload_digest("payload"), "enrollment", "bee-reserved", "capability",
+        int(time.time() * 1000) + 60_000,
+    )
+    assert queue.install_pre_model_grant(grant)
+    row = queue.admit(profile="profile", epoch="epoch", delivery="delivery", session_key="key",
+                      native_id="native", owner="new-owner", plugin="bee", content="payload")
+    assert row["state"] == "rejected" and row["candidate"] is None
+    assert row["native_event_id"] is None
+
+
+def test_native_event_id_commits_once_and_survives_sqlite_restart(tmp_path):
+    from gateway.native_plugin_queue import NativePluginQueue
+    from hermes_cli.trusted_inbound_broker import (
+        NativeCandidateSnapshot, PreModelBrokerGrant, TrustedInboundBrokerClient,
+    )
+    from hermes_cli.trusted_inbound_wire import decode_request
+
+    queue = NativePluginQueue(tmp_path)
+    grant = PreModelBrokerGrant(
+        "delivery", "gateway", "profile", "key", "native", "owner", "epoch",
+        queue.payload_digest("payload"), "enrollment", "bee-reserved", "capability",
+        int(time.time() * 1000) + 60_000,
+    )
+    assert queue.install_pre_model_grant(grant)
+    row = queue.admit(profile="profile", epoch="epoch", delivery="delivery", session_key="key",
+                      native_id="native", owner="owner", plugin="bee", content="payload")
+    assert row["native_event_id"] is None
+    assert queue.transition(row["candidate"], "queued", "running")
+    running = queue.lookup("profile", "epoch", "delivery")
+    assert queue.settle(running)
+    settled = queue.lookup("profile", "epoch", "delivery")
+    assert settled["native_event_id"] and settled["state"] == "admitted"
+    restarted = NativePluginQueue(tmp_path)
+    recovered = restarted.lookup("profile", "epoch", "delivery")
+    assert recovered["native_event_id"] == settled["native_event_id"]
+    assert recovered["enrollment_id"] == "enrollment"
+    snapshot = NativeCandidateSnapshot.from_running_row(recovered, surface="gateway", content="payload")
+    requests = []
+
+    class LostBroker:
+        def exchange(self, request):
+            requests.append(decode_request(request))
+            return None
+
+    client = TrustedInboundBrokerClient()
+    client.transport = LostBroker()
+    assert client.query_native_event(snapshot).state == "unknown"
+    assert [(request.kind, request.fields[2]) for request in requests] == [
+        (4, settled["native_event_id"])]
+    assert not restarted.settle(running)
+    assert restarted.admit(profile="profile", epoch="epoch", delivery="delivery", session_key="key",
+                           native_id="native", owner="owner", plugin="bee", content="payload")[
+                               "native_event_id"] == settled["native_event_id"]
 
 
 def host(tmp_path, monkeypatch):
@@ -400,8 +483,9 @@ async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, mo
         assert state is not None
         assert runner._held_turn_lease(snapshot.session_key, state.persistent.run_generation) is not None
         observations.append(snapshot)
-        assert runner._native_plugin_queue().lookup(manager.scope_key, snapshot.route_epoch,
-                                                   snapshot.delivery_id)["state"] == "admitted"
+        row = runner._native_plugin_queue().lookup(manager.scope_key, snapshot.route_epoch,
+                                                   snapshot.delivery_id)
+        assert row["state"] == "admitted" and snapshot.native_event_id == row["native_event_id"]
         if missing == "observer_failure":
             raise OSError("broker unavailable")
         return original_observe(client, snapshot)

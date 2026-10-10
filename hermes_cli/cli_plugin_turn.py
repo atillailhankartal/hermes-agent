@@ -129,6 +129,11 @@ def _settle_candidate(host, row):
         raise RuntimeError("CLI native candidate owner changed")
     if not host.queue.settle(row):
         raise RuntimeError("CLI native candidate settlement unavailable")
+    settled = host.queue.lookup(row["profile"], row["epoch"], row["delivery"])
+    if (settled is None or settled["state"] != "admitted" or not settled["native_event_id"]
+            or any(settled[field] != row[field] for field in immutable_fields if field != "reason")):
+        raise RuntimeError("CLI native event readback unavailable")
+    snapshot = NativeCandidateSnapshot.from_running_row(settled, surface="cli", content=row["content"])
     TrustedInboundBrokerClient().observe_native_turn(snapshot)
 
 

@@ -258,6 +258,14 @@ class GatewayPluginInjectionMixin:
                         return False
                     if not queue.settle(row):
                         return False
+                    settled = queue.lookup(row["profile"], row["epoch"], row["delivery"])
+                    immutable_fields = ("sequence", "profile", "epoch", "delivery", "session_key",
+                                        "native_id", "owner", "plugin", "content", "payload_digest", "candidate")
+                    if (settled is None or settled["state"] != "admitted" or not settled["native_event_id"]
+                            or any(settled[field] != row[field] for field in immutable_fields)):
+                        return False
+                    snapshot = NativeCandidateSnapshot.from_running_row(
+                        settled, surface="gateway", content=event.text)
                     TrustedInboundBrokerClient().observe_native_turn(snapshot)
                     return True
             except ActiveSessionRegistryError:
