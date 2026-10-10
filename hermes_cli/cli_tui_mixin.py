@@ -16,6 +16,8 @@ import time
 
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
+from hermes_cli.cli_plugin_turn import interrupt_cli_turn
+from hermes_cli.cli_tui_labels import _agent_name
 from hermes_cli.commands_completion import SlashCommandAutoSuggest, SlashCommandCompleter
 from pathlib import Path
 from prompt_toolkit.filters import Condition
@@ -60,14 +62,6 @@ def _approval_choice_label(choice: str) -> str:
     """Localized label for an approval choice id; unknown ids render verbatim."""
     key = _APPROVAL_CHOICE_KEYS.get(choice)
     return t(key) if key else choice
-
-
-def _agent_name() -> str:
-    try:
-        from hermes_cli.skin_engine import get_active_skin
-        return get_active_skin().get_branding("agent_name", "Hermes")
-    except Exception:
-        return "Hermes"
 
 
 def _tn(key: str, count: int, **kwargs) -> str:
@@ -973,7 +967,7 @@ class CLITuiMixin:
                 return
             self._last_ctrl_c_time = now
             print("\n" + t("cli.tui.interrupting_again_hint"))
-            request_hard_interrupt(self.agent)
+            interrupt_cli_turn(self, request_hard_interrupt)
         else:
             self._tui_clear_or_exit(event)
 
@@ -990,7 +984,7 @@ class CLITuiMixin:
             return
         if self._agent_running and self.agent:
             print("\n" + t("cli.tui.interrupting"))
-            request_hard_interrupt(self.agent)
+            interrupt_cli_turn(self, request_hard_interrupt)
         else:
             self._tui_clear_or_exit(event)
 

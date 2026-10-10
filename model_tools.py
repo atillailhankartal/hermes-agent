@@ -834,6 +834,13 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
             if route_claim is None:
                 return tool_error("Gateway route is no longer current", error_type="session_closed")
             dispatch_kwargs["route_claim"] = route_claim
+        else:
+            from hermes_cli.cli_plugin_turn import claim_for_cli_tool, cli_route_bound
+            if cli_route_bound():
+                route_claim = claim_for_cli_tool(ids.session_id)
+                if route_claim is None:
+                    return tool_error("CLI route is no longer current", error_type="session_closed")
+                dispatch_kwargs["route_claim"] = route_claim
     if function_name == "execute_code":
         # Prefer the caller's list so subagents can't overwrite the parent's
         # tool set via the process-global.

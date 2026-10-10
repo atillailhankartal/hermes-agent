@@ -13,6 +13,7 @@ import os
 import sys
 import time
 from agent.i18n import t
+from hermes_cli.cli_plugin_turn import run_cli_conversation
 from agent.interrupt_compat import request_hard_interrupt
 from contextlib import suppress
 from pathlib import Path
@@ -81,7 +82,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
         return
 
     def _quiet_turn(prompt: str) -> dict:
-        result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
+        result = run_cli_conversation(cli, user_message=prompt, conversation_history=cli.conversation_history)
         _sync_cli_session_id_from_agent(cli)
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
@@ -220,7 +221,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
-            result = cli.agent.run_conversation(
+            result = run_cli_conversation(cli,
                 user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
             )
         except KeyboardInterrupt:
@@ -243,7 +244,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         def _quiet_recover_turn(nudge):
             nonlocal result
             _history = result.get("messages") if isinstance(result, dict) else None
-            result = cli.agent.run_conversation(
+            result = run_cli_conversation(cli,
                 user_message=nudge,
                 conversation_history=_history or cli.conversation_history,
                 **author_kwargs,
@@ -272,7 +273,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
 
             def _follow_up(text):
                 nonlocal history
-                follow = cli.agent.run_conversation(
+                follow = run_cli_conversation(cli,
                     user_message=text, conversation_history=history, **author_kwargs,
                 )
                 if isinstance(follow, dict) and follow.get("messages"):
@@ -301,6 +302,16 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 result = continued
                 # A teammate's reply displaced the answer this run prints; tell the spawner.
                 _report_turn(result)
+            host = getattr(cli, "_native_plugin_host", None)
+            if host is not None:
+                def _native_follow_up(text):
+                    nonlocal result
+                    result = _follow_up(text)
+                    _report_turn(result)
+                if _single_query_exit_code(result) == 0:
+                    host.finish(_native_follow_up)
+                else:
+                    host.close()
         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
@@ -436,6 +447,9 @@ def _install_single_query_signal_handlers(cli):
 
     def _signal_handler_q(signum, frame):
         logger.debug("Received signal %s in single-query mode", signum)
+        host = getattr(cli, "_native_plugin_host", None)
+        if host is not None:
+            host.close()
         _arm_exit_watchdog_on_shutdown_signal()  # covers wedges in the unwind below
         _interrupt_agent_for_signal(getattr(cli, "agent", None), signum)
         # Kanban: a non-daemon worker blocked in _wait_for_process survives KeyboardInterrupt
@@ -596,6 +610,9 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
                 _run_kanban_goal_loop_chat(cli, response or "")
             except Exception as _goal_exc:
                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+        host = getattr(cli, "_native_plugin_host", None)
+        if host is not None and _single_query_exit_code(cli._last_turn_result) == 0:
+            host.finish()
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
@@ -604,4 +621,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False),
             credentials_terminal=getattr(cli, "_credentials_terminal", False)))
     finally:
+        host = getattr(cli, "_native_plugin_host", None)
+        if host is not None:
+            host.close()
         _finalize_single_query(cli)

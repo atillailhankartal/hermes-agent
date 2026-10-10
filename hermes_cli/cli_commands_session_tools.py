@@ -324,3 +324,7 @@ def _shlex_args(cmd: str) -> list:
         return shlex.split(cmd)[1:] if cmd else []
     except ValueError:
         return (cmd or "").split()[1:]
+
+
+def _without_session_meta(messages) -> list:
+    return [m for m in (messages or []) if m.get("role") != "session_meta"]

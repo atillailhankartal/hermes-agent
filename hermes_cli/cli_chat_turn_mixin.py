@@ -100,6 +100,8 @@ class CLIChatTurnMixin:
         from agent.notification_presentation import notification_config_snapshot, notification_policy_snapshot
         with notification_policy_snapshot(agent, "cli", notification_config_snapshot()):
             turn = _ChatTurn()
+            from hermes_cli.cli_plugin_turn import current_candidate
+            turn.native_plugin_candidate = current_candidate()
             from gateway.warning_notifications import diagnostic_turn_muted
             turn.mute_notification_reply = diagnostic_turn_muted(
                 agent._pending_cli_user_message.get("display_metadata"), "cli", agent._notification_config)
@@ -364,9 +366,11 @@ class CLIChatTurnMixin:
         self._pending_one_turn_model_restore = None
         try:
             from agent.notification_presentation import notification_turn
+            from hermes_cli.cli_plugin_turn import run_cli_conversation
             muted = getattr(turn, "mute_notification_reply", False)
             with notification_turn(self.agent, muted=muted, session_id=self.session_id):
-                turn.result = self.agent.run_conversation(
+                turn.result = run_cli_conversation(self,
+                    native_candidate=getattr(turn, "native_plugin_candidate", None),
                     user_message=agent_message,
                     conversation_history=self.conversation_history[:-1],
                     stream_callback=None if muted else turn.stream_callback, task_id=self.session_id,
