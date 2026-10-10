@@ -368,7 +368,7 @@ async def test_execution_cancelled_after_claim_never_replays(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing", [None, "slot", "turn_lease"])
+@pytest.mark.parametrize("missing", [None, "slot", "turn_lease", "post_read_mutation", "observer_failure"])
 async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, monkeypatch, missing):
     """Only the external model call is replaced; route, leases, history and adapter are real."""
     import gateway.run as gateway_run
@@ -400,6 +400,10 @@ async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, mo
         assert state is not None
         assert runner._held_turn_lease(snapshot.session_key, state.persistent.run_generation) is not None
         observations.append(snapshot)
+        assert runner._native_plugin_queue().lookup(manager.scope_key, snapshot.route_epoch,
+                                                   snapshot.delivery_id)["state"] == "admitted"
+        if missing == "observer_failure":
+            raise OSError("broker unavailable")
         return original_observe(client, snapshot)
     monkeypatch.setattr(TrustedInboundBrokerClient, "observe_native_turn", observe)
     adapter = RecordingAdapter(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
@@ -428,12 +432,28 @@ async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, mo
         runner._claim_active_session_slot = lambda *args: (None, None)
     elif missing == "turn_lease":
         runner._turn_leases.acquire = AsyncMock(return_value=None)
+    elif missing == "post_read_mutation":
+        queue = runner._native_plugin_queue()
+        original_settle = queue.settle
+        def mutate_then_settle(row):
+            with queue._connection() as db:
+                db.execute("UPDATE candidates SET session_key=? WHERE candidate=?",
+                           ("forged-key", row["candidate"]))
+            return original_settle(row)
+        monkeypatch.setattr(queue, "settle", mutate_then_settle)
     first = await admit(runner, manager, claim, "first", "first native")
     second = await admit(runner, manager, claim, "second", "second native")
     assert first.state == second.state == "unknown"
     for _ in range(2):
         await runner._drain_native_plugin_candidates_once()
         await adapter._session_tasks[entry.session_key]
+    if missing == "observer_failure":
+        assert observed == []
+        assert [item.delivery_id for item in observations] == ["first", "second"]
+        assert (await admit(runner, manager, claim, "first", "first native")).state == "admitted"
+        assert (await admit(runner, manager, claim, "second", "second native")).state == "admitted"
+        assert runner._native_plugin_queue().queued() == []
+        return
     if missing:
         assert observations == []
         assert observed == []

@@ -159,6 +159,7 @@ def test_trusted_broker_observation_is_unavailable_even_after_local_turn(shell, 
     def observe(client, snapshot):
         assert host.active_turn is not None
         assert host.active_turn[2] is not None
+        assert host.queue.lookup(host.profile, claim.route_epoch, "delivery")["state"] == "admitted"
         observations.append(snapshot)
         return original(client, snapshot)
 
@@ -175,6 +176,30 @@ def test_trusted_broker_observation_is_unavailable_even_after_local_turn(shell, 
     assert original(TrustedInboundBrokerClient(), snapshot).state == "unknown"
     assert not host.drain_one()
     assert len(observations) == 1
+
+
+def test_native_event_id_is_stable_and_binds_local_candidate_tuple(shell):
+    from hermes_cli.trusted_inbound_broker import NativeCandidateSnapshot
+
+    host, ctx = context(shell)
+    claim = host.claim()
+    assert deliver(ctx, claim).state == "unknown"
+    row = host.queue.lookup(host.profile, claim.route_epoch, "delivery") | {"execution": "running"}
+    snapshot = NativeCandidateSnapshot.from_running_row(row, surface="cli", content="native prompt")
+    repeated = NativeCandidateSnapshot.from_running_row(row, surface="cli", content="native prompt")
+    changed_owner = NativeCandidateSnapshot.from_running_row(
+        row | {"owner": "other-owner"}, surface="cli", content="native prompt")
+    changed_delivery = NativeCandidateSnapshot.from_running_row(
+        row | {"delivery": "other-delivery"}, surface="cli", content="native prompt")
+    changed_epoch = NativeCandidateSnapshot.from_running_row(
+        row | {"epoch": "other-epoch"}, surface="cli", content="native prompt")
+    changed_candidate = NativeCandidateSnapshot.from_running_row(
+        row | {"candidate": "other-candidate"}, surface="cli", content="native prompt")
+    assert snapshot.local_event_id == repeated.local_event_id
+    assert snapshot.local_event_id != changed_owner.local_event_id
+    assert snapshot.local_event_id != changed_delivery.local_event_id
+    assert snapshot.local_event_id != changed_epoch.local_event_id
+    assert snapshot.local_event_id != changed_candidate.local_event_id
 
 
 def test_forged_local_digest_never_reaches_broker_observer(shell, monkeypatch):
@@ -255,7 +280,7 @@ def test_post_read_route_change_cannot_settle_or_run_model(shell, monkeypatch):
     model_calls = []
     bind_real_agent_thread(shell, lambda **kwargs: model_calls.append(kwargs))
     assert host.drain_one()
-    assert mutated and len(observed) == 1 and observed[0].state == "unknown"
+    assert mutated and observed == []
     assert model_calls == []
     row = original_lookup(host.profile, claim.route_epoch, "delivery")
     assert row["session_key"] == "forged-key"
@@ -467,6 +492,30 @@ def test_settlement_postcommit_error_has_durable_receipt_and_no_second_turn(shel
     assert not calls and host.active_turn is None
     assert deliver(ctx, claim) == receipt
     assert not host.drain_one()
+
+
+def test_observer_failure_after_settlement_has_same_id_readback_without_replay(shell, monkeypatch):
+    from hermes_cli.trusted_inbound_broker import TrustedInboundBrokerClient
+
+    host, ctx = context(shell)
+    claim = host.claim()
+    model_calls = []
+    bind_real_agent_thread(shell, lambda **kw: model_calls.append(kw))
+    observed = []
+
+    def fail_after_settlement(client, snapshot):
+        observed.append(snapshot.local_event_id)
+        raise OSError("broker unavailable")
+
+    monkeypatch.setattr(TrustedInboundBrokerClient, "observe_native_turn", fail_after_settlement)
+    assert deliver(ctx, claim).state == "unknown"
+    assert host.drain_one()
+    receipt = host.query(route_claim=claim, delivery_id="delivery", expected_content="native prompt")
+    assert len(observed) == 1 and receipt.state == "admitted" and receipt.candidate_id
+    assert model_calls == [] and host.active_turn is None
+    assert deliver(ctx, claim) == receipt
+    assert not host.drain_one()
+    assert len(observed) == 1
 
 
 def test_private_admit_never_replays_receipt_under_stale_epoch_or_new_owner(shell):

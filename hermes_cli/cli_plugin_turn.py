@@ -127,9 +127,9 @@ def _settle_candidate(host, row):
         raise RuntimeError("CLI native candidate changed") from exc
     if snapshot.candidate_id != row["candidate"] or snapshot.host_owner_id != host.owner:
         raise RuntimeError("CLI native candidate owner changed")
-    TrustedInboundBrokerClient().observe_native_turn(snapshot)
     if not host.queue.settle(row):
         raise RuntimeError("CLI native candidate settlement unavailable")
+    TrustedInboundBrokerClient().observe_native_turn(snapshot)
 
 
 @contextmanager

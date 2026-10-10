@@ -24,6 +24,7 @@ class NativeCandidateSnapshot:
     host_owner_id: str
     delivery_id: str
     candidate_id: str
+    local_event_id: str
     payload_sha256: str
     route_fingerprint: str
 
@@ -46,9 +47,15 @@ class NativeCandidateSnapshot:
             encoded = value.encode("utf-8")
             hasher.update(struct.pack(">i", len(encoded)))
             hasher.update(encoded)
+        # This same-UID ID is only for future protected IPC readback, never authority.
+        event_hasher = hashlib.sha256(b"hermes-local-native-event-v1\0")
+        for value in (surface, *route, row["delivery"], row["candidate"], digest):
+            encoded = value.encode("utf-8")
+            event_hasher.update(struct.pack(">i", len(encoded)))
+            event_hasher.update(encoded)
         return cls(surface, row["profile"], row["session_key"], row["native_id"],
                    row["epoch"], row["owner"], row["delivery"], row["candidate"],
-                   digest, hasher.hexdigest().upper())
+                   event_hasher.hexdigest().upper(), digest, hasher.hexdigest().upper())
 
 
 class TrustedInboundBrokerClient:
