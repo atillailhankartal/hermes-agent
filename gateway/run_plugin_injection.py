@@ -256,12 +256,15 @@ class GatewayPluginInjectionMixin:
                         return False
                     if snapshot.host_owner_id != self.session_store._route_owner_id:
                         return False
-                    if not queue.settle(row):
+                    native_event_id = queue.settle(row)
+                    if native_event_id is None:
                         return False
                     settled = queue.lookup(row["profile"], row["epoch"], row["delivery"])
                     immutable_fields = ("sequence", "profile", "epoch", "delivery", "session_key",
-                                        "native_id", "owner", "plugin", "content", "payload_digest", "candidate")
-                    if (settled is None or settled["state"] != "admitted" or not settled["native_event_id"]
+                                        "native_id", "owner", "plugin", "content", "payload_digest", "candidate",
+                                        "enrollment_id")
+                    if (settled is None or settled["state"] != "admitted"
+                            or settled["native_event_id"] != native_event_id
                             or any(settled[field] != row[field] for field in immutable_fields)):
                         return False
                     snapshot = NativeCandidateSnapshot.from_running_row(

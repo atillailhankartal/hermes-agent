@@ -110,7 +110,7 @@ def _settle_candidate(host, row):
     from hermes_cli.trusted_inbound_broker import NativeCandidateSnapshot, TrustedInboundBrokerClient
     running = host.queue.lookup(row["profile"], row["epoch"], row["delivery"])
     immutable_fields = ("sequence", "profile", "epoch", "delivery", "session_key", "native_id",
-                        "owner", "plugin", "content", "payload_digest", "candidate", "reason")
+                        "owner", "plugin", "content", "payload_digest", "candidate", "reason", "enrollment_id")
     if running is None or any(running[field] != row[field] for field in immutable_fields):
         raise RuntimeError("CLI native candidate changed")
     claim = host.claim()
@@ -127,10 +127,12 @@ def _settle_candidate(host, row):
         raise RuntimeError("CLI native candidate changed") from exc
     if snapshot.candidate_id != row["candidate"] or snapshot.host_owner_id != host.owner:
         raise RuntimeError("CLI native candidate owner changed")
-    if not host.queue.settle(row):
+    native_event_id = host.queue.settle(row)
+    if native_event_id is None:
         raise RuntimeError("CLI native candidate settlement unavailable")
     settled = host.queue.lookup(row["profile"], row["epoch"], row["delivery"])
-    if (settled is None or settled["state"] != "admitted" or not settled["native_event_id"]
+    if (settled is None or settled["state"] != "admitted"
+            or settled["native_event_id"] != native_event_id
             or any(settled[field] != row[field] for field in immutable_fields if field != "reason")):
         raise RuntimeError("CLI native event readback unavailable")
     snapshot = NativeCandidateSnapshot.from_running_row(settled, surface="cli", content=row["content"])

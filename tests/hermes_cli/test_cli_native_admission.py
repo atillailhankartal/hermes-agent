@@ -271,7 +271,8 @@ def test_running_route_change_never_reaches_observer_or_local_admission(shell, m
     assert not host.drain_one()
 
 
-def test_post_read_route_change_cannot_settle_or_run_model(shell, monkeypatch):
+@pytest.mark.parametrize("field", ["session_key", "enrollment_id", "native_event_id"])
+def test_post_read_route_change_cannot_settle_or_run_model(shell, monkeypatch, field):
     from hermes_cli.trusted_inbound_broker import TrustedInboundBrokerClient
 
     host, ctx = context(shell)
@@ -284,8 +285,8 @@ def test_post_read_route_change_cannot_settle_or_run_model(shell, monkeypatch):
         row = original_lookup(profile, epoch, delivery)
         if row is not None and row["execution"] == "running" and not mutated:
             with host.queue._connection() as db:
-                db.execute("UPDATE candidates SET session_key=? WHERE candidate=?",
-                           ("forged-key", row["candidate"]))
+                db.execute(f"UPDATE candidates SET {field}=? WHERE candidate=?",
+                           ("forged-value", row["candidate"]))
             mutated.append(row["candidate"])
         return row
 
@@ -304,7 +305,7 @@ def test_post_read_route_change_cannot_settle_or_run_model(shell, monkeypatch):
     assert mutated and observed == []
     assert model_calls == []
     row = original_lookup(host.profile, claim.route_epoch, "delivery")
-    assert row["session_key"] == "forged-key"
+    assert row[field] == "forged-value"
     assert row["state"] == "unknown" and row["execution"] == "handler_returned"
     assert host.query(route_claim=claim, delivery_id="delivery",
                       expected_content="native prompt").state == "unknown"
@@ -651,3 +652,32 @@ def test_stale_capacity_does_not_block_fresh_native_turn(shell, rotation):
     for index in range(100):
         assert deliver(ctx, fresh, f"current-{index}").state == "unknown"
     assert deliver(ctx, fresh, "current-over-cap").reason == "native_queue_full"
+
+
+@pytest.mark.parametrize("field", ["enrollment_id", "native_event_id"])
+def test_settlement_identity_substitution_never_reaches_model_or_observer(shell, monkeypatch, field):
+    from hermes_cli.trusted_inbound_broker import TrustedInboundBrokerClient
+
+    host, ctx = context(shell)
+    claim = host.claim()
+    assert deliver(ctx, claim).state == "unknown"
+    original_settle = host.queue.settle
+
+    def change_after_commit(row):
+        result = original_settle(row)
+        assert result
+        with host.queue._connection() as db:
+            db.execute(f"UPDATE candidates SET {field}=? WHERE candidate=?",
+                       ("substituted", row["candidate"]))
+        return result
+
+    monkeypatch.setattr(host.queue, "settle", change_after_commit)
+    observed, model_calls = [], []
+    monkeypatch.setattr(TrustedInboundBrokerClient, "observe_native_turn",
+                        lambda *args: observed.append(args))
+    bind_real_agent_thread(shell, lambda **kwargs: model_calls.append(kwargs))
+    assert host.drain_one()
+    assert observed == model_calls == []
+    row = host.queue.lookup(host.profile, claim.route_epoch, "delivery")
+    assert row[field] == "substituted" and row["execution"] == "handler_returned"
+    assert not host.drain_one()

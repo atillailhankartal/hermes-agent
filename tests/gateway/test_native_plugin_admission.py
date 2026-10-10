@@ -451,7 +451,8 @@ async def test_execution_cancelled_after_claim_never_replays(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing", [None, "slot", "turn_lease", "post_read_mutation", "observer_failure"])
+@pytest.mark.parametrize("missing", [None, "slot", "turn_lease", "post_read_mutation", "observer_failure",
+                                     "pre_enrollment", "pre_event", "post_enrollment", "post_event"])
 async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, monkeypatch, missing):
     """Only the external model call is replaced; route, leases, history and adapter are real."""
     import gateway.run as gateway_run
@@ -525,6 +526,17 @@ async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, mo
                            ("forged-key", row["candidate"]))
             return original_settle(row)
         monkeypatch.setattr(queue, "settle", mutate_then_settle)
+    if missing in ("pre_enrollment", "pre_event", "post_enrollment", "post_event"):
+        queue = runner._native_plugin_queue()
+        original_settle = queue.settle
+        field = "enrollment_id" if missing.endswith("enrollment") else "native_event_id"
+        def substitute_identity(row):
+            result = original_settle(row) if missing.startswith("post_") else None
+            with queue._connection() as db:
+                db.execute(f"UPDATE candidates SET {field}=? WHERE candidate=?",
+                           ("substituted", row["candidate"]))
+            return result if missing.startswith("post_") else original_settle(row)
+        monkeypatch.setattr(queue, "settle", substitute_identity)
     first = await admit(runner, manager, claim, "first", "first native")
     second = await admit(runner, manager, claim, "second", "second native")
     assert first.state == second.state == "unknown"
@@ -536,6 +548,10 @@ async def test_real_runner_and_adapter_drain_two_durable_candidates(tmp_path, mo
         assert [item.delivery_id for item in observations] == ["first", "second"]
         assert (await admit(runner, manager, claim, "first", "first native")).state == "admitted"
         assert (await admit(runner, manager, claim, "second", "second native")).state == "admitted"
+        assert runner._native_plugin_queue().queued() == []
+        return
+    if missing in ("post_enrollment", "post_event"):
+        assert observations == observed == []
         assert runner._native_plugin_queue().queued() == []
         return
     if missing:

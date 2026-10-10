@@ -182,18 +182,22 @@ class NativePluginQueue:
             self._scan_after, self._scan_through = rows[-1]["sequence"], through
         return rows
 
-    def settle(self, original: dict) -> bool:
-        """Atomically settle only the exact candidate seen under the native turn lease."""
+    def settle(self, original: dict) -> str | None:
+        """Commit one event for the exact enrollment observed under the native turn lease."""
+        if original["native_event_id"] is not None:
+            return None
+        native_event_id = uuid.uuid4().hex
         fields = ("sequence", "profile", "epoch", "delivery", "session_key", "native_id",
                   "owner", "plugin", "content", "payload_digest", "candidate", "reason")
         where = " AND ".join(f"{field}=?" for field in fields)
         with self._connection() as db:
             changed = db.execute(
                 "UPDATE candidates SET state='admitted', reason='native_turn_admitted', native_event_id=? "
-                f"WHERE state='unknown' AND execution='running' AND {where}",
-                (uuid.uuid4().hex, *(original[field] for field in fields)),
+                f"WHERE state='unknown' AND execution='running' AND {where} "
+                "AND enrollment_id IS ? AND native_event_id IS NULL",
+                (native_event_id, *(original[field] for field in fields), original["enrollment_id"]),
             ).rowcount
-        return changed == 1
+        return native_event_id if changed == 1 else None
 
     def transition(self, candidate: str, expected: str, execution: str) -> bool:
         with self._connection() as db:
