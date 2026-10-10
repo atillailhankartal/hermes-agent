@@ -83,16 +83,17 @@ def install_tui_message_injector(manager=None) -> None:
         if not _atexit_registered:
             atexit.register(clear_tui_message_injector)
             _atexit_registered = True
+        return
     manager.set_tui_message_injector(_TUI_INJECT_OWNER, inject_tui_session_message)
 
 
 def clear_tui_message_injector(manager=None) -> None:
     """Drop this process's host. A different owner is left in place."""
-    from hermes_cli.plugins import clear_published_tui_message_host, get_plugin_manager
+    from hermes_cli.plugins import clear_published_tui_message_host
 
     if manager is None:
         clear_published_tui_message_host(_TUI_INJECT_OWNER)
-        manager = get_plugin_manager()
+        return
     manager.clear_tui_message_injector(_TUI_INJECT_OWNER)
 
 
