@@ -75,6 +75,10 @@ class NativePluginQueue:
     def conflict(row):
         return dict(row) | {"state": "unknown", "reason": "native_delivery_conflict", "candidate": None}
 
+    def _queued_depth(self, db, *, profile, session_key, epoch, owner):
+        return db.execute("""SELECT COUNT(*) FROM candidates WHERE profile=? AND session_key=?
+                           AND execution='queued'""", (profile, session_key)).fetchone()[0]
+
     def admit(self, *, profile: str, epoch: str, delivery: str, session_key: str,
               native_id: str, owner: str, plugin: str, content: str, cap: int = 100,
               rejection_reason: str | None = None):
@@ -88,8 +92,8 @@ class NativePluginQueue:
                         or row["plugin"] != plugin or row["payload_digest"] != self.payload_digest(content)):
                     return self.conflict(row)
                 return dict(row)
-            depth = db.execute("""SELECT COUNT(*) FROM candidates WHERE profile=? AND session_key=?
-                               AND execution='queued'""", (profile, session_key)).fetchone()[0]
+            depth = self._queued_depth(db, profile=profile, session_key=session_key,
+                                       epoch=epoch, owner=owner)
             state, reason, candidate, execution = "unknown", "native_queue_pending", uuid.uuid4().hex, "queued"
             if rejection_reason or depth >= cap:
                 state, reason, candidate, execution = ("rejected", rejection_reason or "native_queue_full",
