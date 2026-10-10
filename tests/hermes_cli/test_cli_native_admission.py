@@ -1,4 +1,6 @@
 """CLI native delivery admission through production startup and real SQLite."""
+from contextlib import ExitStack
+
 import pytest
 
 
@@ -251,6 +253,28 @@ def test_repl_loop_drains_real_thread_and_binds_private_tool_claim(shell, monkey
     proof = dispatched[0]["route_claim"]
     assert proof.host_owner_id == claim.host_owner_id and proof.route_epoch == claim.route_epoch
     assert host.query(route_claim=claim, delivery_id="delivery", expected_content="native prompt").state == "admitted"
+
+
+@pytest.mark.parametrize("child_context", ("in_process", "inherited_marker"))
+def test_cli_tool_claim_rejects_delegated_child_context(shell, monkeypatch, child_context):
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, delegated_child_context
+    from hermes_cli.cli_plugin_turn import cli_native_turn, claim_for_cli_tool
+
+    with cli_native_turn(shell, None):
+        parent_claim = claim_for_cli_tool(shell.session_id)
+        assert parent_claim is not None
+        assert parent_claim.is_current(native_session_id=shell.session_id)
+
+        with ExitStack() as stack:
+            if child_context == "in_process":
+                stack.enter_context(delegated_child_context(shell.session_id))
+            else:
+                stack.enter_context(monkeypatch.context()).setenv(DELEGATED_CHILD_ENV_MARKER, "1")
+            assert claim_for_cli_tool(shell.session_id) is None
+            assert not parent_claim.is_current(native_session_id=shell.session_id)
+
+        assert claim_for_cli_tool(shell.session_id) is not None
+        assert parent_claim.is_current(native_session_id=shell.session_id)
 
 
 def test_admitted_readback_survives_process_reopen_without_replay(shell):

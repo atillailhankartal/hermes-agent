@@ -4,6 +4,7 @@ from contextvars import ContextVar
 from functools import wraps
 import secrets
 
+from agent.delegation_context import is_delegated_child_process_context
 from hermes_cli.active_sessions import active_session_lease_guard
 
 _BOUND_TURN = ContextVar("cli_native_turn", default=None)
@@ -37,7 +38,7 @@ def interrupt_cli_turn(cli, interrupt=None):
 
 def claim_for_cli_tool(native_session_id):
     bound = _BOUND_TURN.get()
-    if bound is None:
+    if bound is None or is_delegated_child_process_context():
         return None
     host, _ = bound
     claim = host.claim()
@@ -52,7 +53,8 @@ def tool_claim_current(host, claim):
 def _tool_claim_current_locked(host, claim):
     bound = _BOUND_TURN.get()
     active = host.active_turn
-    if bound is None or active is None or (bound[0] is not host or bound[1] is not active):
+    if (is_delegated_child_process_context() or bound is None or active is None
+            or bound[0] is not host or bound[1] is not active):
         return False
     if (not host.route_current(claim) or host.cli.agent is not active[1]
             or (claim.native_session_id, claim.route_epoch) != active[3:]):
