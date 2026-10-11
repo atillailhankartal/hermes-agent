@@ -20,8 +20,9 @@ struct handle { int fd, node, alive, borrowed, enumeration, closes; unsigned gen
 static struct {
     struct stat meta[NODES]; struct handle h[LIMIT]; unsigned next_generation;
     struct event events[LIMIT]; int count, handles, errors, lock_held;
+    int fail2_at, fail2_reached;
     int fail_at, fail_reached, failure_errno, poison_node, poison_kind, poison_reached;
-    int lock_error, lock_replaced, alias_node, alias_kind, alias_reached;
+    int lock_fault_acquired, lock_error, lock_replaced, alias_node, alias_kind, alias_reached;
     char visible_names[NODES][BH_TX_NAME];
     int acl_live, allocations, frees, alloc_live, leaf_opens[3];
     unsigned leaf_original[3]; int close_sequence[LIMIT], closes;
@@ -35,6 +36,7 @@ static int is_dir(int n) { return n == ANCHOR || n == LOCKS || n == VERSIONS || 
 static int event(char op, int node, int arg) {
     if (f.count >= LIMIT) abort();
     f.events[f.count++] = (struct event){op,node,arg};
+    if (f.fail2_at == f.count) { ++f.fail2_reached; errno = f.failure_errno; return -1; }
     if (f.fail_at == f.count) { ++f.fail_reached; errno = f.failure_errno ? f.failure_errno : EIO; return -1; }
     return 0;
 }
@@ -160,11 +162,19 @@ int bh_tx_os_flock(int fd, int operation) {
             f.quarantine_required = 1;
             if (f.cleanup_mode != 1) f.lock_held = 0;
         }
+        else {
+            f.quarantine_required = 1;
+            if (f.cleanup_mode == 2) { f.lock_held = 1; f.lock_fault_acquired = 1; }
+        }
         return -1;
     }
     if (operation == LOCK_UN) { if (!f.lock_held) ++f.errors; f.lock_held = 0; return 0; }
     if (operation != (LOCK_EX|LOCK_NB)) ++f.errors;
-    if (f.lock_error) { ++f.poison_reached; errno = f.lock_error; return -1; }
+    if (f.lock_error) {
+        ++f.poison_reached;
+        if (f.lock_error == EIO || f.lock_error == EINTR || f.lock_error == EACCES) f.quarantine_required = 1;
+        errno = f.lock_error; return -1;
+    }
     f.lock_held = 1; return 0;
 }
 int bh_tx_os_close(int fd) {
@@ -343,7 +353,9 @@ static int run_variant(int which, int v) {
             REQUIRE(calls == f.count);
         } else {
             uint32_t wanted = which == 4 || which == 5 || which == 8 ? BH_TX_UNAVAILABLE : BH_TX_REJECTED;
-            REQUIRE(status == wanted && r.status == wanted); REQUIRE(owner == NULL);
+            REQUIRE(status == wanted && r.status == wanted);
+            /* Clean failures release ownership; ambiguous close/lock must latch. */
+            REQUIRE(f.quarantine_required ? owner != NULL : owner == NULL);
             REQUIRE(acquisition_prefix());
             if (which == 3) { REQUIRE(f.poison_reached > 0); REQUIRE(f.leaf_opens[0]+f.leaf_opens[1]+f.leaf_opens[2] == 0); }
             if (which == 4 || which == 5) {
@@ -454,6 +466,104 @@ static int terminal_latch(int v) {
         f.recycled_handle < 0 ? 0 : f.h[f.recycled_handle].generation);
     dump(); return ok;
 }
+/* Before an allocated owner exists, close/lock uncertainty still belongs to
+ * the caller's owner slot. Every fault position comes from the independent
+ * protocol oracle, not from a successful SUT trace. */
+static int preowner_ambiguity(int kind, int v) {
+    int ok = 1; variant = v; reset(); expected_begin();
+    struct bh_tx_install d = install(); struct bh_v2_transaction *owner = NULL;
+    struct bh_tx_result r = {0};
+    int unrelated = f.handles;
+    f.h[f.handles++] = (struct handle){1000,-1,1,1,0,0,++f.next_generation};
+    struct handle saved_unrelated = f.h[unrelated];
+    char fault_op = 'e'; int fault_node = -1, fault_at = 0;
+    f.cleanup_mode = v%3+1; f.failure_errno = (v/3)%2 ? EINTR : EIO;
+    if (kind == 0) {
+        int occurrence = v/6;
+        for (int i = 0; i < expected_count; ++i) if (expected[i].op == 'e') {
+            if (occurrence-- == 0) { fault_at = i+1; fault_node = expected[i].node; break; }
+        }
+        f.fail_at = fault_at;
+    } else if (kind == 1) {
+        /* Allocation fails after acquiring the graph, then a retained close
+         * or unlock fails independently during pending-owner cleanup. */
+        int position = v/6;
+        const int cleanup_nodes[] = {SELECTOR,FLOOR,MANIFEST,SIGNATURE,POLICY,SELECTORS,FLOORS,VERSION,VERSIONS,LOCKS,ANCHOR,LOCK,LOCK};
+        REQUIRE(expected[expected_count-1].op == 'M');
+        f.fail_at = expected_count;
+        fault_at = f.fail2_at = expected_count+position+1;
+        fault_op = position == 11 ? 'U' : 'C'; fault_node = cleanup_nodes[position];
+    } else {
+        f.cleanup_mode = v%2+1; f.failure_errno = kind == 3 ? EACCES : v/2 ? EINTR : EIO;
+        fault_op = 'L'; fault_node = LOCK;
+        for (int i = 0; i < expected_count; ++i) if (expected[i].op == 'L') fault_at = i+1;
+        f.fail_at = fault_at;
+    }
+    REQUIRE(fault_at > 0);
+    REQUIRE(bh_v2_transaction_begin(9,&d,&owner,&r) == BH_TX_UNAVAILABLE);
+    REQUIRE(r.status == BH_TX_UNAVAILABLE && safe_result(&r));
+    REQUIRE(f.fail_reached == 1 && f.fail2_reached == (kind == 1));
+    REQUIRE(f.count >= fault_at);
+    if (f.count >= fault_at) {
+        REQUIRE(f.events[fault_at-1].op == fault_op && f.events[fault_at-1].node == fault_node);
+        if (kind >= 2) {
+            REQUIRE(f.events[fault_at-1].arg == (LOCK_EX|LOCK_NB));
+            REQUIRE(f.lock_fault_acquired == (f.cleanup_mode == 2));
+        }
+    }
+    REQUIRE(trace_prefix(kind == 1 ? expected_count : fault_at));
+    REQUIRE(f.quarantine_required == 1 && owner != NULL);
+    REQUIRE(borrowed_preserved() && !f.errors && !f.acl_live && !f.alloc_live);
+    REQUIRE(owned_live() == (fault_op != 'L' && fault_op != 'U' && f.cleanup_mode == 1 ? 1 : 0));
+    if (fault_op == 'e' || fault_op == 'C') {
+        REQUIRE(f.failed_handle >= 0);
+        if (f.failed_handle >= 0) {
+            REQUIRE(f.h[f.failed_handle].closes == 1);
+            REQUIRE(f.h[f.failed_handle].alive == (f.cleanup_mode == 1));
+        }
+        if (f.cleanup_mode == 3) {
+            REQUIRE(f.recycled_handle >= 0);
+            if (f.recycled_handle >= 0 && f.failed_handle >= 0) {
+                struct handle *old = &f.h[f.failed_handle], *fresh = &f.h[f.recycled_handle];
+                REQUIRE(old->fd == fresh->fd && old->generation != fresh->generation);
+                REQUIRE(fresh->alive && fresh->borrowed && !fresh->closes);
+            }
+        }
+    }
+    struct bh_v2_transaction *terminal = owner;
+    int calls = f.count, closes = f.closes, allocations = f.allocations;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        memset(&r,0,sizeof(r));
+        REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_UNAVAILABLE);
+        REQUIRE(r.status == BH_TX_UNAVAILABLE && safe_result(&r));
+        REQUIRE(owner == terminal && f.count == calls && f.closes == closes);
+    }
+    memset(&r,0,sizeof(r));
+    REQUIRE(bh_v2_transaction_begin(9,&d,&owner,&r) == BH_TX_REJECTED);
+    REQUIRE(owner == terminal && f.count == calls && f.allocations == allocations && safe_result(&r));
+    REQUIRE(memcmp(&f.h[unrelated],&saved_unrelated,sizeof(saved_unrelated)) == 0);
+    REQUIRE(borrowed_preserved() && !f.errors);
+    if (f.recycled_handle >= 0) REQUIRE(f.h[f.recycled_handle].alive && !f.h[f.recycled_handle].closes);
+    fprintf(stderr,"PREOWNER fault=%c node=%d event=%d primary=%d secondary=%d errno=%d mode=%d; QUARANTINE required=%d; terminate process before retry; no OS release claim\n",
+        fault_op,fault_node,fault_at,f.fail_reached,f.fail2_reached,f.failure_errno,f.cleanup_mode,f.quarantine_required);
+    dump(); return ok;
+}
+static int clean_begin_failure(int v) {
+    int ok = 1; variant = v; reset(); expected_begin();
+    struct bh_tx_install d = install(); struct bh_v2_transaction *owner = NULL;
+    struct bh_tx_result r = {0};
+    if (v == 0) f.lock_error = EWOULDBLOCK;
+    else { f.poison_node = ANCHOR; f.poison_kind = 2; }
+    uint32_t wanted = v == 0 ? BH_TX_UNAVAILABLE : BH_TX_REJECTED;
+    REQUIRE(bh_v2_transaction_begin(9,&d,&owner,&r) == wanted);
+    REQUIRE(r.status == wanted && safe_result(&r) && owner == NULL);
+    REQUIRE(f.poison_reached == 1 && !f.quarantine_required && !owned_live());
+    int calls = f.count;
+    REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_ABORTED);
+    REQUIRE(f.count == calls && owner == NULL && safe_result(&r));
+    REQUIRE(borrowed_preserved() && !f.errors && !f.acl_live && !f.alloc_live);
+    dump(); return ok;
+}
 struct test_case { const char *name; int variants; };
 static const struct test_case cases[] = {
     {"Begin_WhenArgumentsOrAbiAreInvalid_RejectsBeforeOsCalls",13},
@@ -467,18 +577,23 @@ static const struct test_case cases[] = {
     {"Begin_WhenAnyAcquireFails_ReleasesOnlyOwnedResources",-1},
     {"Begin_WhenStableBundleIsPrepared_RetainsOriginalDescriptionsUntilAbort",1},
     {"Harness_WhenLeafReopensWithSameIntegerAndInode_RetentionOracleRejects",1},
-    {"Abort_WhenCleanupFails_LatchesUnavailableAndRejectsOwnerReuse",76}
+    {"Abort_WhenCleanupFails_LatchesUnavailableAndRejectsOwnerReuse",76},
+    {"Begin_WhenEnumerationCloseIsAmbiguous_LatchesTerminalOwner",66},
+    {"Begin_WhenPendingReleaseFailsAfterAcquisitionFailure_LatchesTerminalOwner",78},
+    {"Begin_WhenLockAcquisitionIsAmbiguous_LatchesTerminalOwner",4},
+    {"Begin_WhenBusyOrCleanlyRejected_ReleasesWithoutTerminalOwner",2},
+    {"Begin_WhenFlockEaccesMayHaveAcquiredLock_LatchesTerminalOwner",2}
 };
 int main(void) {
     int passed = 0, variants = 0; size_t count = sizeof(cases)/sizeof(cases[0]);
-    if (count != 12) { fprintf(stderr,"FAIL empty or changed registry\n"); return 2; }
+    if (count != 17) { fprintf(stderr,"FAIL empty or changed registry\n"); return 2; }
     expected_begin(); int acquisitions = expected_count;
     for (size_t i = 0; i < count; ++i) {
         int ok = 1, n = cases[i].variants < 0 ? acquisitions : cases[i].variants;
         current = cases[i].name;
         if (!current[0] || n <= 0) return 2;
         for (size_t j = 0; j < i; ++j) if (!strcmp(current,cases[j].name)) return 2;
-        for (int v = 0; v < n; ++v) { if (!(i == 11 ? terminal_latch(v) : i == 10 ? mutation_oracle() : run_variant((int)i,v))) ok = 0; ++variants; }
+        for (int v = 0; v < n; ++v) { if (!(i == 16 ? preowner_ambiguity(3,v) : i == 15 ? clean_begin_failure(v) : i >= 12 ? preowner_ambiguity((int)i-12,v) : i == 11 ? terminal_latch(v) : i == 10 ? mutation_oracle() : run_variant((int)i,v))) ok = 0; ++variants; }
         printf("%s %s variants=%d\n",ok ? "PASS" : "FAIL",current,n); fflush(stdout); passed += ok;
     }
     printf("SUMMARY %d/%zu named cases passed; %zu failed; variants=%d; 0 skipped; frozen Begin=9; source positive=1; harness=1; terminal latch=1\n",passed,count,count-(size_t)passed,variants);

@@ -1,5 +1,6 @@
 #include "signed_preflight_v2_transaction.h"
 #include "signed_preflight_v2_transaction_os.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/file.h>
@@ -12,7 +13,7 @@ struct bh_v2_transaction {
     struct bh_tx_install install;
     struct owned_fd ledger[TX_FDS];
     unsigned count, next_generation;
-    int lock_index, locked;
+    int lock_index, locked, uncertain;
 };
 /* Address identity only: never a live transaction, never dereferenced or freed.
  * Static storage keeps the terminal marker valid after the owner allocation is
@@ -96,7 +97,9 @@ static uint32_t open_edge(struct bh_v2_transaction *t, unsigned parent,
         if (exact < 0) status = BH_TX_UNAVAILABLE;
         else if (exact != 1) status = BH_TX_REJECTED;
     }
-    if (bh_tx_os_close(enum_fd)) status = BH_TX_UNAVAILABLE;
+    /* This transient generation is retired exactly once, outside the ledger.
+     * A failed close cannot prove release; carry that uncertainty to begin. */
+    if (bh_tx_os_close(enum_fd)) { t->uncertain = 1; status = BH_TX_UNAVAILABLE; }
     if (status != BH_TX_PREPARED_UNTRUSTED) return status;
     if (bh_tx_os_fstatat(t->ledger[parent].fd,name,&before,AT_SYMLINK_NOFOLLOW)) return BH_TX_UNAVAILABLE;
     if (!acceptable(t,&before,directory,min,max)) return BH_TX_REJECTED;
@@ -138,7 +141,13 @@ static uint32_t acquire(struct bh_v2_transaction *t, int anchor) {
     /* Even a lock failing metadata validation owns its independent FD. */
     if (t->count > prior) t->lock_index = (int)leaf;
     if (status != BH_TX_PREPARED_UNTRUSTED) return status;
-    if (bh_tx_os_flock(t->ledger[leaf].fd,LOCK_EX|LOCK_NB)) return BH_TX_UNAVAILABLE;
+    if (bh_tx_os_flock(t->ledger[leaf].fd,LOCK_EX|LOCK_NB)) {
+        /* Darwin flock(2) documents EWOULDBLOCK for LOCK_NB contention.
+         * EAGAIN is its alias; other errors do not prove non-acquisition. Do not issue an
+         * unlock on an ambiguous acquisition; retire the FD once in release. */
+        if (errno != EWOULDBLOCK && errno != EAGAIN) t->uncertain = 1;
+        return BH_TX_UNAVAILABLE;
+    }
     t->locked = 1;
     struct stat after;
     if (bh_tx_os_fstatat(t->ledger[lock_parent].fd,t->install.lock_name,&after,AT_SYMLINK_NOFOLLOW) ||
@@ -176,7 +185,8 @@ uint32_t bh_v2_transaction_begin(int anchor, const struct bh_tx_install *d,
         if (allocated) { *allocated = pending; *owner = allocated; return outcome(r,status); }
         status = BH_TX_UNAVAILABLE;
     }
-    if (release(&pending)) status = BH_TX_UNAVAILABLE;
+    if (release(&pending)) pending.uncertain = 1;
+    if (pending.uncertain) { *owner = &terminal_owner; status = BH_TX_UNAVAILABLE; }
     return outcome(r,status);
 }
 uint32_t bh_v2_transaction_abort(struct bh_v2_transaction **owner, struct bh_tx_result *r) {

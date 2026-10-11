@@ -24,10 +24,10 @@ struct bh_tx_result { uint32_t status, installed_authority, ready, pair; int64_t
  * copies the immutable descriptor. Dup shares the anchor open description;
  * caller must not mutate shared status flags while the context is live.
  * Caller-provided descriptor and anchor do not establish protected-root trust. Result is always OFF/PID0, never authority.
- * This slice latches ambiguous abort of a live owner only. Failed begin still
- * leaves owner NULL, including acquisition/enumeration cleanup uncertainty.
- * Recovery inspection/admission is not implemented: OFF/PID0 is not evidence
- * that retry after failed begin is safe. That gap requires separate validation.
+ * Ambiguous begin lock acquisition or cleanup (including transient enumeration
+ * handles) and ambiguous abort cleanup latch a non-NULL terminal owner. Known
+ * lock contention or clean acquisition rejection leaves owner NULL, but does
+ * not establish safe retry. Recovery inspection/admission is not implemented.
  * Successful abort releases known ownership and NULLs *owner; repeated abort
  * is inert and ABORTED. Ambiguous abort cleanup retires all known generations
  * without retry, but cannot prove the OS released every resource. It leaves a
