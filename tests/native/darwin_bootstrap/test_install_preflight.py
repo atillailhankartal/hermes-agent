@@ -130,11 +130,68 @@ def run_cmake(command):
     return result.returncode == 0
 
 
+def audit_macho(cli, otool, nm):
+    # Closed baseline for the pinned Darwin toolchain, not a side-effect denylist.
+    outputs = {}
+    for option, tool in (("-L", otool), ("-l", otool), ("-u", nm)):
+        result = subprocess.run([tool, option, str(cli)], capture_output=True,
+                                text=True, timeout=10, check=False)
+        print("MACHO_AUDIT", tool, option, "exit", result.returncode, flush=True)
+        print(result.stdout, end="", flush=True)
+        if result.returncode != 0 or result.stderr:
+            print("SETUP_FAIL Mach-O inspection", result.stderr.strip(), flush=True)
+            return False
+        outputs[option] = result.stdout
+    dependency_lines = outputs["-L"].splitlines()
+    if len(dependency_lines) != 2 or dependency_lines[0] != f"{cli}:" or not re.fullmatch(
+            r"\s+/usr/lib/libSystem\.B\.dylib \(compatibility version [0-9.]+, "
+            r"current version [0-9.]+\)", dependency_lines[1]):
+        print("SETUP_FAIL Mach-O dynamic dependencies mismatch", flush=True)
+        return False
+    # Account for every load-command block, rejecting unknown commands as well as
+    # rpath, weak, reexport, lazy and upward dylib loads and dyld environment entries.
+    blocks = re.split(r"^Load command ", outputs["-l"], flags=re.MULTILINE)
+    expected_commands = ["LC_SEGMENT_64"] * 4 + [
+        "LC_DYLD_CHAINED_FIXUPS", "LC_DYLD_EXPORTS_TRIE", "LC_SYMTAB",
+        "LC_DYSYMTAB", "LC_LOAD_DYLINKER", "LC_UUID", "LC_BUILD_VERSION",
+        "LC_SOURCE_VERSION", "LC_MAIN", "LC_LOAD_DYLIB", "LC_FUNCTION_STARTS",
+        "LC_DATA_IN_CODE", "LC_CODE_SIGNATURE"]
+    commands = []
+    if blocks[0] != f"{cli}:\n":
+        print("SETUP_FAIL Mach-O load command header", flush=True)
+        return False
+    for index, block in enumerate(blocks[1:]):
+        lines = block.splitlines()
+        command = re.findall(r"^\s+cmd (LC_\w+)$", block, re.MULTILINE)
+        if not lines or lines[0] != str(index) or len(command) != 1:
+            print("SETUP_FAIL unrecognized Mach-O load command", flush=True)
+            return False
+        commands.extend(command)
+        if command[0] in ("LC_LOAD_DYLIB", "LC_LOAD_DYLINKER"):
+            names = re.findall(r"^\s+name (.+) \(offset \d+\)$", block, re.MULTILINE)
+            expected_name = ("/usr/lib/libSystem.B.dylib" if command[0] == "LC_LOAD_DYLIB"
+                             else "/usr/lib/dyld")
+            if names != [expected_name]:
+                print("SETUP_FAIL Mach-O load path mismatch", flush=True)
+                return False
+    if sorted(commands) != sorted(expected_commands):
+        print("SETUP_FAIL Mach-O load commands mismatch", commands, flush=True)
+        return False
+    imports = outputs["-u"].splitlines()
+    expected_imports = {"___stack_chk_fail", "___stack_chk_guard", "_memcmp",
+                        "_memset", "_printf", "_puts", "_strcmp"}
+    if len(imports) != len(expected_imports) or set(imports) != expected_imports:
+        print("SETUP_FAIL exact CLI undefined imports mismatch", imports, flush=True)
+        return False
+    return True
+
+
 def build_exact_cli(directory):
     cmake = shutil.which("cmake")
     nm = shutil.which("nm")
-    if cmake is None or nm is None:
-        print("SETUP_FAIL cmake or nm unavailable", flush=True)
+    otool = shutil.which("otool")
+    if cmake is None or nm is None or otool is None:
+        print("SETUP_FAIL cmake, nm or otool unavailable", flush=True)
         return None
     if shutil.disk_usage(ROOT).free <= 20 * 1024**3 + 64 * 1024**2:
         print("SETUP_FAIL below 20 GiB reserve plus 64 MiB build cap", flush=True)
@@ -160,16 +217,30 @@ def build_exact_cli(directory):
     if len(object_section) != 2:
         print("SETUP_FAIL link map object section absent", flush=True)
         return None
-    object_lines = object_section[1].split("# Sections:", 1)[0]
-    objects = re.findall(r"^\[\s*\d+\]\s+(\S+\.o)$", object_lines, re.MULTILINE)
+    sections = object_section[1].split("# Sections:\n")
+    if len(sections) != 2:
+        print("SETUP_FAIL link map sections boundary absent or repeated", flush=True)
+        return None
+    objects = []
+    # Parse every row: filtering for .o silently omitted archives and dylibs.
+    for index, line in enumerate(sections[0].splitlines()):
+        row = re.fullmatch(r"\[\s*(\d+)\] (.+)", line)
+        if row is None or int(row[1]) != index:
+            print("SETUP_FAIL unrecognized link map object row", repr(line), flush=True)
+            return None
+        objects.append(row[2])
     expected = {
         f"CMakeFiles/hermes_bee_install_preflight.dir/{name}.c.o"
         for name in ("install_preflight_main", "install_preflight",
                      "install_preflight_unavailable")
     }
-    print("LINK_OBJECTS", sorted(objects), flush=True)
-    if len(objects) != len(expected) or set(objects) != expected or \
-            "test_install_preflight_adapter" in contents:
+    # Exact SDK stub identities observed in the pinned Xcode link map. No SDK
+    # glob, basename match or arbitrary system library is accepted.
+    sdk = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+    expected_rows = expected | {"linker synthesized", f"{sdk}/usr/lib/libSystem.tbd",
+                                f"{sdk}/usr/lib/system/libsystem_c.tbd"}
+    print("LINK_OBJECTS", objects, flush=True)
+    if len(objects) != len(expected_rows) or set(objects) != expected_rows:
         print("SETUP_FAIL exact CLI link object graph mismatch", flush=True)
         return None
     for obj in sorted(expected):
@@ -191,6 +262,8 @@ def build_exact_cli(directory):
     print("LINK_DEFINED_SYMBOLS", sorted(defined), flush=True)
     if not required.issubset(defined) or "_bh_ip_test_synthetic_provider" in actual:
         print("SETUP_FAIL exact CLI symbols mismatch", flush=True)
+        return None
+    if not audit_macho(cli, otool, nm):
         return None
     print("LINK_AUDIT PASS", flush=True)
     print("CMAKE_CLI_SHA256", sha256(cli), flush=True)
