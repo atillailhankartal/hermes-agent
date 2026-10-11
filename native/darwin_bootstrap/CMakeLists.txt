@@ -5,6 +5,27 @@ if(NOT APPLE)
   message(FATAL_ERROR "Darwin bootstrap requires the pinned macOS SDK")
 endif()
 
+# Explicit structure-only v2 parser exercise. Neither target is in the default
+# build, installed, nor linked into a launcher, host, broker or Hermes client.
+option(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TESTS
+  "Explicit dormant signed-preflight v2 structure tests" OFF)
+if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TESTS)
+  add_library(bee_hermes_signed_preflight_v2 STATIC EXCLUDE_FROM_ALL
+    signed_preflight_v2.c)
+  add_executable(bee_hermes_signed_preflight_v2_test EXCLUDE_FROM_ALL
+    ../../tests/native/darwin_bootstrap/test_signed_preflight_v2.c)
+  target_compile_features(bee_hermes_signed_preflight_v2 PRIVATE c_std_11)
+  target_compile_features(bee_hermes_signed_preflight_v2_test PRIVATE c_std_11)
+  target_compile_options(bee_hermes_signed_preflight_v2 PRIVATE
+    -Wall -Wextra -Werror -pedantic)
+  target_compile_options(bee_hermes_signed_preflight_v2_test PRIVATE
+    -Wall -Wextra -Werror -pedantic)
+  target_include_directories(bee_hermes_signed_preflight_v2 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(bee_hermes_signed_preflight_v2_test PRIVATE
+    bee_hermes_signed_preflight_v2)
+endif()
+
 add_library(bee_hermes_a2a STATIC
   launch_authority.c
   stage0.c

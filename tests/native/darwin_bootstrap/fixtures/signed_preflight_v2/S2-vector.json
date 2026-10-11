@@ -1,0 +1,85 @@
+{
+  "test_only": true,
+  "private_key_serialized_by_script": false,
+  "mode_mask": 7,
+  "positive_host_modes": [
+    1,
+    2,
+    3
+  ],
+  "missing_host_modes": [
+    1,
+    3
+  ],
+  "substituted_gateway_host_kind": 4,
+  "files": {
+    "S2-public-key.x963": {
+      "size": 65,
+      "sha256": "caf370ba1721c36c227ac9209547016ba7c7d02b0e85637641cdec4645ace0e0"
+    },
+    "S2-public-key.pem": {
+      "size": 178,
+      "sha256": "bbaebe81463ea8e67a4ba154cbfd1688f549f7262750e7fa781a311db707cc31"
+    },
+    "S2-manifest.bin": {
+      "size": 2569,
+      "sha256": "a246d07e7fc3e33beb4dbfd7c903138eeaed3cd97ff873b9eeec0cc34c30cf39"
+    },
+    "S2-policy.bin": {
+      "size": 391,
+      "sha256": "dfaeff11a19b576a1e1ca7f7f95700a7c72a6ff56a7fcaa4ebea7ed4b3516314"
+    },
+    "S2-preimage.bin": {
+      "size": 419,
+      "sha256": "eab6e35c066805db27ec62f03626dc30ecb5b9dc46b1dd32dac0aab137fe9665"
+    },
+    "S2-signature.raw": {
+      "size": 64,
+      "sha256": "151756a5d93a8cd11605f1635c8561b0805ea094e9bf85a2f03300cc2d464e38"
+    },
+    "S2-signature.der": {
+      "size": 70,
+      "sha256": "49ca54497bb826bbf5ff447423912024e56edb907d6ee972632258e5d3d85a1a"
+    },
+    "H-MISSING-manifest.bin": {
+      "size": 2563,
+      "sha256": "21aa7c4b9eed64101422b423f43ad275edb9500d8d640fa7cca05504c9fc1b92"
+    },
+    "H-MISSING-policy.bin": {
+      "size": 391,
+      "sha256": "3d6fb940b3c9603f9c871ac8d2966bf87fb83fe02156317e06f168c7191fc55d"
+    },
+    "H-MISSING-preimage.bin": {
+      "size": 419,
+      "sha256": "616a4ee8e3273d4a35621c9459367fe3885497f98759fc4af793bbb4a582ef25"
+    },
+    "H-MISSING-signature.raw": {
+      "size": 64,
+      "sha256": "e6a286ba96bdfd1b118211b3571e16d3b85adf3feeefda69b3de3ef5c9abe96d"
+    },
+    "H-MISSING-signature.der": {
+      "size": 71,
+      "sha256": "eef5d97b15d10ae4f463da7013dccefd849e31ef623b97fa0fde5c4f4c57d19e"
+    },
+    "H-SUB-manifest.bin": {
+      "size": 2569,
+      "sha256": "fed93d0baa6fd5a8f3358c17ce90bc7d21261820365a3307cad881da90bae5a1"
+    },
+    "H-SUB-policy.bin": {
+      "size": 391,
+      "sha256": "38ca908e039e3825ddf125b05b865c5725f86ed07cffc8df70de613f9dbb8dd9"
+    },
+    "H-SUB-preimage.bin": {
+      "size": 419,
+      "sha256": "37ba7a9c185e3e84be9bd01fa0a59c3dfc8409aa1822836293711e4ab5f90d8d"
+    },
+    "H-SUB-signature.raw": {
+      "size": 64,
+      "sha256": "b309dec3b4914bace583c682e80861821fccb462985ce349a635b2da29bf4510"
+    },
+    "H-SUB-signature.der": {
+      "size": 70,
+      "sha256": "3a45b49d00a771b3f088f1e7380f46357730c4b0d40dc6bda66bdf283eb08431"
+    }
+  }
+}
