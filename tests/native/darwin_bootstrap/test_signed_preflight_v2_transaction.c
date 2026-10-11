@@ -65,6 +65,7 @@ static struct {
     int pread_leaf, pread_pass, pread_kind, pread_fault_reached;
     int byte_drift_leaf, byte_drift_reached;
     char observe_fault_op; int observe_fault_node, observe_fault_nth, observe_fault_seen, observe_fault_reached;
+    const unsigned char *codec_bytes[2]; size_t codec_lengths[2];
     int state_active, state_start, state_opens[2], state_read_count[2], state_read_reached[2][2];
     unsigned state_original[2], state_read_generation[2][2];
     size_t state_read_size[2][2]; off_t state_read_offset[2][2];
@@ -340,6 +341,10 @@ ssize_t bh_tx_os_pread(int fd, void *buf, size_t n, off_t offset) {
         }
         unsigned char *out = buf;
         for (size_t i=0; i<n; ++i) out[i] = (unsigned char)(h->node*17+(int)(i%251)*7);
+        if (f.codec_bytes[file]) {
+            if (f.codec_lengths[file] != n) { ++f.errors; return -1; }
+            memcpy(out,f.codec_bytes[file],n);
+        }
         if (file == f.state_byte_drift_file && pass == 1 && n) {
             out[n-1] ^= 0x80; ++f.state_byte_drift_reached;
         }
@@ -1492,6 +1497,453 @@ static int local_state_variant(size_t group, int v) {
         return local_state_positive((int)group,v);
     return local_state_fault((int)group,v);
 }
+#ifdef BH_TX_CODEC_TEST
+#include <CommonCrypto/CommonDigest.h>
+/* The generated header is emitted only by the pinned fixture run.py. */
+typedef struct {
+    const char *name;
+    bh_journal_snapshot journal, selector;
+    bh_journal_action action;
+    int has_candidate;
+    bh_journal_candidate candidate;
+    bh_journal_outcome expected;
+    const char *diagnosis, *external_reason;
+    int off;
+} journal_case;
+#define cases codec_vectors
+#include "journal_vectors.h"
+#undef cases
+uint32_t bh_v2_transaction_observe_codec(struct bh_v2_transaction **,
+    const bh_journal_parameters *, struct bh_tx_result *);
+#ifdef BH_TX_CODEC_RED_STUB
+extern unsigned bh_tx_codec_red_hits;
+#endif
+static struct {
+    int calls, errors, mutation, mutation_hits;
+    bh_journal_parameters *source;
+    bh_journal_parameters expected;
+    bh_journal_snapshot journal, selector;
+    bh_journal_outcome outcome, real_expected;
+    const char *real_diagnosis;
+} codec_spy;
+/* The spy binary NEVER links the actual codec. The real binary renames only the
+ * actual codec entry point at compilation and wraps it to count reached calls. */
+#ifndef BH_TX_CODEC_SPY
+bh_journal_observation bh_test_real_journal_observe(bh_journal_snapshot,
+    bh_journal_snapshot, const bh_journal_parameters *, bh_journal_action,
+    const bh_journal_candidate *);
+#endif
+static void codec_digest(const void *p, size_t n, unsigned char out[32]) {
+    if (n > UINT32_MAX || !CC_SHA256(p,(CC_LONG)n,out)) abort();
+}
+bh_journal_observation bh_journal_observe(bh_journal_snapshot j,
+    bh_journal_snapshot s, const bh_journal_parameters *p,
+    bh_journal_action a, const bh_journal_candidate *c) {
+    ++codec_spy.calls;
+    if (a != BH_JOURNAL_STARTUP_RECOVER || c != NULL || !p ||
+        p == codec_spy.source || memcmp(p,&codec_spy.expected,sizeof(*p))) ++codec_spy.errors;
+    bh_journal_snapshot got[2]={j,s}, want[2]={codec_spy.journal,codec_spy.selector};
+    for (int i=0; i<2; ++i) {
+        unsigned char x[32], y[32];
+        if (!got[i].present || got[i].length != want[i].length || !got[i].bytes) {
+            ++codec_spy.errors; continue;
+        }
+        codec_digest(got[i].bytes,got[i].length,x);
+        codec_digest(want[i].bytes,want[i].length,y);
+        if (memcmp(x,y,32) || got[i].bytes == want[i].bytes) ++codec_spy.errors;
+    }
+#ifdef BH_TX_CODEC_SPY
+    if (codec_spy.mutation) {
+        ++codec_spy.mutation_hits;
+        if (codec_spy.mutation == 1) memset(codec_spy.source->installation_id,0x99,32);
+        if (codec_spy.mutation == 2) memset(codec_spy.source->new_key_id,0x99,32);
+        if (codec_spy.mutation == 3) codec_spy.source->threshold_t=99;
+        if (memcmp(p,&codec_spy.expected,sizeof(*p))) ++codec_spy.errors;
+    }
+    /* Deliberately hostile authority-looking fields must never escape. */
+    bh_journal_observation result={codec_spy.outcome,"spy","spy",0,99,77,66};
+    return result;
+#else
+    bh_journal_observation result=bh_test_real_journal_observe(j,s,p,a,c);
+    if (result.outcome != codec_spy.real_expected || !result.parser_diagnosis ||
+        strcmp(result.parser_diagnosis,codec_spy.real_diagnosis)) ++codec_spy.errors;
+    printf("REAL CODEC reached outcome=%d diagnosis=%s\n",(int)result.outcome,result.parser_diagnosis);
+    return result;
+#endif
+}
+static const journal_case *codec_vector(const char *name) {
+    for (size_t i=0; i<sizeof(codec_vectors)/sizeof(codec_vectors[0]); ++i)
+        if (!strcmp(codec_vectors[i].name,name)) return &codec_vectors[i];
+    fprintf(stderr,"SETUP missing fixture %s\n",name); return NULL;
+}
+static int codec_prepare(struct bh_v2_transaction **owner, struct bh_tx_result *r,
+                         const journal_case *v, int capture) {
+    if (!v || v->action != BH_JOURNAL_STARTUP_RECOVER || !v->journal.present ||
+        !v->selector.present || !v->journal.length || !v->selector.length) return 0;
+    if (!local_state_fixture(owner,r,(off_t)v->journal.length,(off_t)v->selector.length,0)) return 0;
+    f.codec_bytes[0]=v->journal.bytes; f.codec_lengths[0]=v->journal.length;
+    f.codec_bytes[1]=v->selector.bytes; f.codec_lengths[1]=v->selector.length;
+    if (capture && local_state_call(owner,r) != BH_TX_PREPARED_UNTRUSTED) return 0;
+    if (capture && (!state_original_reads() || !state_full_trace() || f.alloc_live != 6)) return 0;
+    if (capture) {
+        bh_journal_snapshot snapshots[2]={v->journal,v->selector};
+        for (int i=0; i<2; ++i) {
+            unsigned char digest[32];
+            if (f.blocks[5+i].size != snapshots[i].length ||
+                memcmp(f.blocks[5+i].ptr,snapshots[i].bytes,snapshots[i].length)) return 0;
+            codec_digest(f.blocks[5+i].ptr,snapshots[i].length,digest);
+            printf("FIXTURE %s %s length=%zu sha256=",v->name,i ? "selector" : "journal",snapshots[i].length);
+            for (int k=0; k<32; ++k) printf("%02x",digest[k]);
+            putchar('\n');
+        }
+    }
+    memset(r,0,sizeof(*r));
+    memset(&codec_spy,0,sizeof(codec_spy));
+    codec_spy.journal=v->journal; codec_spy.selector=v->selector;
+    codec_spy.real_expected=v->expected; codec_spy.real_diagnosis=v->diagnosis;
+    codec_spy.outcome=BH_JOURNAL_CONSISTENT_ONLY;
+    return 1;
+}
+static uint32_t codec_call(struct bh_v2_transaction **owner,
+                          bh_journal_parameters *p, struct bh_tx_result *r) {
+    codec_spy.source=p;
+    if (p) codec_spy.expected=*p;
+    return bh_v2_transaction_observe_codec(owner,p,r);
+}
+static int codec_no_io(int cursor, int frees) {
+    if (f.count-cursor != frees) return 0;
+    for (int i=cursor; i<f.count; ++i) if (f.events[i].op != 'F') return 0;
+    return 1;
+}
+static int codec_cleanup(struct bh_v2_transaction **owner, struct bh_tx_result *r, int ambiguous) {
+    int ok=1, start=f.count;
+    memset(r,0,sizeof(*r));
+    uint32_t want=ambiguous ? BH_TX_UNAVAILABLE : BH_TX_ABORTED;
+    REQUIRE(bh_v2_transaction_abort(owner,r) == want);
+    REQUIRE(r->status == want && safe_result(r) && !f.alloc_live && !f.errors && borrowed_preserved());
+    REQUIRE(ambiguous ? *owner != NULL : *owner == NULL);
+    if (!ambiguous) REQUIRE(!owned_live() && local_state_cleanup_order(start));
+    for (int i=0; i<f.block_count; ++i) REQUIRE(f.blocks[i].frees == 1);
+    int cursor=f.count; memset(r,0,sizeof(*r));
+    REQUIRE(bh_v2_transaction_abort(owner,r) == want && cursor == f.count);
+    return ok;
+}
+static int codec_expect(struct bh_v2_transaction **owner, bh_journal_parameters *p,
+                        struct bh_tx_result *r, uint32_t want, int calls, int drain) {
+    int ok=1, cursor=f.count, allocations=f.allocations, frees=f.frees;
+    size_t payload=f.payload_live;
+    memset(r,0,sizeof(*r));
+    struct bh_tx_result before=*r;
+    int null_owner=owner == NULL || *owner == NULL;
+    uint32_t got=codec_call(owner,p,r);
+    printf("BRIDGE %s variant=%d expected=%u actual=%u codec_calls=%d\n",current,variant,want,got,codec_spy.calls);
+    REQUIRE(got == want && safe_result(r));
+    if (null_owner) {
+        /* Structural null-owner rejection preserves the complete caller result,
+         * including status; abort has already cleared ownership in its case. */
+        REQUIRE(want == BH_TX_REJECTED && memcmp(r,&before,sizeof(before)) == 0);
+    } else REQUIRE(r->status == want);
+    REQUIRE(codec_spy.calls == calls && !codec_spy.errors);
+    REQUIRE(f.allocations == allocations && codec_no_io(cursor,drain ? 5 : 0));
+    REQUIRE(f.frees == frees+(drain ? 5 : 0));
+    REQUIRE(drain ? state_all_buffers_freed() : f.payload_live == payload);
+    REQUIRE(!f.errors && borrowed_preserved());
+    return ok;
+}
+/* Literal strict parser for fix2 row17: no tolerant fromhex/truncation. */
+static int codec_new_key_delta(bh_journal_parameters *p) {
+    const char *hex="a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4";
+    size_t n=strlen(hex), decoded=0;
+    if (n != 64) return 0;
+    for (size_t i=0; i<n; i+=2) {
+        unsigned char pair[2];
+        for (size_t k=0; k<2; ++k) {
+            char ch=hex[i+k];
+            if (ch >= '0' && ch <= '9') pair[k]=(unsigned char)(ch-'0');
+            else if (ch >= 'a' && ch <= 'f') pair[k]=(unsigned char)(10+ch-'a');
+            else return 0;
+        }
+        p->new_key_id[decoded++]=(unsigned char)(pair[0]*16+pair[1]);
+    }
+    if (decoded != 32) return 0;
+    for (size_t i=0; i<decoded; ++i) if (p->new_key_id[i] != 0xa4) return 0;
+    return 1;
+}
+static int codec_variant(int group, int v, const char *label) {
+    int ok=1; variant=v;
+    struct bh_v2_transaction *owner=NULL; struct bh_tx_result r={0};
+    bh_journal_parameters p=parameters;
+    const char *fixture="seed_old_active";
+    if (group <= 14 || group == 23) fixture=label;
+    if (group == 17) {
+        static const char *const bindings[]={"seed_old_active","new_t_plus_one_active","seed_old_active","old_at_t_armed_active"};
+        fixture=bindings[v];
+    }
+    if ((group == 25 && v == 1) || (group == 27 && v == 1)) fixture="crash_armed_intent_old_selector";
+    if (group == 25 && v == 2) fixture="incorrect_integrity_digest";
+    const journal_case *j=codec_vector(fixture);
+    if (!j) return 0;
+    if (group == 19) {
+        reset(); memset(&codec_spy,0,sizeof(codec_spy));
+        struct bh_tx_install d=install();
+        if (v != 0) {
+            REQUIRE(bh_v2_transaction_begin(9,&d,&owner,&r) == BH_TX_PREPARED_UNTRUSTED);
+            if (v == 2) { memset(&r,0,sizeof(r)); REQUIRE(observe_call(&owner,&r) == BH_TX_PREPARED_UNTRUSTED); }
+            if (v == 3) {
+                f.fail_at=f.count+1; f.failure_errno=EIO; f.cleanup_mode=2;
+                memset(&r,0,sizeof(r));
+                REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_UNAVAILABLE);
+                REQUIRE(f.fail_reached == 1);
+            }
+        }
+        REQUIRE(codec_expect(&owner,&p,&r,v == 3 ? BH_TX_UNAVAILABLE : BH_TX_REJECTED,0,0));
+        if (v == 1 || v == 2) {
+            if (v == 1) { memset(&r,0,sizeof(r)); REQUIRE(observe_call(&owner,&r) == BH_TX_PREPARED_UNTRUSTED); }
+            f.codec_bytes[0]=j->journal.bytes; f.codec_lengths[0]=j->journal.length;
+            f.codec_bytes[1]=j->selector.bytes; f.codec_lengths[1]=j->selector.length;
+            /* These wrong-order cases retain the original 32-byte baselines;
+             * a correctly ordered spy diagnostic is allowed on those snapshots. */
+            f.codec_bytes[0]=f.codec_bytes[1]=NULL;
+            memset(&r,0,sizeof(r)); REQUIRE(local_state_call(&owner,&r) == BH_TX_PREPARED_UNTRUSTED);
+            codec_spy.journal=(bh_journal_snapshot){f.blocks[5].ptr,f.blocks[5].size,1};
+            codec_spy.selector=(bh_journal_snapshot){f.blocks[6].ptr,f.blocks[6].size,1};
+            /* Reference bytes must be independent from the product pointers. */
+            unsigned char jb[32],sb[32]; memcpy(jb,f.blocks[5].ptr,32); memcpy(sb,f.blocks[6].ptr,32);
+            codec_spy.journal.bytes=jb; codec_spy.selector.bytes=sb;
+            codec_spy.outcome=BH_JOURNAL_CONSISTENT_ONLY;
+            REQUIRE(codec_expect(&owner,&p,&r,BH_TX_PREPARED_UNTRUSTED,1,0));
+        }
+        if (v == 0) { memset(&r,0,sizeof(r)); REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_ABORTED); }
+        else REQUIRE(codec_cleanup(&owner,&r,v == 3));
+        return ok;
+    }
+    if (group == 21 || group == 28 || group == 29) {
+        if (group == 28) {
+            off_t floor=v ? (off_t)BH_JOURNAL_MAX_BYTES+1 : 0;
+            off_t selector=v ? 0 : (off_t)BH_SELECTOR_MAX_BYTES+1;
+            REQUIRE(local_state_fixture(&owner,&r,floor,selector,0));
+            memset(&codec_spy,0,sizeof(codec_spy));
+            REQUIRE(local_state_call(&owner,&r) == (uint32_t)(v ? BH_TX_REJECTED : BH_TX_UNAVAILABLE));
+        } else if (group == 21 && v == 0) {
+            reset(); memset(&codec_spy,0,sizeof(codec_spy)); struct bh_tx_install d=install();
+            REQUIRE(bh_v2_transaction_begin(9,&d,&owner,&r) == BH_TX_PREPARED_UNTRUSTED);
+            f.pread_leaf=0; f.pread_pass=0; f.pread_kind=3; memset(&r,0,sizeof(r));
+            REQUIRE(observe_call(&owner,&r) == BH_TX_UNAVAILABLE && f.pread_fault_reached == 1);
+        } else {
+            REQUIRE(codec_prepare(&owner,&r,j,0));
+            if (group == 21 && v == 1) f.state_byte_drift_file=0;
+            if (group == 21 && v == 2) { f.state_pread_file=0; f.state_pread_pass=0; f.state_pread_kind=3; }
+            if (group == 29 && v == 0) { f.state_meta_file=0; f.state_meta_checkpoint=0; f.state_meta_kind=3; }
+            if (group == 29 && v == 1) { f.observe_fault_op='A'; f.observe_fault_node=FLOOR; f.observe_fault_nth=1; }
+            if (group == 29 && v == 2) { f.path_override[FLOOR]=1; f.path_meta[FLOOR]=f.meta[FLOOR]; ++f.path_meta[FLOOR].st_ino; }
+            uint32_t status=local_state_call(&owner,&r);
+            REQUIRE(status == (uint32_t)((group == 21 && v == 2) || (group == 29 && v == 1) ? BH_TX_UNAVAILABLE : BH_TX_REJECTED));
+            if (group == 21) REQUIRE(v == 1 ? f.state_byte_drift_reached == 1 : f.state_pread_fault_reached == 1);
+            if (group == 29 && v == 0) REQUIRE(f.state_meta_reached == 1);
+            if (group == 29 && v == 1) REQUIRE(f.observe_fault_reached == 1);
+            if (group == 29 && v == 2) {
+                int seen=0; for (int i=f.state_start; i<f.count; ++i)
+                    if (f.events[i].op == 'N' && f.events[i].node == FLOOR) ++seen;
+                REQUIRE(seen == 1);
+            }
+        }
+        REQUIRE(state_all_buffers_freed());
+        REQUIRE(codec_expect(&owner,&p,&r,BH_TX_UNAVAILABLE,0,0));
+        REQUIRE(codec_cleanup(&owner,&r,0)); return ok;
+    }
+    if (group == 30 && v == 1) {
+        REQUIRE(local_state_fixture(&owner,&r,BH_JOURNAL_MAX_BYTES,BH_SELECTOR_MAX_BYTES,0));
+        REQUIRE(local_state_call(&owner,&r) == BH_TX_PREPARED_UNTRUSTED);
+        memset(&codec_spy,0,sizeof(codec_spy));
+        codec_spy.outcome=BH_JOURNAL_CONSISTENT_ONLY;
+        unsigned char *jb=malloc(BH_JOURNAL_MAX_BYTES), *sb=malloc(BH_SELECTOR_MAX_BYTES);
+        if (!jb || !sb) { free(jb); free(sb); return 0; }
+        memcpy(jb,f.blocks[5].ptr,BH_JOURNAL_MAX_BYTES); memcpy(sb,f.blocks[6].ptr,BH_SELECTOR_MAX_BYTES);
+        codec_spy.journal=(bh_journal_snapshot){jb,BH_JOURNAL_MAX_BYTES,1};
+        codec_spy.selector=(bh_journal_snapshot){sb,BH_SELECTOR_MAX_BYTES,1};
+        REQUIRE(f.allocations == 8 && f.alloc_live == 6);
+        REQUIRE(f.payload_live == 130+BH_JOURNAL_MAX_BYTES+BH_SELECTOR_MAX_BYTES);
+        REQUIRE(codec_expect(&owner,&p,&r,BH_TX_PREPARED_UNTRUSTED,1,0));
+        free(jb); free(sb); REQUIRE(codec_cleanup(&owner,&r,0)); return ok;
+    }
+    REQUIRE(codec_prepare(&owner,&r,j,1));
+    if (!owner || f.alloc_live != 6) return 0;
+    if (group == 15) {
+        int cursor=f.count, allocations=f.allocations;
+        uint32_t got=0;
+        if (v == 0) got=bh_v2_transaction_observe_codec(&owner,NULL,&r);
+        if (v == 1 || v == 2) {
+            union { max_align_t align; unsigned char bytes[sizeof(bh_journal_parameters)+sizeof(struct bh_tx_result)+sizeof(void *)]; } storage;
+            memset(&storage,0,sizeof(storage));
+            if (v == 1) memcpy(storage.bytes,&owner,sizeof(owner));
+            unsigned char saved[sizeof(storage.bytes)]; memcpy(saved,storage.bytes,sizeof(saved));
+            got=bh_v2_transaction_observe_codec(v == 1 ? (void *)storage.bytes : &owner,
+                (const void *)storage.bytes,v == 2 ? (void *)storage.bytes : &r);
+            REQUIRE(!memcmp(storage.bytes,saved,sizeof(saved)));
+        }
+        if (v == 3) {
+            struct block *b=&f.blocks[0]; unsigned char *saved=malloc(b->size);
+            if (!saved) return 0;
+            memcpy(saved,b->ptr,b->size);
+            /* calloc owner is aligned and larger than the full parameter range;
+             * the forbidden range is rejected before it may be interpreted. */
+            REQUIRE(b->size >= sizeof(p));
+            got=bh_v2_transaction_observe_codec(&owner,b->ptr,&r);
+            REQUIRE(!memcmp(saved,b->ptr,b->size)); free(saved);
+        }
+        REQUIRE(got == BH_TX_REJECTED && !codec_spy.calls && f.count == cursor && f.allocations == allocations && f.alloc_live == 6);
+        REQUIRE(codec_expect(&owner,&p,&r,BH_TX_PREPARED_UNTRUSTED,1,0));
+        REQUIRE(codec_cleanup(&owner,&r,0)); return ok;
+    }
+    if (group == 16 || (group == 25 && v == 3) || (group == 27 && v == 2)) {
+        int delta=group == 16 ? v : 0;
+        if (delta == 0) memset(p.installation_id,0,32);
+        if (delta == 1) memset(p.new_key_id,0,32);
+        if (delta == 2) p.threshold_t=0;
+        if (delta == 3) p.threshold_t=UINT64_MAX;
+        REQUIRE(codec_expect(&owner,&p,&r,BH_TX_REJECTED,0,1));
+        p=parameters; REQUIRE(codec_expect(&owner,&p,&r,BH_TX_UNAVAILABLE,0,0));
+        REQUIRE(codec_cleanup(&owner,&r,0)); return ok;
+    }
+    if (group == 17) {
+        static const char *const diagnoses[]={"installation_mismatch","armed_bound","old_bound","armed_bound"};
+        codec_spy.real_expected=BH_JOURNAL_UNAVAILABLE; codec_spy.real_diagnosis=diagnoses[v];
+        if (v == 0) memset(p.installation_id,0x11,32);
+        if (v == 1) REQUIRE(codec_new_key_delta(&p));
+        if (v == 2) p.threshold_t=6;
+        if (v == 3) p.threshold_t=8;
+    }
+    if (group == 18) codec_spy.mutation=v+1;
+    if (group == 20 && v == 2) {
+        REQUIRE(codec_cleanup(&owner,&r,0));
+        REQUIRE(codec_expect(&owner,&p,&r,BH_TX_REJECTED,0,0)); return ok;
+    }
+    unsigned char *changed=NULL;
+    if (group == 22) {
+        int file=v%2;
+        if (v < 2) {
+            size_t n=f.codec_lengths[file]; changed=malloc(n); if (!changed) return 0;
+            memcpy(changed,f.codec_bytes[file],n); changed[n-1]^=0xff;
+            f.codec_bytes[file]=changed;
+            REQUIRE(memcmp(changed,file ? j->selector.bytes : j->journal.bytes,n) != 0);
+        } else {
+            f.path_override[FLOOR+file]=1; f.path_meta[FLOOR+file]=f.meta[FLOOR+file];
+            ++f.path_meta[FLOOR+file].st_ino;
+            REQUIRE(f.path_meta[FLOOR+file].st_ino != f.meta[FLOOR+file].st_ino);
+        }
+    }
+    uint32_t want=BH_TX_PREPARED_UNTRUSTED;
+    if ((group >= 2 && group <= 14) || group == 17) want=BH_TX_UNAVAILABLE;
+    if (group == 20 && v == 1) codec_spy.outcome=BH_JOURNAL_UNAVAILABLE;
+    if (group == 23) {
+        const bh_journal_outcome outcomes[]={BH_JOURNAL_CONSISTENT_ONLY,BH_JOURNAL_OFF_PENDING,BH_JOURNAL_UNAVAILABLE};
+        codec_spy.outcome=outcomes[v];
+    }
+    if (group == 24) {
+        const bh_journal_outcome outcomes[]={BH_JOURNAL_OFF_REJECT,BH_JOURNAL_CANDIDATE_ELIGIBLE_ONLY,BH_JOURNAL_UNAVAILABLE,(bh_journal_outcome)99};
+        codec_spy.outcome=outcomes[v];
+    }
+    if (group == 25) {
+        const bh_journal_outcome outcomes[]={BH_JOURNAL_CONSISTENT_ONLY,BH_JOURNAL_OFF_PENDING,BH_JOURNAL_UNAVAILABLE};
+        codec_spy.outcome=outcomes[v];
+    }
+    if (group == 26) {
+        const bh_journal_outcome outcomes[]={BH_JOURNAL_CONSISTENT_ONLY,BH_JOURNAL_OFF_PENDING,BH_JOURNAL_UNAVAILABLE,BH_JOURNAL_CANDIDATE_ELIGIBLE_ONLY};
+        codec_spy.outcome=outcomes[v];
+    }
+    if (group == 27 && v == 1) codec_spy.outcome=BH_JOURNAL_OFF_PENDING;
+    if (group == 30 && v == 2) codec_spy.outcome=BH_JOURNAL_UNAVAILABLE;
+#ifdef BH_TX_CODEC_SPY
+    if (codec_spy.outcome != BH_JOURNAL_CONSISTENT_ONLY) want=BH_TX_UNAVAILABLE;
+#endif
+    REQUIRE(codec_expect(&owner,&p,&r,want,1,want == BH_TX_UNAVAILABLE));
+    if (group == 18) REQUIRE(codec_spy.mutation_hits == 1 && memcmp(&p,&parameters,sizeof(p)) != 0);
+    if (group == 20 || group == 24) {
+        REQUIRE(codec_expect(&owner,&p,&r,want == BH_TX_PREPARED_UNTRUSTED ? BH_TX_REJECTED : BH_TX_UNAVAILABLE,1,0));
+    }
+    free(changed);
+    if (group == 22 && v < 2) f.codec_bytes[v]=NULL;
+    if (group == 27 && v == 3) {
+        /* Five buffer frees precede the first owned FD close. */
+        f.fail_at=f.count+6; f.failure_errno=EIO; f.cleanup_mode=2;
+        REQUIRE(codec_cleanup(&owner,&r,1)); REQUIRE(f.fail_reached == 1);
+    } else REQUIRE(codec_cleanup(&owner,&r,0));
+    return ok;
+}
+
+struct codec_group { const char *name; int count; const char *labels[4]; };
+static const struct codec_group codec_groups[] = {
+    {"ObserveCodec_WhenExactActiveSelector_ReturnsPreparedUntrusted",3,{"seed_old_active","old_at_t_armed_active","new_t_plus_one_active"}},
+    {"ObserveCodec_WhenPendingOldSelector_ReturnsUnavailable",2,{"crash_armed_intent_old_selector","crash_new_only_intent_old_selector"}},
+    {"ObserveCodec_WhenPendingTargetSelector_ReturnsUnavailable",2,{"crash_armed_intent_target_selector","crash_new_only_intent_target_selector"}},
+    {"ObserveCodec_WhenJournalSuffixIsTorn_ReturnsUnavailable",4,{"prefix_byte","suffix_byte","truncated_active","wrong_total_length"}},
+    {"ObserveCodec_WhenRecordSyntaxIsInvalid_ReturnsUnavailable",4,{"unknown_record_type","unknown_record_flag","noncanonical_version_length","nonzero_reserved"}},
+    {"ObserveCodec_WhenVersionEncodingIsInvalid_ReturnsUnavailable",2,{"invalid_utf8_overlong_version","alternate_casefold_version"}},
+    {"ObserveCodec_WhenSequenceIsNotContiguous_ReturnsUnavailable",4,{"duplicate_sequence","gap_sequence","reordered_records","sequence_u64_max_overflow_boundary"}},
+    {"ObserveCodec_WhenDigestChainIsWrong_ReturnsUnavailable",3,{"incorrect_previous_digest","incorrect_intent_digest","incorrect_integrity_digest"}},
+    {"ObserveCodec_WhenSelectorTupleDiffers_ReturnsUnavailable",4,{"selector_policy_mismatch","selector_manifest_mismatch","selector_version_mismatch","selector_incorrect_intent_binding"}},
+    {"ObserveCodec_WhenSelectorFormatIsInvalid_ReturnsUnavailable",2,{"selector_suffix","selector_unknown_flag"}},
+    {"ObserveCodec_WhenKeyBoundsAreInvalid_ReturnsUnavailable",2,{"unknown_key_state","old_key_at_t_plus_one"}},
+    {"ObserveCodec_WhenTransitionIsInvalid_ReturnsUnavailable",2,{"direct_old_to_new_only","same_epoch_changed_policy"}},
+    {"ObserveCodec_WhenIntentOrActiveTupleIsInvalid_ReturnsUnavailable",3,{"active_tuple_mismatch","duplicate_intent","transaction_id_reuse"}},
+    {"ObserveCodec_WhenInstallationDiffers_ReturnsUnavailable",1,{"wrong_installation"}},
+    {"ObserveCodec_WhenParametersAreStructurallyInvalid_RejectsWithoutAttempt",4,{"null","overlap_owner_range","overlap_result_range","overlap_live_context_range"}},
+    {"ObserveCodec_WhenParameterContentIsInvalid_RejectsAndLatches",4,{"zero_installation_id","zero_new_key_id","threshold_zero","threshold_uint64_max"}},
+    {"ObserveCodec_WhenParametersDoNotMatchPersistedState_ReturnsUnavailable",4,{"different_installation_id","different_new_key_id_on_new_active","threshold_below_old_epoch","threshold_above_armed_epoch"}},
+    {"ObserveCodec_WhenCallerMutatesParametersDuringCall_UsesCopiedTuple",3,{"mutate_installation","mutate_new_key","mutate_threshold"}},
+    {"ObserveCodec_WhenCalledOutOfOrder_RejectsWithoutCodec",4,{"null_owner","before_leaf","after_leaf_before_state","terminal_owner"}},
+    {"ObserveCodec_WhenRepeated_DoesNotInvokeCodecAgain",3,{"after_success","after_codec_failure","after_abort"}},
+    {"ObserveCodec_WhenPriorObservationFailed_DoesNotBypassFailure",3,{"leaf_unavailable","state_rejected","state_unavailable"}},
+    {"ObserveCodec_WhenStateBytesChangeAfterCapture_UsesPrivateSnapshots",4,{"floor_same_fd_mutated","selector_same_fd_mutated","floor_path_replaced","selector_path_replaced"}},
+    {"ObserveCodec_WhenInvoked_UsesFixedStartupActionAndNullCandidate",3,{"seed_old_active","crash_armed_intent_old_selector","incorrect_integrity_digest"}},
+    {"ObserveCodec_WhenCodecReturnsUnexpectedOutcome_FailsClosed",4,{"off_reject","candidate_eligible","unavailable","invalid_enum_value"}},
+    {"ObserveCodec_WhenCalled_AddsNoIOOrPersistence",4,{"exact_active","pending_intent","corrupt_record","invalid_parameters"}},
+    {"ObserveCodec_WhenAnyOutcome_NeverGrantsAuthority",4,{"consistent_codec_off_false","pending","unavailable","unexpected_candidate_eligible"}},
+    {"ObserveCodec_WhenAborted_ReleasesSnapshotsAndFDsExactlyOnce",4,{"after_success","after_pending","after_content_failure","ambiguous_abort_close"}},
+    {"ObserveCodec_WhenPairedStateSizesFail_PreservesLegacyPrecedence",2,{"floor_zero_selector_301","floor_1392641_selector_zero"}},
+    {"ObserveCodec_WhenPhysicalStateObservationFails_DoesNotCallCodec",3,{"metadata_drift","acl_unknown","path_identity_drift"}},
+    {"ObserveCodec_WhenSnapshotsAreBounded_AddsNoPayload",3,{"minimal_valid_fixture","journal_max_selector_max_captured","failure_frees_all"}},
+};
+static int codec_suite(void) {
+    int ok=1, total=0, executed=0, passed=0, groups=0;
+    REQUIRE(sizeof(codec_groups)/sizeof(codec_groups[0]) == 30);
+    for (size_t i=0; i<30; ++i) {
+        REQUIRE(codec_groups[i].count > 0);
+        for (size_t k=0; k<i; ++k) REQUIRE(strcmp(codec_groups[i].name,codec_groups[k].name) != 0);
+        total+=codec_groups[i].count;
+    }
+    REQUIRE(total == 94);
+    for (int group=1; group<=30; ++group) {
+#ifdef BH_TX_CODEC_SPY
+        if (group <= 17) continue; /* Explicit disjoint link partition, not a skip. */
+#else
+        if (group > 17) continue;
+#endif
+        int group_ok=1; current=codec_groups[group-1].name; ++groups;
+        for (int v=0; v<codec_groups[group-1].count; ++v) {
+            printf("VARIANT %s label=%s\n",current,codec_groups[group-1].labels[v]);
+            if (!codec_variant(group,v,codec_groups[group-1].labels[v])) group_ok=0;
+            ++executed;
+        }
+        printf("%s %s variants=%d\n",group_ok ? "PASS" : "FAIL",current,codec_groups[group-1].count);
+        passed+=group_ok; fflush(stdout);
+    }
+#ifdef BH_TX_CODEC_RED_STUB
+    printf("RED STUB hits=%u; negative matches are NOT coverage\n",bh_tx_codec_red_hits);
+    REQUIRE(bh_tx_codec_red_hits > 0);
+#endif
+    printf("CODEC BRIDGE SUMMARY %d/%d groups; executed=%d; registry=30/94; skips=0; link=%s\n",
+        passed,groups,executed,
+#ifdef BH_TX_CODEC_SPY
+        "spy"
+#else
+        "real"
+#endif
+    );
+    return ok && passed == groups;
+}
+#endif
+
 int main(void) {
     int passed = 0, variants = 0; size_t count = sizeof(cases)/sizeof(cases[0]);
     if (count != 18) { fprintf(stderr,"FAIL empty or changed registry\n"); return 2; }
@@ -1540,6 +1992,11 @@ int main(void) {
     }
     printf("LOCAL STATE SUMMARY %d/%zu named cases passed; %zu failed; variants=%d; 0 skipped; prior 18/490 and 11/94 preserved\n",
         state_passed,state_count,state_count-(size_t)state_passed,state_variants);
-    reset(); return passed == (int)count && terminal && observe_passed == (int)observe_count &&
+#ifdef BH_TX_CODEC_TEST
+    int codec_ok=codec_suite();
+#else
+    int codec_ok=1;
+#endif
+    reset(); return codec_ok && passed == (int)count && terminal && observe_passed == (int)observe_count &&
         state_passed == (int)state_count && state_variants == 141 ? 0 : 1;
 }

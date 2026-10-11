@@ -2,6 +2,7 @@
 #define BH_V2_TRANSACTION_H
 #include <stddef.h>
 #include <stdint.h>
+#include "signed_preflight_v2_journal_codec.h"
 #define BH_TX_ABI 1u
 #define BH_TX_COMPONENTS 4u
 #define BH_TX_NAME 64u
@@ -49,5 +50,14 @@ uint32_t bh_v2_transaction_observe_retained(struct bh_v2_transaction **owner,
  * remain private until abort; no format, witness, or admission proof is made. */
 uint32_t bh_v2_transaction_observe_local_state(struct bh_v2_transaction **owner,
     struct bh_tx_result *result);
+/* One-shot synchronous format diagnostic after successful leaf/state capture.
+ * Parameters are caller-supplied and untrusted, readable at entry, and copied
+ * before codec use. Their range, owner and result must be mutually disjoint
+ * and disjoint from the live context. Structural failures preserve inputs and
+ * do not consume the attempt. Content/codec failure drains private snapshots
+ * and latches failure; success retains them until abort. No codec output or
+ * parameter establishes installation, recovery, admission or launch authority. */
+uint32_t bh_v2_transaction_observe_codec(struct bh_v2_transaction **owner,
+    const bh_journal_parameters *diagnostic_parameters, struct bh_tx_result *result);
 uint32_t bh_v2_transaction_abort(struct bh_v2_transaction **owner, struct bh_tx_result *result);
 #endif

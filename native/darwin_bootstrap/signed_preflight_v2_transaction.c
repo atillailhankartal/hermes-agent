@@ -30,6 +30,7 @@ struct bh_v2_transaction {
     unsigned char *state_snapshots[2];
     size_t state_snapshot_lengths[2];
     int state_observation_done, state_observation_failed;
+    int codec_observation_done, codec_observation_failed;
     int lock_index, locked, uncertain;
 };
 /* Address identity only: never a live transaction, never dereferenced or freed.
@@ -419,6 +420,52 @@ uint32_t bh_v2_transaction_observe_local_state(struct bh_v2_transaction **owner,
         free_state_snapshots(t);
         free_snapshots(t);
         t->state_observation_failed = 1;
+    }
+    return outcome(r,status);
+}
+uint32_t bh_v2_transaction_observe_codec(struct bh_v2_transaction **owner,
+    const bh_journal_parameters *diagnostic_parameters, struct bh_tx_result *r) {
+    if (!owner || !r || !diagnostic_parameters ||
+        overlap(owner,sizeof(*owner),r,sizeof(*r)) ||
+        overlap(owner,sizeof(*owner),diagnostic_parameters,sizeof(*diagnostic_parameters)) ||
+        overlap(r,sizeof(*r),diagnostic_parameters,sizeof(*diagnostic_parameters)))
+        return BH_TX_REJECTED;
+    struct bh_tx_result zero = {0};
+    if (memcmp(r,&zero,sizeof(zero)) || !*owner) return BH_TX_REJECTED;
+    struct bh_v2_transaction *t = *owner;
+    if (t == &terminal_owner) return outcome(r,BH_TX_UNAVAILABLE);
+    if (overlap(t,sizeof(*t),owner,sizeof(*owner)) ||
+        overlap(t,sizeof(*t),r,sizeof(*r)) ||
+        overlap(t,sizeof(*t),diagnostic_parameters,sizeof(*diagnostic_parameters)))
+        return BH_TX_REJECTED;
+    if (t->observation_failed || t->state_observation_failed || t->codec_observation_failed)
+        return outcome(r,BH_TX_UNAVAILABLE);
+    if (t->codec_observation_done || !t->observation_done || !t->state_observation_done)
+        return outcome(r,BH_TX_REJECTED);
+
+    bh_journal_parameters copied_parameters;
+    memcpy(&copied_parameters,diagnostic_parameters,sizeof(copied_parameters));
+    unsigned installation_nonzero = 0, key_nonzero = 0;
+    for (size_t i=0; i<sizeof(copied_parameters.installation_id); ++i)
+        installation_nonzero |= copied_parameters.installation_id[i];
+    for (size_t i=0; i<sizeof(copied_parameters.new_key_id); ++i)
+        key_nonzero |= copied_parameters.new_key_id[i];
+    uint32_t status = BH_TX_REJECTED;
+    if (installation_nonzero && key_nonzero && copied_parameters.threshold_t != 0 &&
+        copied_parameters.threshold_t != UINT64_MAX) {
+        bh_journal_snapshot journal = {t->state_snapshots[0],t->state_snapshot_lengths[0],1};
+        bh_journal_snapshot selector = {t->state_snapshots[1],t->state_snapshot_lengths[1],1};
+        bh_journal_observation observation = bh_journal_observe(journal,selector,
+            &copied_parameters,BH_JOURNAL_STARTUP_RECOVER,NULL);
+        /* Format consistency, including codec off=false, grants no authority. */
+        status = observation.outcome == BH_JOURNAL_CONSISTENT_ONLY ?
+            BH_TX_PREPARED_UNTRUSTED : BH_TX_UNAVAILABLE;
+    }
+    if (status == BH_TX_PREPARED_UNTRUSTED) t->codec_observation_done = 1;
+    else {
+        free_state_snapshots(t);
+        free_snapshots(t);
+        t->codec_observation_failed = 1;
     }
     return outcome(r,status);
 }

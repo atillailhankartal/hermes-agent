@@ -233,7 +233,10 @@ endif()
 # Pure dormant journal byte/consistency codec. No installed or default consumer.
 option(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_JOURNAL_TESTS
   "Explicit dormant signed-preflight v2 journal codec tests" OFF)
-if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_JOURNAL_TESTS)
+option(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TRANSACTION_TESTS
+  "Explicit dormant retained-FD transaction and codec bridge tests" OFF)
+if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_JOURNAL_TESTS OR
+   BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TRANSACTION_TESTS)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   set(journal_fixture_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/native/darwin_bootstrap/fixtures/signed_preflight_v2_journal")
   add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/journal_vectors.h"
@@ -241,11 +244,16 @@ if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_JOURNAL_TESTS)
       --emit-header "${CMAKE_CURRENT_BINARY_DIR}/journal_vectors.h"
     DEPENDS "${journal_fixture_dir}/run.py" "${journal_fixture_dir}/golden-vectors.json"
     VERBATIM)
+  add_custom_target(bee_hermes_signed_preflight_v2_journal_vectors
+    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/journal_vectors.h")
+endif()
+if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_JOURNAL_TESTS)
   add_library(bee_hermes_signed_preflight_v2_journal STATIC EXCLUDE_FROM_ALL
     signed_preflight_v2_journal_codec.c)
   add_executable(bee_hermes_signed_preflight_v2_journal_test EXCLUDE_FROM_ALL
-    ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_journal_codec.c
-    "${CMAKE_CURRENT_BINARY_DIR}/journal_vectors.h")
+    ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_journal_codec.c)
+  add_dependencies(bee_hermes_signed_preflight_v2_journal_test
+    bee_hermes_signed_preflight_v2_journal_vectors)
   foreach(journal_target bee_hermes_signed_preflight_v2_journal
           bee_hermes_signed_preflight_v2_journal_test)
     target_compile_features(${journal_target} PRIVATE c_std_11)
@@ -257,19 +265,45 @@ if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_JOURNAL_TESTS)
     bee_hermes_signed_preflight_v2_journal)
 endif()
 
-# Acquisition only, untrusted and dormant. Real and fake adapters never mix.
-option(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TRANSACTION_TESTS
-  "Explicit dormant retained-FD transaction acquisition tests" OFF)
+# Untrusted dormant observations. Real and fake adapters never mix.
 if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TRANSACTION_TESTS)
   add_library(bee_hermes_signed_preflight_v2_transaction STATIC EXCLUDE_FROM_ALL
-    signed_preflight_v2_transaction.c signed_preflight_v2_transaction_os_darwin.c)
-  add_executable(bee_hermes_signed_preflight_v2_transaction_test EXCLUDE_FROM_ALL
-    signed_preflight_v2_transaction.c
-    ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_transaction.c)
+    signed_preflight_v2_transaction.c signed_preflight_v2_transaction_os_darwin.c
+    signed_preflight_v2_journal_codec.c)
+  # The real test wrapper counts calls then forwards to this exact product codec.
+  # Rename only its test object, never the product library or the spy binary.
+  add_library(bee_hermes_signed_preflight_v2_transaction_test_codec OBJECT EXCLUDE_FROM_ALL
+    signed_preflight_v2_journal_codec.c)
+  target_compile_definitions(bee_hermes_signed_preflight_v2_transaction_test_codec PRIVATE
+    bh_journal_observe=bh_test_real_journal_observe)
+  foreach(tx_test bee_hermes_signed_preflight_v2_transaction_test
+          bee_hermes_signed_preflight_v2_transaction_spy_test)
+    add_executable(${tx_test} EXCLUDE_FROM_ALL
+      signed_preflight_v2_transaction.c
+      ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_transaction.c)
+    add_dependencies(${tx_test} bee_hermes_signed_preflight_v2_journal_vectors)
+    target_compile_definitions(${tx_test} PRIVATE BH_TX_CODEC_TEST)
+  endforeach()
+  target_sources(bee_hermes_signed_preflight_v2_transaction_test PRIVATE
+    $<TARGET_OBJECTS:bee_hermes_signed_preflight_v2_transaction_test_codec>)
+  target_compile_definitions(bee_hermes_signed_preflight_v2_transaction_spy_test PRIVATE
+    BH_TX_CODEC_SPY)
+  # Darwin's default libSystem link re-exports CommonCrypto's CC_SHA256;
+  # CommonCrypto is not a framework. Keep the real OS adapter out of this test.
   foreach(tx_target bee_hermes_signed_preflight_v2_transaction
-          bee_hermes_signed_preflight_v2_transaction_test)
+          bee_hermes_signed_preflight_v2_transaction_test_codec
+          bee_hermes_signed_preflight_v2_transaction_test
+          bee_hermes_signed_preflight_v2_transaction_spy_test)
     target_compile_features(${tx_target} PRIVATE c_std_11)
     target_compile_options(${tx_target} PRIVATE -Wall -Wextra -Werror -pedantic)
-    target_include_directories(${tx_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(${tx_target} PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
   endforeach()
+  # Both disjoint link configurations are required for all 30 groups/94 variants.
+  add_custom_target(bee_hermes_signed_preflight_v2_transaction_check
+    COMMAND $<TARGET_FILE:bee_hermes_signed_preflight_v2_transaction_test>
+    COMMAND $<TARGET_FILE:bee_hermes_signed_preflight_v2_transaction_spy_test>
+    DEPENDS bee_hermes_signed_preflight_v2_transaction_test
+      bee_hermes_signed_preflight_v2_transaction_spy_test
+    VERBATIM)
 endif()
