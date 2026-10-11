@@ -229,3 +229,30 @@ if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_KEY_POLICY_TESTS)
   target_link_options(bee_hermes_signed_preflight_v2_key_policy_test PRIVATE
     "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/bee_hermes_signed_preflight_v2_key_policy_test.map")
 endif()
+
+# Pure dormant journal byte/consistency codec. No installed or default consumer.
+option(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_JOURNAL_TESTS
+  "Explicit dormant signed-preflight v2 journal codec tests" OFF)
+if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_JOURNAL_TESTS)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(journal_fixture_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/native/darwin_bootstrap/fixtures/signed_preflight_v2_journal")
+  add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/journal_vectors.h"
+    COMMAND "${Python3_EXECUTABLE}" "${journal_fixture_dir}/run.py"
+      --emit-header "${CMAKE_CURRENT_BINARY_DIR}/journal_vectors.h"
+    DEPENDS "${journal_fixture_dir}/run.py" "${journal_fixture_dir}/golden-vectors.json"
+    VERBATIM)
+  add_library(bee_hermes_signed_preflight_v2_journal STATIC EXCLUDE_FROM_ALL
+    signed_preflight_v2_journal_codec.c)
+  add_executable(bee_hermes_signed_preflight_v2_journal_test EXCLUDE_FROM_ALL
+    ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_journal_codec.c
+    "${CMAKE_CURRENT_BINARY_DIR}/journal_vectors.h")
+  foreach(journal_target bee_hermes_signed_preflight_v2_journal
+          bee_hermes_signed_preflight_v2_journal_test)
+    target_compile_features(${journal_target} PRIVATE c_std_11)
+    target_compile_options(${journal_target} PRIVATE -Wall -Wextra -Werror -pedantic)
+    target_include_directories(${journal_target} PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+  endforeach()
+  target_link_libraries(bee_hermes_signed_preflight_v2_journal_test PRIVATE
+    bee_hermes_signed_preflight_v2_journal)
+endif()
