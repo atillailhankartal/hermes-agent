@@ -59,6 +59,8 @@ add_executable(bee_hermes_a2c_phase3_final final_entry.c
   a2c_phase3_policy.c a2c_phase3_io.c a2c_phase3_unavailable.c)
 add_executable(bee_hermes_a2c_phase3_stage0 stage0_entry.c)
 target_link_libraries(bee_hermes_a2c_phase3_stage0 PRIVATE bee_hermes_a2c_phase1)
+target_link_options(bee_hermes_a2c_phase3_stage0 PRIVATE
+  "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/bee_hermes_a2c_phase3_stage0.map")
 target_compile_definitions(bee_hermes_a2c_phase3_stage0 PRIVATE
   BH_A2C_FINAL_IMAGE="$<TARGET_FILE:bee_hermes_a2c_phase3_final>")
 add_dependencies(bee_hermes_a2c_phase3_stage0 bee_hermes_a2c_phase3_final)
@@ -92,3 +94,37 @@ foreach(image hermes_bee_install_preflight bee_hermes_install_preflight_test)
   target_compile_options(${image} PRIVATE -Wall -Wextra -Werror -pedantic)
   target_link_options(${image} PRIVATE "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/${image}.map")
 endforeach()
+
+# Dormant diagnostic observer. The shared decision object is compiled once and
+# is linked to distinct real and injected syscall adapters only in explicit tests.
+# No observer target participates in the default build or an installed product.
+option(BH_BUILD_DORMANT_PATH_OBSERVER_TESTS "Explicit dormant observer tests" OFF)
+if(BH_BUILD_DORMANT_PATH_OBSERVER_TESTS)
+  add_library(bee_hermes_path_observer_v1_core OBJECT EXCLUDE_FROM_ALL
+    path_observer_core_v1.c)
+  add_library(bee_hermes_path_observer_v1 STATIC EXCLUDE_FROM_ALL
+    $<TARGET_OBJECTS:bee_hermes_path_observer_v1_core>
+    path_observer_os_darwin_v1.c)
+  add_executable(bee_hermes_path_observer_v1_real_test EXCLUDE_FROM_ALL
+    ../../tests/native/darwin_bootstrap/test_path_observer_real.c)
+  target_link_libraries(bee_hermes_path_observer_v1_real_test PRIVATE
+    bee_hermes_path_observer_v1)
+  add_executable(bee_hermes_path_observer_v1_injected_test EXCLUDE_FROM_ALL
+    ../../tests/native/darwin_bootstrap/test_path_observer_injected.c
+    ../../tests/native/darwin_bootstrap/path_observer_os_test_v1.c
+    $<TARGET_OBJECTS:bee_hermes_path_observer_v1_core>)
+  foreach(observer_target bee_hermes_path_observer_v1_core
+          bee_hermes_path_observer_v1
+          bee_hermes_path_observer_v1_real_test
+          bee_hermes_path_observer_v1_injected_test)
+    target_compile_features(${observer_target} PRIVATE c_std_11)
+    target_compile_options(${observer_target} PRIVATE -Wall -Wextra -Werror -pedantic)
+    target_include_directories(${observer_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_property(TARGET ${observer_target} PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+  endforeach()
+  foreach(observer_image bee_hermes_path_observer_v1_real_test
+          bee_hermes_path_observer_v1_injected_test)
+    target_link_options(${observer_image} PRIVATE
+      "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/${observer_image}.map")
+  endforeach()
+endif()
