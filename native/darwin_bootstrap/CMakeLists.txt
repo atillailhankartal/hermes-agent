@@ -256,3 +256,20 @@ if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_JOURNAL_TESTS)
   target_link_libraries(bee_hermes_signed_preflight_v2_journal_test PRIVATE
     bee_hermes_signed_preflight_v2_journal)
 endif()
+
+# Acquisition only, untrusted and dormant. Real and fake adapters never mix.
+option(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TRANSACTION_TESTS
+  "Explicit dormant retained-FD transaction acquisition tests" OFF)
+if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TRANSACTION_TESTS)
+  add_library(bee_hermes_signed_preflight_v2_transaction STATIC EXCLUDE_FROM_ALL
+    signed_preflight_v2_transaction.c signed_preflight_v2_transaction_os_darwin.c)
+  add_executable(bee_hermes_signed_preflight_v2_transaction_test EXCLUDE_FROM_ALL
+    signed_preflight_v2_transaction.c
+    ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_transaction.c)
+  foreach(tx_target bee_hermes_signed_preflight_v2_transaction
+          bee_hermes_signed_preflight_v2_transaction_test)
+    target_compile_features(${tx_target} PRIVATE c_std_11)
+    target_compile_options(${tx_target} PRIVATE -Wall -Wextra -Werror -pedantic)
+    target_include_directories(${tx_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  endforeach()
+endif()
