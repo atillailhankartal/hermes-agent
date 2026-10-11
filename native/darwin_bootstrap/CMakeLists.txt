@@ -78,3 +78,17 @@ foreach(image bee_hermes_a2c_phase3_attempt bee_hermes_a2c_phase3_final bee_herm
   target_compile_options(${image} PRIVATE -Wall -Wextra -Werror -pedantic)
 endforeach()
 add_dependencies(bee_hermes_a2c_phase3_attempt bee_hermes_a2c_phase3_stage0)
+
+# Inert install preflight source exercise. There is no installed policy provider.
+# The synthetic observation adapter exists only in the separate test image.
+add_executable(hermes_bee_install_preflight
+  install_preflight_main.c install_preflight.c install_preflight_unavailable.c)
+add_executable(bee_hermes_install_preflight_test
+  ../../tests/native/darwin_bootstrap/test_install_preflight.c
+  ../../tests/native/darwin_bootstrap/test_install_preflight_adapter.c
+  install_preflight.c install_preflight_unavailable.c)
+foreach(image hermes_bee_install_preflight bee_hermes_install_preflight_test)
+  target_compile_features(${image} PRIVATE c_std_11)
+  target_compile_options(${image} PRIVATE -Wall -Wextra -Werror -pedantic)
+  target_link_options(${image} PRIVATE "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/${image}.map")
+endforeach()
