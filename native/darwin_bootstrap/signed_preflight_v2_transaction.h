@@ -39,5 +39,10 @@ struct bh_tx_result { uint32_t status, installed_authority, ready, pair; int64_t
  * marker records failure only; it is never a live context or release proof. */
 uint32_t bh_v2_transaction_begin(int borrowed_anchor, const struct bh_tx_install *install,
     struct bh_v2_transaction **owner, struct bh_tx_result *result);
+/* One-shot OFF-only diagnostic of the original retained leaf descriptions.
+ * A stable observation remains untrusted and grants no launch authority.
+ * The live owner retains private bounded snapshots until abort. */
+uint32_t bh_v2_transaction_observe_retained(struct bh_v2_transaction **owner,
+    struct bh_tx_result *result);
 uint32_t bh_v2_transaction_abort(struct bh_v2_transaction **owner, struct bh_tx_result *result);
 #endif

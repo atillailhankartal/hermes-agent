@@ -2,6 +2,7 @@
 #define BH_TX_OS_H
 #include <stddef.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 /* Private link-time seam. Exactly one adapter linked per binary.
  * No callbacks or fault controls in the public ABI. ACL observation is not
  * writer exclusion; a prepared result remains untrusted. */
@@ -15,6 +16,7 @@ int bh_tx_os_acl_empty(void *acl);
 int bh_tx_os_acl_free(void *acl);
 int bh_tx_os_flock(int fd, int operation);
 int bh_tx_os_close(int fd);
+ssize_t bh_tx_os_pread(int fd, void *buf, size_t n, off_t offset);
 void *bh_tx_os_alloc(size_t n);
 void bh_tx_os_free(void *p);
 #endif

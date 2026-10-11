@@ -6,6 +6,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/types.h>
+
+/* The RED binary links the unchanged product translation unit. The fixed
+ * no-authority stub exists only with this explicit test build flag. */
+#ifdef BH_TX_OBSERVE_RED_STUB
+uint32_t bh_v2_transaction_observe_retained(struct bh_v2_transaction **owner,
+                                             struct bh_tx_result *result) {
+    (void)owner; (void)result; return BH_TX_REJECTED;
+}
+#else
+uint32_t bh_v2_transaction_observe_retained(struct bh_v2_transaction **owner,
+                                             struct bh_tx_result *result);
+#endif
 
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "ASSERT %s variant=%d line=%d: %s\n", current, variant, __LINE__, #x); ok = 0; } } while (0)
 #define LIMIT 2048
@@ -17,20 +30,27 @@ static const char *const names[NODES] = {"anchor", "locks", "install.lock", "ver
 static const int parents[NODES] = {-1, ANCHOR, LOCKS, ANCHOR, VERSIONS, ANCHOR, ANCHOR, VERSION, VERSION, VERSION, FLOORS, SELECTORS};
 struct event { char op; int node, arg; };
 struct handle { int fd, node, alive, borrowed, enumeration, closes; unsigned generation; };
+struct block { void *ptr; size_t size; int alive, frees; };
 static struct {
-    struct stat meta[NODES]; struct handle h[LIMIT]; unsigned next_generation;
+    struct stat meta[NODES], path_meta[NODES]; int path_override[NODES];
+    struct handle h[LIMIT]; unsigned next_generation;
     struct event events[LIMIT]; int count, handles, errors, lock_held;
     int fail2_at, fail2_reached;
     int fail_at, fail_reached, failure_errno, poison_node, poison_kind, poison_reached;
     int lock_fault_acquired, lock_error, lock_replaced, alias_node, alias_kind, alias_reached;
     char visible_names[NODES][BH_TX_NAME];
-    int acl_live, allocations, frees, alloc_live, leaf_opens[3];
+    int acl_live, allocations, frees, alloc_live, alloc_peak, leaf_opens[3];
+    struct block blocks[16]; int block_count;
     unsigned leaf_original[3]; int close_sequence[LIMIT], closes;
     int caller_flags, caller_offset, ready, pair;
     int cleanup_mode, failed_handle, recycled_handle, quarantine_required;
     int timestamp_node, timestamp_kind, timestamp_reached, timestamp_event;
     struct stat timestamp_observed;
-    void *allocation;
+    int observe_active, observe_start, read_count[3], read_reached[3][2];
+    unsigned read_generation[3][2]; size_t read_size[3][2];
+    int pread_leaf, pread_pass, pread_kind, pread_fault_reached;
+    int byte_drift_leaf, byte_drift_reached;
+    char observe_fault_op; int observe_fault_node, observe_fault_nth, observe_fault_seen, observe_fault_reached;
 } f;
 static const char *current;
 static int variant;
@@ -38,6 +58,11 @@ static int is_dir(int n) { return n == ANCHOR || n == LOCKS || n == VERSIONS || 
 static int event(char op, int node, int arg) {
     if (f.count >= LIMIT) abort();
     f.events[f.count++] = (struct event){op,node,arg};
+    if (f.observe_active && op == f.observe_fault_op &&
+        (f.observe_fault_node < 0 || f.observe_fault_node == node) &&
+        ++f.observe_fault_seen == f.observe_fault_nth) {
+        ++f.observe_fault_reached; errno = EIO; return -1;
+    }
     if (f.fail2_at == f.count) { ++f.fail2_reached; errno = f.failure_errno; return -1; }
     if (f.fail_at == f.count) { ++f.fail_reached; errno = f.failure_errno ? f.failure_errno : EIO; return -1; }
     return 0;
@@ -69,8 +94,10 @@ static int lookup(int fd, const char *name) {
     ++f.errors; errno = ENOENT; return -1;
 }
 static void reset(void) {
-    if (f.allocation) free(f.allocation);
+    for (int i = 0; i < f.block_count; ++i) if (f.blocks[i].alive) free(f.blocks[i].ptr);
     memset(&f,0,sizeof(f)); f.poison_node = f.alias_node = f.failed_handle = f.recycled_handle = f.timestamp_node = -1;
+    f.pread_leaf = f.byte_drift_leaf = -1;
+    f.observe_fault_node = -1;
     f.caller_flags = 0x123; f.caller_offset = 37;
     for (int i = 0; i < NODES; ++i) {
         strcpy(f.visible_names[i], names[i]);
@@ -139,7 +166,7 @@ int bh_tx_os_fstatat(int parent, const char *name, struct stat *out, int flags) 
     int n = lookup(parent,name); if (n < 0) return -1;
     if (event('T',n,flags)) return -1;
     if (flags != AT_SYMLINK_NOFOLLOW) ++f.errors;
-    *out = f.meta[n]; poison(n,out,0);
+    *out = f.path_override[n] ? f.path_meta[n] : f.meta[n]; poison(n,out,0);
     if (n == LOCK && f.lock_held && f.lock_replaced) { ++out->st_ino; ++f.poison_reached; }
     return 0;
 }
@@ -217,13 +244,48 @@ int bh_tx_os_close(int fd) {
 void *bh_tx_os_alloc(size_t n) {
     ++f.allocations;
     if (event('M',-1,0)) return NULL;
-    if (f.allocation || n == 0) abort();
-    f.allocation = calloc(1,n); if (f.allocation) ++f.alloc_live;
-    return f.allocation;
+    if (f.block_count >= 16 || n == 0) abort();
+    void *p = calloc(1,n);
+    if (p) {
+        f.blocks[f.block_count++] = (struct block){p,n,1,0};
+        if (++f.alloc_live > f.alloc_peak) f.alloc_peak = f.alloc_live;
+    }
+    return p;
 }
 void bh_tx_os_free(void *p) {
-    if (!p || p != f.allocation) { ++f.errors; return; }
-    (void)event('F',-1,0); free(p); f.allocation = NULL; --f.alloc_live; ++f.frees;
+    int i;
+    for (i = 0; i < f.block_count; ++i) if (f.blocks[i].ptr == p && f.blocks[i].alive) break;
+    if (!p || i == f.block_count) { ++f.errors; return; }
+    (void)event('F',-1,0); free(p); f.blocks[i].alive = 0;
+    ++f.blocks[i].frees; --f.alloc_live; ++f.frees;
+}
+/* This private seam is declared in the product OS header in GREEN. The test
+ * adapter has the exact frozen signature already, including ssize_t/off_t. */
+ssize_t bh_tx_os_pread(int fd, void *buf, size_t n, off_t offset) {
+    struct handle *h = handle(fd);
+    if (!h) return -1;
+    int leaf = h->node-POLICY;
+    if (leaf < 0 || leaf >= 3 || h->enumeration || offset != 0 ||
+        n != (size_t)f.meta[h->node].st_size) ++f.errors;
+    int pass = leaf >= 0 && leaf < 3 ? f.read_count[leaf]++ : 0;
+    if (event('R',h->node,pass)) return -1;
+    if (leaf >= 0 && leaf < 3 && pass < 2) {
+        ++f.read_reached[leaf][pass]; f.read_generation[leaf][pass] = h->generation;
+        f.read_size[leaf][pass] = n;
+    }
+    if (leaf == f.pread_leaf && pass == f.pread_pass) {
+        ++f.pread_fault_reached;
+        if (f.pread_kind == 0) return n ? (ssize_t)(n-1) : 0;
+        if (f.pread_kind == 1) return 0;
+        if (f.pread_kind == 4) return (ssize_t)(n+1);
+        errno = f.pread_kind == 2 ? EINTR : EIO; return -1;
+    }
+    unsigned char *out = buf;
+    for (size_t i = 0; i < n; ++i) out[i] = (unsigned char)(h->node*17+(int)(i%251)*7);
+    if (leaf == f.byte_drift_leaf && pass == 1 && n) {
+        out[n-1] ^= 0x80; ++f.byte_drift_reached;
+    }
+    return (ssize_t)n;
 }
 
 /* Independent trace oracle for the acquisition-only protocol. These events
@@ -634,6 +696,266 @@ static int timestamp_identity(int v) {
         f.timestamp_node,f.timestamp_kind,f.timestamp_reached,f.timestamp_event,status,owner ? "live" : "null");
     dump(); return ok;
 }
+static uint32_t observe_call(struct bh_v2_transaction **owner, struct bh_tx_result *r) {
+    f.observe_active = 1; f.observe_start = f.count;
+    uint32_t status = bh_v2_transaction_observe_retained(owner,r);
+    f.observe_active = 0; return status;
+}
+static int observe_fixture(struct bh_v2_transaction **owner, struct bh_tx_result *r, int max_payload) {
+    reset(); expected_begin(); struct bh_tx_install d = install();
+    if (max_payload == 1) {
+        f.meta[POLICY].st_size=65584; f.meta[MANIFEST].st_size=65552;
+    } else if (max_payload == 2) {
+        f.meta[MANIFEST].st_size=100; /* Manifest dominates the scratch maximum. */
+    }
+    if (bh_v2_transaction_begin(9,&d,owner,r) != BH_TX_PREPARED_UNTRUSTED ||
+        !*owner || f.count != expected_count || !retention() || f.alloc_live != 1) return 0;
+    memset(r,0,sizeof(*r)); return 1;
+}
+static int observation_allocations_live(void) {
+    int n = 0; for (int i=1; i<f.block_count; ++i) n += f.blocks[i].alive;
+    return n;
+}
+static int original_leaf_reads(void) {
+    for (int i=0; i<3; ++i) {
+        if (f.read_count[i] != 2 || f.leaf_opens[i] != 1) return 0;
+        for (int pass=0; pass<2; ++pass)
+            if (f.read_reached[i][pass] != 1 ||
+                f.read_generation[i][pass] != f.leaf_original[i] ||
+                f.read_size[i][pass] != (size_t)f.meta[POLICY+i].st_size) return 0;
+    }
+    return retention();
+}
+static int snapshots_match_bytes(void) {
+    if (f.block_count < 5) return 0; /* context + policy/sig/manifest + scratch */
+    for (int leaf=0; leaf<3; ++leaf) {
+        const struct block *b = &f.blocks[leaf+1];
+        if (!b->alive || b->size != (size_t)f.meta[POLICY+leaf].st_size) return 0;
+        const unsigned char *bytes = b->ptr;
+        for (size_t i=0; i<b->size; ++i)
+            if (bytes[i] != (unsigned char)((POLICY+leaf)*17+(int)(i%251)*7)) return 0;
+    }
+    size_t max=f.meta[POLICY].st_size > f.meta[SIGNATURE].st_size ?
+        (size_t)f.meta[POLICY].st_size : (size_t)f.meta[SIGNATURE].st_size;
+    if ((size_t)f.meta[MANIFEST].st_size > max) max=(size_t)f.meta[MANIFEST].st_size;
+    return f.blocks[4].size == max && !f.blocks[4].alive && f.blocks[4].frees == 1;
+}
+static int observe_stable(int v) {
+    int ok=1; variant=v; struct bh_v2_transaction *owner=NULL; struct bh_tx_result r={0};
+    REQUIRE(observe_fixture(&owner,&r,v));
+    int unrelated=f.handles;
+    f.h[f.handles++] = (struct handle){1000,-1,1,1,0,0,++f.next_generation};
+    struct handle saved=f.h[unrelated];
+    uint32_t status=observe_call(&owner,&r);
+    REQUIRE(status == BH_TX_PREPARED_UNTRUSTED && r.status == status && safe_result(&r));
+    REQUIRE(owner && original_leaf_reads() && snapshots_match_bytes());
+    REQUIRE(observation_allocations_live() == 3 && f.alloc_peak == 5);
+    REQUIRE(f.alloc_live == 4 && f.frees == 1 && !f.errors && borrowed_preserved());
+    REQUIRE(memcmp(&f.h[unrelated],&saved,sizeof(saved)) == 0);
+    int calls=f.count, allocations=f.allocations;
+    memset(&r,0,sizeof(r));
+    REQUIRE(observe_call(&owner,&r) == BH_TX_REJECTED);
+    REQUIRE(r.status == BH_TX_REJECTED && safe_result(&r) &&
+            f.count == calls && f.allocations == allocations && observation_allocations_live() == 3);
+    memset(&r,0,sizeof(r));
+    REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_ABORTED);
+    REQUIRE(!owner && r.status == BH_TX_ABORTED && safe_result(&r));
+    REQUIRE(f.alloc_live == 0 && f.frees == 5 && !owned_live() && borrowed_preserved());
+    for (int i=1; i<5 && i<f.block_count; ++i) REQUIRE(f.blocks[i].frees == 1);
+    REQUIRE(memcmp(&f.h[unrelated],&saved,sizeof(saved)) == 0 && !f.errors);
+    dump(); return ok;
+}
+static int observe_fault_case(int group, int v) {
+    int ok=1; variant=v; struct bh_v2_transaction *owner=NULL; struct bh_tx_result r={0};
+    REQUIRE(observe_fixture(&owner,&r,0));
+    int unrelated=f.handles;
+    f.h[f.handles++] = (struct handle){1000,-1,1,1,0,0,++f.next_generation};
+    struct handle saved_unrelated=f.h[unrelated];
+    int wanted=BH_TX_UNAVAILABLE, target=-1, pass=-1;
+    if (group == 0) { /* every leaf and pass: short/zero/EINTR/EIO/over-return */
+        target=v/10; pass=(v/5)%2; f.pread_leaf=target; f.pread_pass=pass; f.pread_kind=v%5;
+    } else if (group == 1) { /* post-begin size; no allocation may follow */
+        target=v/4; wanted=BH_TX_REJECTED;
+        if (v >= 12) {
+            target=v-12; wanted=BH_TX_UNAVAILABLE;
+            f.observe_fault_op='S'; f.observe_fault_node=POLICY+target; f.observe_fault_nth=1;
+        } else {
+        struct stat *s=&f.meta[POLICY+target];
+        if (v%4 == 0) s->st_size=-1;
+        else if (v%4 == 1) s->st_size=target == 0 ? 48 : target == 1 ? 63 : 16;
+        else if (v%4 == 2) s->st_size=target == 0 ? 65585 : target == 1 ? 65 : 65553;
+        else s->st_size=target == 1 ? 63 : s->st_size+1;
+        }
+    } else if (group == 2) { f.observe_fault_op='M'; f.observe_fault_nth=v+1; }
+    else if (group == 3) { target=v; f.byte_drift_leaf=target; wanted=BH_TX_REJECTED; }
+    else if (group == 4) { /* path-only replacement: retained handle still has old inode */
+        target=v==0 ? VERSION : POLICY+v-1; f.path_override[target]=1;
+        f.path_meta[target]=f.meta[target]; ++f.path_meta[target].st_ino; wanted=BH_TX_REJECTED;
+    } else if (group == 5) { /* case-insensitive same-vnode alias */
+        target=POLICY; f.alias_node=target; f.alias_kind=0;
+        strcpy(f.visible_names[target],"POLICY.V2.BIN"); wanted=BH_TX_REJECTED;
+    } else if (group == 6) {
+        const int targets[]={VERSION,POLICY,SIGNATURE,MANIFEST};
+        target=targets[v/4]; wanted=BH_TX_REJECTED;
+        struct stat *s=&f.meta[target];
+        if (v%4==0) ++s->st_ctimespec.tv_sec;
+        if (v%4==1) ++s->st_ctimespec.tv_nsec;
+        if (v%4==2) ++s->st_mtimespec.tv_sec;
+        if (v%4==3) ++s->st_mtimespec.tv_nsec;
+    } else if (group == 7) {
+        const char faults[]={'A','V','Q','E','N','e'};
+        if (v < 6) { f.observe_fault_op=faults[v]; f.observe_fault_nth=1; }
+        else if (v == 6) { f.poison_node=POLICY; f.poison_kind=5; wanted=BH_TX_REJECTED; }
+        else {
+            f.alias_node=POLICY; f.alias_kind=0;
+            strcpy(f.visible_names[POLICY],"POLICY.V2.BIN");
+            f.observe_fault_op='e'; f.observe_fault_node=VERSION;
+            f.observe_fault_nth=1; /* ambiguous close overrides exact mismatch */
+        }
+    }
+    int before_alloc=f.allocations, before_reads=f.read_count[0]+f.read_count[1]+f.read_count[2];
+    uint32_t status=observe_call(&owner,&r);
+    REQUIRE(status == (uint32_t)wanted && r.status == (uint32_t)wanted && safe_result(&r));
+    REQUIRE(owner && observation_allocations_live() == 0 && !f.errors && borrowed_preserved());
+    REQUIRE(memcmp(&f.h[unrelated],&saved_unrelated,sizeof(saved_unrelated)) == 0);
+    if (group == 0) { REQUIRE(f.pread_fault_reached == 1); REQUIRE(f.read_reached[target][pass] == 1); }
+    if (group == 1 || group == 4 || group == 6) {
+        REQUIRE(f.allocations == before_alloc && f.read_count[0]+f.read_count[1]+f.read_count[2] == before_reads);
+    }
+    if (group == 2) REQUIRE(f.observe_fault_reached == 1 && f.observe_fault_seen == v+1);
+    if (group == 3) REQUIRE(f.byte_drift_reached == 1 && original_leaf_reads());
+    if (group == 5) REQUIRE(f.alias_reached == 1);
+    if (group == 1 && v >= 12) REQUIRE(f.observe_fault_reached == 1);
+    if (group == 7) {
+        if (v == 6) {
+            int policy_acl_seen=0;
+            for (int i=f.observe_start; i<f.count; ++i)
+                if (f.events[i].op == 'V' && f.events[i].node == POLICY) ++policy_acl_seen;
+            REQUIRE(policy_acl_seen == 1 && f.poison_reached > 0);
+        } else REQUIRE(f.observe_fault_reached == 1);
+    }
+    int calls=f.count, allocations=f.allocations;
+    memset(&r,0,sizeof(r));
+    REQUIRE(observe_call(&owner,&r) == BH_TX_UNAVAILABLE);
+    REQUIRE(r.status == BH_TX_UNAVAILABLE && safe_result(&r) && f.count == calls && f.allocations == allocations);
+    memset(&r,0,sizeof(r));
+    uint32_t abort_status=bh_v2_transaction_abort(&owner,&r);
+    REQUIRE(abort_status == (uint32_t)(f.quarantine_required ? BH_TX_UNAVAILABLE : BH_TX_ABORTED));
+    REQUIRE(r.status == abort_status && safe_result(&r));
+    REQUIRE(f.alloc_live == 0 && observation_allocations_live() == 0 && borrowed_preserved() && !f.errors);
+    REQUIRE(memcmp(&f.h[unrelated],&saved_unrelated,sizeof(saved_unrelated)) == 0);
+    for (int i=1; i<f.block_count; ++i) REQUIRE(f.blocks[i].frees == 1);
+    int after=f.count; memset(&r,0,sizeof(r));
+    REQUIRE(bh_v2_transaction_abort(&owner,&r) == abort_status && f.count == after);
+    dump(); return ok;
+}
+static void *zero_context_region(size_t n, size_t alignment) {
+    unsigned char *bytes=f.blocks[0].ptr; size_t size=f.blocks[0].size;
+    for (size_t i=0; i+n<=size; ++i) {
+        if ((uintptr_t)(bytes+i)%alignment) continue;
+        int zero=1;
+        for (size_t j=0; j<n; ++j) if (bytes[i+j]) { zero=0; break; }
+        if (zero) return bytes+i;
+    }
+    return NULL;
+}
+static int observe_invalid(int v) {
+    int ok=1; variant=v; struct bh_v2_transaction *owner=NULL; struct bh_tx_result r={0};
+    REQUIRE(observe_fixture(&owner,&r,0));
+    if (v == 7) {
+        f.fail_at=f.count+1; f.failure_errno=EIO; f.cleanup_mode=2;
+        REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_UNAVAILABLE && owner);
+        REQUIRE(f.fail_reached == 1 && f.alloc_live == 0);
+        memset(&r,0,sizeof(r)); int calls=f.count;
+        REQUIRE(observe_call(&owner,&r) == BH_TX_UNAVAILABLE);
+        REQUIRE(r.status == BH_TX_UNAVAILABLE && safe_result(&r) && f.count == calls);
+        REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_UNAVAILABLE && f.count == calls);
+        REQUIRE(borrowed_preserved() && !f.errors); dump(); return ok;
+    }
+    int calls=f.count, allocations=f.allocations; uint32_t status;
+    if (v == 0) status=observe_call(NULL,&r);
+    else if (v == 1) status=observe_call(&owner,NULL);
+    else if (v == 2) {
+        struct bh_v2_transaction *empty=NULL; status=observe_call(&empty,&r);
+        REQUIRE(!empty);
+    } else if (v == 3) {
+        r.ready=1; struct bh_tx_result saved=r;
+        status=observe_call(&owner,&r); REQUIRE(memcmp(&r,&saved,sizeof(r)) == 0);
+        memset(&r,0,sizeof(r));
+    } else if (v == 4) {
+        union { max_align_t align; unsigned char bytes[sizeof(struct bh_tx_result)+sizeof(void *)]; } storage;
+        memset(&storage,0,sizeof(storage)); memcpy(storage.bytes,&owner,sizeof(owner));
+        unsigned char saved[sizeof(storage.bytes)]; memcpy(saved,storage.bytes,sizeof(saved));
+        status=observe_call((void *)storage.bytes,(void *)storage.bytes);
+        REQUIRE(memcmp(storage.bytes,saved,sizeof(saved)) == 0);
+    } else if (v == 5) {
+        struct block *context=&f.blocks[0];
+        unsigned char *saved=malloc(context->size); REQUIRE(saved != NULL);
+        if (!saved) return 0;
+        memcpy(saved,context->ptr,context->size);
+        struct bh_tx_result *inside=zero_context_region(sizeof(r),_Alignof(struct bh_tx_result));
+        REQUIRE(inside != NULL);
+        status=inside ? observe_call(&owner,inside) : BH_TX_UNAVAILABLE;
+        REQUIRE(memcmp(saved,context->ptr,context->size) == 0);
+        memcpy(context->ptr,saved,context->size);
+        free(saved);
+    } else {
+        struct block *context=&f.blocks[0];
+        unsigned char *saved=malloc(context->size); REQUIRE(saved != NULL);
+        if (!saved) return 0;
+        memcpy(saved,context->ptr,context->size);
+        struct bh_v2_transaction **inside=zero_context_region(sizeof(owner),_Alignof(struct bh_v2_transaction *));
+        REQUIRE(inside != NULL);
+        if (inside) memcpy(inside,&owner,sizeof(owner));
+        unsigned char *call_image=malloc(context->size); REQUIRE(call_image != NULL);
+        if (!call_image) { free(saved); return 0; }
+        memcpy(call_image,context->ptr,context->size);
+        status=inside ? observe_call(inside,&r) : BH_TX_UNAVAILABLE;
+        REQUIRE(memcmp(call_image,context->ptr,context->size) == 0);
+        memcpy(context->ptr,saved,context->size);
+        free(call_image);
+        free(saved);
+    }
+    REQUIRE(status == BH_TX_REJECTED && f.count == calls && f.allocations == allocations);
+    REQUIRE(owner && retention() && !f.errors && borrowed_preserved());
+    REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_ABORTED && !owner);
+    REQUIRE(!f.alloc_live && !owned_live() && !f.errors); dump(); return ok;
+}
+static int observe_failed_abort(int v) {
+    int ok=1; variant=v; struct bh_v2_transaction *owner=NULL; struct bh_tx_result r={0};
+    REQUIRE(observe_fixture(&owner,&r,0));
+    int unrelated=f.handles;
+    f.h[f.handles++] = (struct handle){1000,-1,1,1,0,0,++f.next_generation};
+    struct handle saved_unrelated=f.h[unrelated];
+    if (v == 0) { f.observe_fault_op='M'; f.observe_fault_nth=3; }
+    else { f.observe_fault_op='e'; f.observe_fault_nth=1; f.cleanup_mode=1; }
+    REQUIRE(observe_call(&owner,&r) == BH_TX_UNAVAILABLE);
+    REQUIRE(f.observe_fault_reached == 1 && observation_allocations_live() == 0 && owner);
+    int uncertain=f.quarantine_required;
+    REQUIRE(uncertain == (v == 1));
+    memset(&r,0,sizeof(r));
+    uint32_t status=bh_v2_transaction_abort(&owner,&r);
+    REQUIRE(status == (uint32_t)(uncertain ? BH_TX_UNAVAILABLE : BH_TX_ABORTED));
+    REQUIRE(r.status == status && safe_result(&r));
+    REQUIRE(uncertain ? owner != NULL : owner == NULL);
+    REQUIRE(!f.alloc_live && owned_live() == (uncertain ? 1 : 0) && borrowed_preserved() && !f.errors);
+    if (uncertain) {
+        REQUIRE(f.failed_handle >= 0 && f.failed_handle < f.handles);
+        if (f.failed_handle >= 0 && f.failed_handle < f.handles)
+            REQUIRE(f.h[f.failed_handle].enumeration && f.h[f.failed_handle].alive &&
+                    f.h[f.failed_handle].closes == 1);
+    }
+    REQUIRE(memcmp(&f.h[unrelated],&saved_unrelated,sizeof(saved_unrelated)) == 0);
+    for (int i=1; i<f.block_count; ++i) REQUIRE(f.blocks[i].frees == 1);
+    int calls=f.count;
+    memset(&r,0,sizeof(r)); REQUIRE(bh_v2_transaction_abort(&owner,&r) == status && f.count == calls);
+    if (uncertain && f.failed_handle >= 0 && f.failed_handle < f.handles)
+        REQUIRE(f.h[f.failed_handle].closes == 1); /* Ambiguous integer is never retried. */
+    memset(&r,0,sizeof(r));
+    REQUIRE(observe_call(&owner,&r) == (uint32_t)(uncertain ? BH_TX_UNAVAILABLE : BH_TX_REJECTED));
+    REQUIRE(f.count == calls && borrowed_preserved() && !f.errors);
+    dump(); return ok;
+}
 struct test_case { const char *name; int variants; };
 static const struct test_case cases[] = {
     {"Begin_WhenArgumentsOrAbiAreInvalid_RejectsBeforeOsCalls",13},
@@ -655,6 +977,25 @@ static const struct test_case cases[] = {
     {"Begin_WhenFlockEaccesMayHaveAcquiredLock_LatchesTerminalOwner",2},
     {"Begin_WhenRetainedAncestorOrLeafTimestampDrifts_RejectsIdentityMismatch",17}
 };
+static const struct test_case observe_cases[] = {
+    {"Observe_WhenArgumentsOrOwnerInvalid_RejectsBeforeOsCalls",8},
+    {"Observe_WhenStableOriginalLeavesAreReadTwice_ReturnsUntrustedOnce",3},
+    {"Observe_WhenLeafReadIsShortOrFails_LatchesUnavailable",30},
+    {"Observe_WhenLeafSizeDrifts_Rejects",15},
+    {"Observe_WhenAllocationFails_LatchesUnavailable",4},
+    {"Observe_WhenSameVnodeBytesChangeBetweenPasses_Rejects",3},
+    {"Observe_WhenLeafPathOrAncestorChanges_Rejects",4},
+    {"Observe_WhenCaseOnlyRenameKeepsInode_RejectsExactNameMismatch",1},
+    {"Observe_WhenTimestampOnlyDrifts_RejectsMetadataMismatch",16},
+    {"Observe_WhenAclOrTransientEnumerationFails_LatchesUnavailable",8},
+    {"Observe_WhenFailureThenAbortOccurs_ReleasesKnownFdOnce",2}
+};
+static int observe_variant(size_t group, int v) {
+    if (group == 0) return observe_invalid(v);
+    if (group == 1) return observe_stable(v);
+    if (group >= 2 && group <= 9) return observe_fault_case((int)group-2,v);
+    return observe_failed_abort(v);
+}
 int main(void) {
     int passed = 0, variants = 0; size_t count = sizeof(cases)/sizeof(cases[0]);
     if (count != 18) { fprintf(stderr,"FAIL empty or changed registry\n"); return 2; }
@@ -671,5 +1012,21 @@ int main(void) {
     current = "Abort_WhenUnlockOrCloseIsAmbiguous_RetiresOwnershipWithoutRetry";
     int terminal = abort_ambiguity();
     printf("%s %s variants=26; source supplement; 0 skipped\n",terminal ? "PASS" : "FAIL",current);
-    reset(); return passed == (int)count && terminal ? 0 : 1;
+    int observe_passed=0, observe_variants=0;
+    size_t observe_count=sizeof(observe_cases)/sizeof(observe_cases[0]);
+    if (observe_count != 11) return 2;
+    for (size_t i=0; i<observe_count; ++i) {
+        int ok=1; current=observe_cases[i].name;
+        if (!current[0] || observe_cases[i].variants <= 0) return 2;
+        for (size_t j=0; j<i; ++j) if (!strcmp(current,observe_cases[j].name)) return 2;
+        for (int v=0; v<observe_cases[i].variants; ++v) {
+            if (!observe_variant(i,v)) ok=0;
+            ++observe_variants;
+        }
+        printf("%s %s variants=%d\n",ok ? "PASS" : "FAIL",current,observe_cases[i].variants);
+        fflush(stdout); observe_passed += ok;
+    }
+    printf("OBSERVE SUMMARY %d/%zu named cases passed; %zu failed; variants=%d; 0 skipped; original 18 named/490 traced preserved\n",
+        observe_passed,observe_count,observe_count-(size_t)observe_passed,observe_variants);
+    reset(); return passed == (int)count && terminal && observe_passed == (int)observe_count ? 0 : 1;
 }

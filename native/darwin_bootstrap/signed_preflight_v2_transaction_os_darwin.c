@@ -48,5 +48,8 @@ int bh_tx_os_acl_empty(void *value) {
 int bh_tx_os_acl_free(void *acl) { return acl_free(acl); }
 int bh_tx_os_flock(int fd, int operation) { return flock(fd,operation); }
 int bh_tx_os_close(int fd) { return close(fd); }
+ssize_t bh_tx_os_pread(int fd, void *buf, size_t n, off_t offset) {
+    return pread(fd,buf,n,offset);
+}
 void *bh_tx_os_alloc(size_t n) { return malloc(n); }
 void bh_tx_os_free(void *p) { free(p); }
