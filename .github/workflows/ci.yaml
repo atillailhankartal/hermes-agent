@@ -54,6 +54,20 @@ concurrency:
   cancel-in-progress: ${{ inputs.release != true && github.event_name == 'pull_request' }}
 
 jobs:
+  runner-policy:
+    name: Self-hosted runner policy
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install policy parser
+        run: python -m pip install PyYAML==6.0.3
+      - name: Enforce workflow runner policy
+        run: python scripts/ci/selfhosted_workflow_policy.py
+
   # ─────────────────────────────────────────────────────────────────────
   # detect: run the classifier once. Every downstream job reads its outputs
   # to decide whether to run. On push/dispatch the classifier fails open
@@ -66,7 +80,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 1
     outputs:
       python: ${{ steps.gate-lanes.outputs.python }}
@@ -194,24 +208,6 @@ jobs:
     if: needs.detect.outputs.bootstrap == 'true'
     uses: ./.github/workflows/bootstrap-installer.yml
 
-  e2e-desktop:
-    name: Desktop E2E
-    needs: detect
-    # python_prod (not python): the Playwright suite exercises the built app
-    # + `hermes serve` backend, which never import anything under tests/.
-    # Tests-only PRs (~17% of commits) skip this 5-minute job — the longest
-    # single job in the workflow — while still running the full pytest lanes.
-    #
-    # Re-disabled (Sep 2026): the Sep 1 re-enable is still incredibly flaky.
-    # Keep this a bare `if: false`. The earlier
-    # `${{ false && (... || ...) }}` form on this reusable-workflow job made
-    # GitHub's workflow parser fail at startup ("An unexpected error has
-    # occurred") — every ci.yaml run repo-wide dispatched 0 jobs from
-    # 24f5a60ed1 until this line changed. To re-enable, restore:
-    #   if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
-    if: false
-    uses: ./.github/workflows/e2e-desktop.yml
-
   e2e-desktop-core:
     name: Desktop core E2E
     needs: detect
@@ -317,8 +313,7 @@ jobs:
   #   by detect.outputs must succeed; only unselected consumers may skip.
   #   Release (inputs.release): strict — every required job must be
   #   `success`. A skipped required lane fails the gate; only the PR-only
-  #   jobs (history-check, lockfile-diff, supply-chain) and
-  #   the deferred Desktop E2E (e2e-desktop) may skip. The OSV scan's
+  #   jobs (history-check, lockfile-diff, supply-chain) may skip. The OSV scan's
   #   findings are advisory, but its execution is required.
   #
   # Branch protection should require ONLY this check.
@@ -335,8 +330,9 @@ jobs:
   # the live comment poller can list failed jobs in the PR comment.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
-    name: All required checks pass (v2)
+    name: All required checks pass (v3)
     needs:
+      - runner-policy
       - detect
       - tests
       - tests-os
@@ -344,7 +340,6 @@ jobs:
       - js-tests
       - rust-tests
       - bootstrap-installer
-      - e2e-desktop
       - e2e-desktop-core
       - e2e-desktop-update
       - docs-site
@@ -368,7 +363,7 @@ jobs:
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 10
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
@@ -384,7 +379,9 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           RELEASE: ${{ inputs.release }}
+          POLICY_RESULT: ${{ needs.runner-policy.result }}
         run: |
+          test "$POLICY_RESULT" = success
           args=()
           if [ "$RELEASE" = true ]; then args+=(--release); fi
           printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py "${args[@]}"
@@ -403,7 +400,7 @@ jobs:
     name: CI timing report
     needs: [all-checks-pass]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 10
     steps:
       - name: Checkout code

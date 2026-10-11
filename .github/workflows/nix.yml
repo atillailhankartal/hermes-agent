@@ -49,7 +49,7 @@ jobs:
   # flake turns main red after the merge.
   detect:
     name: Detect affected areas
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 10
     outputs:
       nix: ${{ steps.classify.outputs.nix }}
@@ -76,7 +76,7 @@ jobs:
     # takes minutes and not seconds when the cache misses. `nix flake check`
     # builds 21 checks, and --max-jobs defaults to the core count. It uses the
     # wider runner with no more configuration.
-    runs-on: ubuntu-latest-32-core
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 60
     steps:
       - name: Checkout code

@@ -21,7 +21,7 @@ concurrency:
 jobs:
   posix:
     name: install.sh protocol + small fresh-install E2E
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 15
     # NOTE: `runner.temp` is only available in step-level env, not job-level
     # env — a job-env `${{ runner.temp }}` makes GitHub reject the workflow
@@ -128,7 +128,7 @@ jobs:
 
   windows:
     name: install.ps1 protocol surface
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, hermes-ci]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1

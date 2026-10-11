@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   check-no-committed-infographics:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 10
     outputs:
       review_status: ${{ steps.infographic-check.outputs.review_status }}
@@ -54,7 +54,10 @@ jobs:
 
           if [ -n "$OFFENDERS" ]; then
             COUNT=$(printf '%s\n' "$OFFENDERS" | wc -l | tr -d ' ')
-            STATUS='[{"source":"committed infographics","results":[{"kind":"action_required","title":"PR infographic committed to the repo","summary":"Infographic images belong in the PR description, never in git.","detail":"","how_to_fix":"Untrack the image and reference the provider URL from the PR body instead:\n```\ngit rm --cached <path-to-image>\n```\nThen put it in the PR description:\n```\n## Infographic\n\n![slug](https://<provider-url>)\n```\n"}]}]'
+            STATUS=$(cat <<'JSON'
+          [{"source":"committed infographics","results":[{"kind":"action_required","title":"PR infographic committed to the repo","summary":"Infographic images belong in the PR description, never in git.","detail":"","how_to_fix":"Untrack the image and reference the provider URL from the PR body instead:\n```\ngit rm --cached <path-to-image>\n```\nThen put it in the PR description:\n```\n## Infographic\n\n![slug](https://<provider-url>)\n```\n"}]}]
+          JSON
+          )
             echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
             echo ""
             echo "::error::${COUNT} PR-infographic image(s) are tracked in git."

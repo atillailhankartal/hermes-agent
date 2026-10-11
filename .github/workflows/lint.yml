@@ -35,7 +35,7 @@ jobs:
   lint-diff:
     name: ruff + ty diff
     if: inputs.event_name == 'pull_request' && inputs.python
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -129,7 +129,7 @@ jobs:
     # the diff comment even when enforcement fails.
     name: ruff enforcement (blocking)
     if: inputs.python
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 5
     steps:
       - name: Checkout code
@@ -158,7 +158,7 @@ jobs:
     # parent (current main), so an improvement that lands on main is locked in at once.
     name: code health ratchet (blocking)
     if: inputs.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -186,7 +186,7 @@ jobs:
     # See scripts/check-windows-footguns.py for the full rule list.
     name: Windows footguns (blocking)
     if: inputs.python
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 5
     steps:
       - name: Checkout code
@@ -239,7 +239,7 @@ jobs:
           PR_HEAD: "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
         run: |
           git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" "$PR_HEAD"
-          for i in 1 2 3; do
+          for _ in 1 2 3; do
             git merge-base "origin/${{ github.base_ref }}" origin/pr-head >/dev/null 2>&1 && break
             git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "$PR_HEAD"
           done
@@ -267,7 +267,7 @@ jobs:
           PR_HEAD: "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
         run: |
           git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" "$PR_HEAD"
-          for i in 1 2 3; do
+          for _ in 1 2 3; do
             git merge-base "origin/${{ github.base_ref }}" origin/pr-head >/dev/null 2>&1 && break
             git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "$PR_HEAD"
           done

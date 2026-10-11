@@ -40,7 +40,7 @@ jobs:
   track:
     name: Update the install-e2e-red tracker
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-automation]
     timeout-minutes: 5
     permissions:
       contents: read
@@ -56,4 +56,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.run-id || github.event.workflow_run.id }}
           DRY_RUN: ${{ inputs.dry-run == true && '--dry-run' || '' }}
-        run: node tests/install/e2e-assets/red-tracker.mjs --run-id "$RUN_ID" $DRY_RUN
+        run: |
+          args=()
+          if [ "$DRY_RUN" = '--dry-run' ]; then args+=(--dry-run); fi
+          node tests/install/e2e-assets/red-tracker.mjs --run-id "$RUN_ID" "${args[@]}"

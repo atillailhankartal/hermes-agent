@@ -64,7 +64,7 @@ permissions:
 jobs:
   validate:
     name: Require a supported native smoke target
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 5
     env:
       TARGET: ${{ inputs.platform }}/${{ inputs.arch }}/${{ inputs.format }}
@@ -81,7 +81,7 @@ jobs:
     name: macOS install and chat
     needs: validate
     if: inputs.platform == 'darwin'
-    runs-on: ${{ inputs.arch == 'x64' && 'macos-15-intel' || 'macos-15' }}
+    runs-on: [self-hosted, "${{ inputs.arch == 'x64' && 'hermes-macos-x64' || 'hermes-macos-arm64' }}", hermes-ci]
     timeout-minutes: 30
     # Also constrains the recording action's nested cache to read-only.
     cache-mode: read
@@ -245,7 +245,7 @@ jobs:
     name: Windows install and chat
     needs: validate
     if: inputs.platform == 'win32'
-    runs-on: ${{ inputs.arch == 'arm64' && 'windows-latest-32-arm-core' || 'windows-latest-32-core' }}
+    runs-on: [self-hosted, "${{ inputs.arch == 'arm64' && 'hermes-windows-arm64' || 'hermes-windows-x64' }}", hermes-ci]
     # windows-11-arm runners are much slower (npm ci alone runs 12+ minutes and
     # the MSIX leg exceeds 30 total); x64 legs complete in ~14.
     timeout-minutes: 45

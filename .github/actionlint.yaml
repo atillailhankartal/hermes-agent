@@ -3,8 +3,13 @@
 # the real findings, unless this file declares it.
 self-hosted-runner:
   labels:
-    - ubuntu-latest-96-core
-    - ubuntu-latest-32-core
-    - ubuntu-latest-32-arm-core
-    - windows-latest-32-core
-    - windows-latest-32-arm-core
+    - hermes-ci
+    - hermes-build
+    - hermes-publish
+    - hermes-automation
+    - hermes-linux-x64
+    - hermes-linux-arm64
+    - hermes-windows-x64
+    - hermes-windows-arm64
+    - hermes-macos-x64
+    - hermes-macos-arm64

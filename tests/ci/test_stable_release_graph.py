@@ -138,11 +138,16 @@ def test_claim_flags_remove_exactly_the_jobs_the_gate_expects_skipped():
         assert set(gated) <= set(needs_of(name)), name
 
 
-def test_all_applicable_ci_jobs_are_aggregated_and_desktop_e2e_stays_deferred():
+def test_all_applicable_ci_jobs_are_aggregated_and_dormant_desktop_e2e_is_absent():
     jobs = workflow("ci.yaml")["jobs"]
+    # The old event predicate became reachable through a repository_dispatch
+    # caller of this reusable workflow. Keep that job and its aggregate edge
+    # absent until a separately reviewed desktop E2E rollout.
+    assert "e2e-desktop" not in jobs
+    assert "e2e-desktop" not in direct_needs(jobs, "all-checks-pass")
+    assert {"e2e-desktop-core", "e2e-desktop-update"} <= set(jobs)
     checks = {name for name, job in jobs.items() if "uses" in job}
     assert checks <= set(jobs["all-checks-pass"]["needs"])
-    assert not gate(jobs["e2e-desktop"]["if"], {}, {})
     assert "workflow_call" in workflow("ci.yaml")["on"]
 
 

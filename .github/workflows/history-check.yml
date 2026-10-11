@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   check-common-ancestor:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, hermes-ci]
     timeout-minutes: 10
     outputs:
       review_status: ${{ steps.merge-base-check.outputs.review_status }}
@@ -42,7 +42,10 @@ jobs:
           # so the failure message is clear regardless of which signal fires
           # first.
           if ! BASE=$(git merge-base origin/main HEAD 2>/dev/null) || [ -z "$BASE" ]; then
-            STATUS='[{"source":"unrelated histories","results":[{"kind":"action_required","title":"Unrelated histories","summary":"This PR has no common ancestor with main.","detail":"","how_to_fix":"Rebase your changes onto current main:\n```\ngit fetch origin main\ngit checkout -b fix-branch origin/main\n# re-apply your changes (cherry-pick, copy files, etc.)\ngit push -f origin fix-branch\n```\n"}]}]'
+            STATUS=$(cat <<'JSON'
+          [{"source":"unrelated histories","results":[{"kind":"action_required","title":"Unrelated histories","summary":"This PR has no common ancestor with main.","detail":"","how_to_fix":"Rebase your changes onto current main:\n```\ngit fetch origin main\ngit checkout -b fix-branch origin/main\n# re-apply your changes (cherry-pick, copy files, etc.)\ngit push -f origin fix-branch\n```\n"}]}]
+          JSON
+          )
             echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
             echo "review_status=${STATUS}" > review-status.json
             echo ""

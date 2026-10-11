@@ -26,9 +26,13 @@ CANARY_TAG = "v0.28.0+canary.20260818T101010Z"
 PLATFORMS = ("darwin", "win32")
 ARCHES = ("arm64", "x64")
 NATIVE_TARGETS = tuple(f"{platform}-{arch}" for platform in PLATFORMS for arch in ARCHES)
-# The release branch may write the shared dependency cache; commit and channel
-# builds run unreviewed inputs and may only read it.
-_MODE_BY_CACHE = {"write": "release", "read": "commit"}
+def _build_mode(job: dict) -> str:
+    """Classify the mutually exclusive release and commit admission branches."""
+    condition = " ".join(job.get("if", "").split())
+    release = "inputs.build_commit == '' && inputs.channel == ''"
+    commit = "(inputs.build_commit != '' || inputs.channel != '')"
+    assert (release in condition) != (commit in condition), condition
+    return "release" if release in condition else "commit"
 
 
 def load(path: Path = WORKFLOW) -> dict:
@@ -52,7 +56,7 @@ def native_builds(jobs: dict) -> dict[tuple[str, str], str]:
         if not any(step.get("uses") == BUILD_CACHE_ACTION for step in job.get("steps", [])):
             continue
         (target,) = [row["label"] for row in job["strategy"]["matrix"]["target"]]
-        key = (target, _MODE_BY_CACHE[job["cache-mode"]])
+        key = (target, _build_mode(job))
         assert key not in legs, f"{name} and {legs[key]} both build {key}"
         legs[key] = name
     assert {target for target, _ in legs} == set(NATIVE_TARGETS), legs

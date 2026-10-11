@@ -27,7 +27,8 @@ concurrency:
 jobs:
   tag:
     name: Tag, draft, and start the canary build
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
+    environment: release-signing
     # A dispatch from a feature branch would tag unmerged code as the canary.
     if: github.ref_name == github.event.repository.default_branch
     steps:
@@ -48,7 +49,7 @@ jobs:
 
   prune:
     name: Prune canaries older than 14 days
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, hermes-publish]
     needs: tag
     environment: release-signing
     # Prune even when this run had nothing new to tag. The desktop build

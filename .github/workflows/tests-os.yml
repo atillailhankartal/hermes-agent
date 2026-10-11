@@ -3,7 +3,7 @@ name: OS-specific tests
 # Runs the tests that can only be trusted on their own host OS.
 #
 # The main Python suite (.github/workflows/tests.yml) runs on
-# ubuntu-latest and covers everything that is either platform-agnostic or
+# hermes-linux-x64 and covers everything that is either platform-agnostic or
 # genuinely Linux-specific. Tests whose subject is macOS- or
 # Windows-specific behaviour carry a marker (see the ``_OS_MARKS`` block
 # comment in tests/conftest.py) and are SKIPPED on Linux, because faking
@@ -11,8 +11,8 @@ name: OS-specific tests
 # reproducing any of the OS behaviour that branch exists for. This workflow
 # is where those markers actually execute:
 #
-#   macos    → ``-m platforms``    on macos-latest
-#   windows  → ``-m platforms``    on windows-latest-32-core and windows-latest-32-arm-core
+#   macos    → ``-m platforms``    on hermes-macos-arm64
+#   windows  → ``-m platforms``    on hermes-windows-x64 and hermes-windows-arm64
 #
 # (tests/conftest.py's ``pytest_collection_modifyitems`` hook skips
 # foreign-OS ``platforms(...)`` markers on each host, so one shared ``-m
@@ -72,7 +72,7 @@ concurrency:
 jobs:
   os-tests:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: [self-hosted, "${{ matrix.runner }}", hermes-ci]
     timeout-minutes: ${{ matrix.timeout || 30 }}
     strategy:
       fail-fast: false
@@ -81,18 +81,18 @@ jobs:
           # Two slices on the free standard runner (3 cores, 3 workers): one lane ran
           # ~7.5 min and became the slowest required job once the Linux suite split.
           - name: macOS-only tests (1/2)
-            runner: macos-latest
+            runner: hermes-macos-arm64
             marker: macos
             slice: 1/2
           - name: macOS-only tests (2/2)
-            runner: macos-latest
+            runner: hermes-macos-arm64
             marker: macos
             slice: 2/2
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: hermes-windows-x64
             marker: windows
           - name: Windows-only tests (arm64)
-            runner: windows-latest-32-arm-core
+            runner: hermes-windows-arm64
             marker: windows
             timeout: 60
     steps:
@@ -224,7 +224,7 @@ jobs:
     # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
     # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
     # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    runs-on: windows-latest-32-core
+    runs-on: [self-hosted, Windows, X64, hermes-ci]
     timeout-minutes: 25
     steps:
       - name: Checkout code
