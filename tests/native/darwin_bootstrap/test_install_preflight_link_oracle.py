@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """An extra linked dylib must be rejected before the preflight CLI runs."""
 
+import argparse
+from contextlib import redirect_stdout
 import hashlib
 import importlib.util
+import io
 from pathlib import Path
 import shutil
 import subprocess
@@ -32,6 +35,10 @@ def command(argv):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--simulate-unrelated-failure", action="store_true",
+                        help="prove an unrelated builder failure cannot satisfy this oracle")
+    args = parser.parse_args()
     cmake = shutil.which("cmake")
     otool = shutil.which("otool")
     if cmake is None or otool is None or not HARNESS.is_file():
@@ -98,6 +105,11 @@ def main():
         harness = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(harness)
         harness.NATIVE = source.resolve()
+        if args.simulate_unrelated_failure:
+            def unrelated_failure(_directory):
+                print("SETUP_FAIL unrelated tool failure", flush=True)
+                return None
+            harness.build_exact_cli = unrelated_failure
         executions = []
         original_run = subprocess.run
 
@@ -115,15 +127,21 @@ def main():
         harness.subprocess = GuardedSubprocess()
         owned_build = root / "harness-build"
         owned_build.mkdir()
+        audit_output = io.StringIO()
         try:
-            audited_cli = harness.build_exact_cli(owned_build)
+            with redirect_stdout(audit_output):
+                audited_cli = harness.build_exact_cli(owned_build)
         except RuntimeError as error:
             print("FAIL CLI executed before rejection", str(error), flush=True)
             return 1
+        diagnostic = "SETUP_FAIL exact CLI link object graph mismatch"
+        output = audit_output.getvalue()
+        print(output, end="", flush=True)
         print("AUDITOR_RETURN", audited_cli, flush=True)
         print("CLI_EXECUTIONS", len(executions), flush=True)
-        if audited_cli is not None or executions:
-            print("FAIL ExtraDylib_WasAccepted", flush=True)
+        print("EXPECTED_GRAPH_REFUSAL_COUNT", output.splitlines().count(diagnostic), flush=True)
+        if audited_cli is not None or executions or output.splitlines().count(diagnostic) != 1:
+            print("FAIL ExtraDylib_NotSpecificallyRejected", flush=True)
             return 1
         print("PASS ExtraDylib_IsRejectedBeforeExecution", flush=True)
         return 0
