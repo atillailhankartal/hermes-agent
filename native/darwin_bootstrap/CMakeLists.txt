@@ -171,3 +171,37 @@ if(BH_BUILD_DORMANT_PATH_OBSERVER_TESTS)
       "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/${observer_image}.map")
   endforeach()
 endif()
+
+# Dormant byte observation only: no authority and no installed consumers.
+# The deterministic empty-ACL adapter is exclusively linked into the test image.
+option(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_BUNDLE_TESTS
+  "Explicit dormant signed-preflight v2 bundle observation tests" OFF)
+if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_BUNDLE_TESTS)
+  add_library(bee_hermes_signed_preflight_v2_bundle_core OBJECT EXCLUDE_FROM_ALL
+    signed_preflight_v2_bundle_reader.c)
+  add_library(bee_hermes_signed_preflight_v2_bundle STATIC EXCLUDE_FROM_ALL
+    $<TARGET_OBJECTS:bee_hermes_signed_preflight_v2_bundle_core>
+    bundle_reader_os_darwin.c)
+  add_executable(bee_hermes_signed_preflight_v2_bundle_test EXCLUDE_FROM_ALL
+    ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_bundle_reader.c
+    ../../tests/native/darwin_bootstrap/bundle_reader_os_test.c
+    $<TARGET_OBJECTS:bee_hermes_signed_preflight_v2_bundle_core>
+    signed_preflight_v2.c signed_preflight_v2_crypto.c)
+  foreach(bundle_target bee_hermes_signed_preflight_v2_bundle_core
+          bee_hermes_signed_preflight_v2_bundle
+          bee_hermes_signed_preflight_v2_bundle_test)
+    target_compile_features(${bundle_target} PRIVATE c_std_11)
+    target_compile_options(${bundle_target} PRIVATE -Wall -Wextra -Werror -pedantic)
+    target_include_directories(${bundle_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_property(TARGET ${bundle_target} PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+  endforeach()
+  target_compile_definitions(bee_hermes_signed_preflight_v2_bundle_test PRIVATE
+    BH_BUNDLE_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/native/darwin_bootstrap/fixtures/signed_preflight_v2"
+    BH_BUNDLE_PREFLIGHT="$<TARGET_FILE:hermes_bee_install_preflight>")
+  target_link_libraries(bee_hermes_signed_preflight_v2_bundle_test PRIVATE
+    "-framework Security" "-framework CoreFoundation")
+  target_link_options(bee_hermes_signed_preflight_v2_bundle_test PRIVATE
+    "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/bee_hermes_signed_preflight_v2_bundle_test.map")
+  add_dependencies(bee_hermes_signed_preflight_v2_bundle_test
+    hermes_bee_install_preflight bee_hermes_signed_preflight_v2_bundle)
+endif()
