@@ -1,0 +1,163 @@
+{
+  "source": "literal approved TEST-SPEC.md SHA256 7b0ecab5af16052923e1701c133f1a1a385c6aa29947061d93705bcc24292df4",
+  "cases": [
+    {
+      "name": "LeafDigest_WhenArgumentsAreNull_PreservesCallerBytes",
+      "variants": 4
+    },
+    {
+      "name": "LeafDigest_WhenPublicRangesOverlap_PreservesAllBytes",
+      "variants": 6
+    },
+    {
+      "name": "LeafDigest_WhenPublicRangeAliasesContext_PreservesContext",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenPublicRangeAliasesSnapshot_PreservesFiveBuffers",
+      "variants": 15
+    },
+    {
+      "name": "LeafDigest_WhenResultIsNonzero_PreservesItBeforeLivenessChecks",
+      "variants": 4
+    },
+    {
+      "name": "LeafDigest_WhenPrerequisiteMissing_RejectsWithoutConsumption",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenPriorObservationFailed_ReturnsUnavailable",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenOwnerIsTerminalOrAborted_HonorsOwnerContract",
+      "variants": 2
+    },
+    {
+      "name": "LeafDigest_WhenActiveTupleMatches_RemainsUntrusted",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenFullLeafLengthVaries_HashesEveryByte",
+      "variants": 4
+    },
+    {
+      "name": "LeafDigest_WhenPolicyByteChanges_RejectsSameEpoch",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenManifestByteChanges_RejectsSameEpoch",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenByteChangesAfterEmbeddedNul_Rejects",
+      "variants": 2
+    },
+    {
+      "name": "LeafDigest_WhenDigestFieldsWouldBeForged_NoCallerDigestCanDecideEquality",
+      "variants": 2
+    },
+    {
+      "name": "LeafDigest_WhenBackingBytesChangeAfterCapture_UsesPrivateOriginals",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenSignatureBytesDiffer_DoesNotClaimSignatureVerification",
+      "variants": 1
+    },
+    {
+      "name": "LeafDigest_WhenClaimEpochOrStateIsInvalid_DrainsAndLatches",
+      "variants": 4
+    },
+    {
+      "name": "LeafDigest_WhenClaimTupleDiffersFromActive_Rejects",
+      "variants": 4
+    },
+    {
+      "name": "LeafDigest_WhenFinalVersionSpellingIsInvalid_Rejects",
+      "variants": 6
+    },
+    {
+      "name": "LeafDigest_WhenVersionLengthAndPathAreValid_UsesFinalComponent",
+      "variants": 4
+    },
+    {
+      "name": "LeafDigest_WhenOriginalInstallIsModified_UsesBeginCopy",
+      "variants": 1
+    },
+    {
+      "name": "LeafDigest_WhenVersionDiffersFromActive_RejectsWithoutNormalization",
+      "variants": 2
+    },
+    {
+      "name": "LeafDigest_WhenStartupParametersAreModified_UsesOriginalPrivateCopy",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenClaimIsModifiedDuringHash_UsesEntryCopy",
+      "variants": 2
+    },
+    {
+      "name": "LeafDigest_WhenHashReturnsNull_DrainsWithoutCodec",
+      "variants": 4
+    },
+    {
+      "name": "LeafDigest_WhenHashReturnsWrongPointer_DrainsWithoutCodec",
+      "variants": 2
+    },
+    {
+      "name": "LeafDigest_WhenHashReturnsAllZero_UsesCodecRejectMapping",
+      "variants": 2
+    },
+    {
+      "name": "LeafDigest_WhenSnapshotInvariantIsBroken_FailsBeforeHash",
+      "variants": 6
+    },
+    {
+      "name": "LeafDigest_WhenCodecOutcomeIsHostile_MapsOnlyAllowedOutcome",
+      "variants": 6
+    },
+    {
+      "name": "LeafDigest_WhenStartupStateIsPending_CannotReachCandidate",
+      "variants": 4
+    },
+    {
+      "name": "LeafDigest_WhenStartupStateIsCorrupt_CannotReachCandidate",
+      "variants": 4
+    },
+    {
+      "name": "LeafDigest_WhenCalledAgain_EnforcesOneShot",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenFailureIsLatched_AllObservationEntrypointsStayUnavailable",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenAbortFollowsOutcome_ReleasesEveryGenerationOnce",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenAbortCleanupIsAmbiguous_QuarantinesWithoutRetry",
+      "variants": 2
+    },
+    {
+      "name": "LeafDigest_WhenNoIoOrAuthorityIsPermitted_RecordsOnlyHashesAndCodec",
+      "variants": 3
+    },
+    {
+      "name": "LeafDigest_WhenCodecArgumentsAreCaptured_UsesPrivatePointersAndSameAction",
+      "variants": 1
+    },
+    {
+      "name": "LeafDigestHarness_WhenRegistryOrOracleIsDamaged_FailsItsOwnGate",
+      "variants": 3
+    }
+  ],
+  "unique_cases": 38,
+  "variants_per_link": 133,
+  "links": [
+    "real",
+    "spy"
+  ]
+}

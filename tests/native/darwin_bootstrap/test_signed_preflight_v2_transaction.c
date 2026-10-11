@@ -41,6 +41,12 @@ uint32_t bh_v2_transaction_observe_local_state(struct bh_v2_transaction **owner,
 enum { ANCHOR, LOCKS, LOCK, VERSIONS, VERSION, FLOORS, SELECTORS, POLICY, SIGNATURE, MANIFEST, FLOOR, SELECTOR, NODES };
 static const char *const names[NODES] = {"anchor", "locks", "install.lock", "versions", "release-7", "floors", "selectors", "policy.v2.bin", "policy.v2.sig", "release.v2.bin", "floor.journal", "current.selector"};
 static const int parents[NODES] = {-1, ANCHOR, LOCKS, ANCHOR, VERSIONS, ANCHOR, ANCHOR, VERSION, VERSION, VERSION, FLOORS, SELECTORS};
+#ifdef BH_TX_LEAF_DIGEST_TEST
+static const unsigned char *leaf_pread_bytes[3];
+static size_t leaf_pread_lengths[3];
+static char leaf_version_name[BH_TX_NAME];
+static int leaf_version_count_zero, leaf_parent_uppercase;
+#endif
 struct event { char op; int node, arg; };
 struct handle { int fd, node, alive, borrowed, enumeration, closes; unsigned generation; };
 struct block { void *ptr; size_t size; int alive, frees; };
@@ -115,7 +121,23 @@ static int add_handle(int node, int enumeration, int borrowed) {
 static int lookup(int fd, const char *name) {
     struct handle *h = handle(fd); if (!h) return -1;
     if (!strcmp(name, ".")) return h->node;
-    for (int i = 1; i < NODES; ++i) if (parents[i] == h->node && !strcmp(name,names[i])) return i;
+#ifdef BH_TX_LEAF_DIGEST_TEST
+    if (leaf_parent_uppercase && h->node == ANCHOR && !strcmp(name,"Versions")) return VERSIONS;
+    if (leaf_version_count_zero && h->node == ANCHOR) {
+        for (int i=POLICY; i<=MANIFEST; ++i)
+            if (!strcmp(name,names[i])) return i;
+    }
+    if (h->node == VERSION && leaf_version_name[0] && !strcmp(name,leaf_version_name))
+        return VERSION;
+#endif
+    for (int i = 1; i < NODES; ++i) {
+#ifdef BH_TX_LEAF_DIGEST_TEST
+        const char *expected = i == VERSION && leaf_version_name[0] ? leaf_version_name : names[i];
+#else
+        const char *expected = names[i];
+#endif
+        if (parents[i] == h->node && !strcmp(name,expected)) return i;
+    }
     ++f.errors; errno = ENOENT; return -1;
 }
 static void reset(void) {
@@ -296,7 +318,12 @@ void *bh_tx_os_alloc(size_t n) {
     ++f.allocations;
     if (event('M',-1,0)) return NULL;
     if (f.block_count >= 16 || n == 0) abort();
+#ifdef BH_TX_LEAF_DIGEST_TEST
+    size_t physical = n < sizeof(struct bh_tx_result) ? sizeof(struct bh_tx_result) : n;
+    void *p = calloc(1,physical);
+#else
     void *p = calloc(1,n);
+#endif
     if (p) {
         if (f.block_count) {
             f.payload_live += n;
@@ -368,6 +395,12 @@ ssize_t bh_tx_os_pread(int fd, void *buf, size_t n, off_t offset) {
     }
     unsigned char *out = buf;
     for (size_t i = 0; i < n; ++i) out[i] = (unsigned char)(h->node*17+(int)(i%251)*7);
+#ifdef BH_TX_LEAF_DIGEST_TEST
+    if (leaf >= 0 && leaf < 3 && leaf_pread_bytes[leaf]) {
+        if (leaf_pread_lengths[leaf] != n) { ++f.errors; return -1; }
+        memcpy(out,leaf_pread_bytes[leaf],n);
+    }
+#endif
     if (leaf == f.byte_drift_leaf && pass == 1 && n) {
         out[n-1] ^= 0x80; ++f.byte_drift_reached;
     }
@@ -1533,12 +1566,21 @@ bh_journal_observation bh_test_real_journal_observe(bh_journal_snapshot,
     bh_journal_snapshot, const bh_journal_parameters *, bh_journal_action,
     const bh_journal_candidate *);
 #endif
+#ifdef BH_TX_LEAF_DIGEST_TEST
+static bh_journal_observation leaf_candidate_wrap(bh_journal_snapshot,
+    bh_journal_snapshot, const bh_journal_parameters *, bh_journal_action,
+    const bh_journal_candidate *);
+#endif
 static void codec_digest(const void *p, size_t n, unsigned char out[32]) {
     if (n > UINT32_MAX || !CC_SHA256(p,(CC_LONG)n,out)) abort();
 }
 bh_journal_observation bh_journal_observe(bh_journal_snapshot j,
     bh_journal_snapshot s, const bh_journal_parameters *p,
     bh_journal_action a, const bh_journal_candidate *c) {
+#ifdef BH_TX_LEAF_DIGEST_TEST
+    if (a == BH_JOURNAL_SAME_EPOCH_CANDIDATE)
+        return leaf_candidate_wrap(j,s,p,a,c);
+#endif
     ++codec_spy.calls;
     if (a != BH_JOURNAL_STARTUP_RECOVER || c != NULL || !p ||
         p == codec_spy.source || memcmp(p,&codec_spy.expected,sizeof(*p))) ++codec_spy.errors;
@@ -1567,6 +1609,15 @@ bh_journal_observation bh_journal_observe(bh_journal_snapshot j,
     bh_journal_observation result=bh_test_real_journal_observe(j,s,p,a,c);
     if (result.outcome != codec_spy.real_expected || !result.parser_diagnosis ||
         strcmp(result.parser_diagnosis,codec_spy.real_diagnosis)) ++codec_spy.errors;
+#ifdef BH_TX_LEAF_DIGEST_TEST
+    if (codec_spy.mutation) {
+        ++codec_spy.mutation_hits;
+        if (codec_spy.mutation == 1) memset(codec_spy.source->installation_id,0x99,32);
+        if (codec_spy.mutation == 2) memset(codec_spy.source->new_key_id,0x99,32);
+        if (codec_spy.mutation == 3) codec_spy.source->threshold_t=99;
+        if (memcmp(p,&codec_spy.expected,sizeof(*p))) ++codec_spy.errors;
+    }
+#endif
     printf("REAL CODEC reached outcome=%d diagnosis=%s\n",(int)result.outcome,result.parser_diagnosis);
     return result;
 #endif

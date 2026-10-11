@@ -59,5 +59,12 @@ uint32_t bh_v2_transaction_observe_local_state(struct bh_v2_transaction **owner,
  * parameter establishes installation, recovery, admission or launch authority. */
 uint32_t bh_v2_transaction_observe_codec(struct bh_v2_transaction **owner,
     const bh_journal_parameters *diagnostic_parameters, struct bh_tx_result *result);
+/* One-shot OFF-only binding of original private policy/manifest bytes to the
+ * local tuple. The copied claim remains unsigned/untrusted. Structural errors
+ * preserve caller bytes; consumed failures drain snapshots and latch unavailable.
+ * Requires successful retained, state and startup codec observations. */
+struct bh_tx_leaf_claim { uint64_t epoch; uint32_t key_state; };
+uint32_t bh_v2_transaction_observe_leaf_digests(struct bh_v2_transaction **owner,
+    const struct bh_tx_leaf_claim *diagnostic_claim, struct bh_tx_result *result);
 uint32_t bh_v2_transaction_abort(struct bh_v2_transaction **owner, struct bh_tx_result *result);
 #endif

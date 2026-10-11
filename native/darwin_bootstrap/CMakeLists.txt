@@ -307,3 +307,54 @@ if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TRANSACTION_TESTS)
       bee_hermes_signed_preflight_v2_transaction_spy_test
     VERBATIM)
 endif()
+
+# The SHA adapter is restricted to the test transaction object. The test TU
+# forwards to genuine CommonCrypto; neither macro reaches the normal archive.
+if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TRANSACTION_TESTS)
+  set(leaf_fixture_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/native/darwin_bootstrap/fixtures/signed_preflight_v2_leaf_digest")
+  add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/leaf_vectors.h"
+    COMMAND "${Python3_EXECUTABLE}" "${leaf_fixture_dir}/generate.py"
+      --emit-header "${CMAKE_CURRENT_BINARY_DIR}/leaf_vectors.h"
+    DEPENDS "${leaf_fixture_dir}/generate.py" "${leaf_fixture_dir}/leaf-fixtures.json"
+      "${leaf_fixture_dir}/leaf-fixture-expansions.json" "${leaf_fixture_dir}/leaf-registry.json"
+    VERBATIM)
+  add_custom_target(bee_hermes_signed_preflight_v2_leaf_vectors
+    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/leaf_vectors.h")
+  add_library(bee_hermes_signed_preflight_v2_leaf_test_transaction OBJECT EXCLUDE_FROM_ALL
+    signed_preflight_v2_transaction.c)
+  target_compile_definitions(bee_hermes_signed_preflight_v2_leaf_test_transaction PRIVATE
+    CC_SHA256=bh_test_tx_sha256)
+  add_library(bee_hermes_signed_preflight_v2_leaf_test_codec OBJECT EXCLUDE_FROM_ALL
+    signed_preflight_v2_journal_codec.c)
+  target_compile_definitions(bee_hermes_signed_preflight_v2_leaf_test_codec PRIVATE
+    bh_journal_observe=bh_test_real_journal_observe)
+  foreach(leaf_test bee_hermes_signed_preflight_v2_leaf_digest_test
+          bee_hermes_signed_preflight_v2_leaf_digest_spy_test)
+    add_executable(${leaf_test} EXCLUDE_FROM_ALL
+      ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_leaf_digest.c
+      $<TARGET_OBJECTS:bee_hermes_signed_preflight_v2_leaf_test_transaction>)
+    add_dependencies(${leaf_test} bee_hermes_signed_preflight_v2_journal_vectors
+      bee_hermes_signed_preflight_v2_leaf_vectors)
+    target_compile_definitions(${leaf_test} PRIVATE BH_TX_LEAF_DIGEST_TEST)
+    target_link_options(${leaf_test} PRIVATE
+      "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/${leaf_test}.map")
+  endforeach()
+  target_sources(bee_hermes_signed_preflight_v2_leaf_digest_test PRIVATE
+    $<TARGET_OBJECTS:bee_hermes_signed_preflight_v2_leaf_test_codec>)
+  target_compile_definitions(bee_hermes_signed_preflight_v2_leaf_digest_spy_test PRIVATE BH_TX_CODEC_SPY)
+  foreach(leaf_target bee_hermes_signed_preflight_v2_leaf_test_transaction
+          bee_hermes_signed_preflight_v2_leaf_test_codec
+          bee_hermes_signed_preflight_v2_leaf_digest_test
+          bee_hermes_signed_preflight_v2_leaf_digest_spy_test)
+    target_compile_features(${leaf_target} PRIVATE c_std_11)
+    target_compile_options(${leaf_target} PRIVATE -Wall -Wextra -Werror -pedantic)
+    target_include_directories(${leaf_target} PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+  endforeach()
+  add_custom_target(bee_hermes_signed_preflight_v2_leaf_digest_check
+    COMMAND $<TARGET_FILE:bee_hermes_signed_preflight_v2_leaf_digest_test>
+    COMMAND $<TARGET_FILE:bee_hermes_signed_preflight_v2_leaf_digest_spy_test>
+    DEPENDS bee_hermes_signed_preflight_v2_leaf_digest_test
+      bee_hermes_signed_preflight_v2_leaf_digest_spy_test
+    VERBATIM)
+endif()

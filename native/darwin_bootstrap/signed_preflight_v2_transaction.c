@@ -1,6 +1,7 @@
 #include "signed_preflight_v2_transaction.h"
 #include "signed_preflight_v2_transaction_os.h"
 #include "signed_preflight_v2_journal_codec.h"
+#include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -31,6 +32,8 @@ struct bh_v2_transaction {
     size_t state_snapshot_lengths[2];
     int state_observation_done, state_observation_failed;
     int codec_observation_done, codec_observation_failed;
+    bh_journal_parameters saved_parameters;
+    int saved_parameters_valid, leaf_digest_done, leaf_digest_failed;
     int lock_index, locked, uncertain;
 };
 /* Address identity only: never a live transaction, never dereferenced or freed.
@@ -296,7 +299,7 @@ uint32_t bh_v2_transaction_observe_retained(struct bh_v2_transaction **owner,
     if (t == &terminal_owner) return outcome(r,BH_TX_UNAVAILABLE);
     if (overlap(t,sizeof(*t),owner,sizeof(*owner)) ||
         overlap(t,sizeof(*t),r,sizeof(*r))) return BH_TX_REJECTED;
-    if (t->observation_failed) return outcome(r,BH_TX_UNAVAILABLE);
+    if (t->observation_failed || t->leaf_digest_failed) return outcome(r,BH_TX_UNAVAILABLE);
     if (t->observation_done) return outcome(r,BH_TX_REJECTED);
     uint32_t status = observe_all_edges(t);
     unsigned char *scratch = NULL;
@@ -354,7 +357,7 @@ uint32_t bh_v2_transaction_observe_local_state(struct bh_v2_transaction **owner,
     if (t == &terminal_owner) return outcome(r,BH_TX_UNAVAILABLE);
     if (overlap(t,sizeof(*t),owner,sizeof(*owner)) ||
         overlap(t,sizeof(*t),r,sizeof(*r))) return BH_TX_REJECTED;
-    if (t->state_observation_failed || t->observation_failed)
+    if (t->state_observation_failed || t->observation_failed || t->leaf_digest_failed)
         return outcome(r,BH_TX_UNAVAILABLE);
     if (t->state_observation_done || !t->observation_done)
         return outcome(r,BH_TX_REJECTED);
@@ -438,7 +441,7 @@ uint32_t bh_v2_transaction_observe_codec(struct bh_v2_transaction **owner,
         overlap(t,sizeof(*t),r,sizeof(*r)) ||
         overlap(t,sizeof(*t),diagnostic_parameters,sizeof(*diagnostic_parameters)))
         return BH_TX_REJECTED;
-    if (t->observation_failed || t->state_observation_failed || t->codec_observation_failed)
+    if (t->observation_failed || t->state_observation_failed || t->codec_observation_failed || t->leaf_digest_failed)
         return outcome(r,BH_TX_UNAVAILABLE);
     if (t->codec_observation_done || !t->observation_done || !t->state_observation_done)
         return outcome(r,BH_TX_REJECTED);
@@ -461,13 +464,106 @@ uint32_t bh_v2_transaction_observe_codec(struct bh_v2_transaction **owner,
         status = observation.outcome == BH_JOURNAL_CONSISTENT_ONLY ?
             BH_TX_PREPARED_UNTRUSTED : BH_TX_UNAVAILABLE;
     }
-    if (status == BH_TX_PREPARED_UNTRUSTED) t->codec_observation_done = 1;
+    if (status == BH_TX_PREPARED_UNTRUSTED) {
+        t->saved_parameters = copied_parameters;
+        t->saved_parameters_valid = 1;
+        t->codec_observation_done = 1;
+    }
     else {
         free_state_snapshots(t);
         free_snapshots(t);
         t->codec_observation_failed = 1;
     }
     return outcome(r,status);
+}
+/* Structural validation precedes any caller-byte reads or diagnostic work. */
+static int leaf_range_overlap(const struct bh_v2_transaction *t,
+    const void *p, size_t length) {
+    if (overlap(t,sizeof(*t),p,length)) return 1;
+    for (unsigned i=0; i<3; ++i)
+        if (t->snapshots[i] && overlap(t->snapshots[i],t->snapshot_lengths[i],p,length))
+            return 1;
+    for (unsigned i=0; i<2; ++i)
+        if (t->state_snapshots[i] &&
+            overlap(t->state_snapshots[i],t->state_snapshot_lengths[i],p,length)) return 1;
+    return 0;
+}
+static int lower_alnum(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+}
+static size_t leaf_version_length(const struct bh_tx_path *path) {
+    if (!path->count || path->count > BH_TX_COMPONENTS) return 0;
+    const char *name = path->components[path->count-1];
+    const char *end = memchr(name,0,BH_TX_NAME);
+    if (!end || end == name || !lower_alnum((unsigned char)name[0]) ||
+        !lower_alnum((unsigned char)end[-1])) return 0;
+    for (const char *p=name; p!=end; ++p)
+        if (!lower_alnum((unsigned char)*p) && *p != '_' && *p != '-') return 0;
+    return (size_t)(end-name);
+}
+static uint32_t leaf_failure(struct bh_v2_transaction *t,
+    struct bh_tx_result *r, uint32_t status) {
+    t->leaf_digest_failed = 1;
+    t->saved_parameters_valid = 0;
+    memset(&t->saved_parameters,0,sizeof(t->saved_parameters));
+    free_state_snapshots(t);
+    free_snapshots(t);
+    return outcome(r,status);
+}
+uint32_t bh_v2_transaction_observe_leaf_digests(struct bh_v2_transaction **owner,
+    const struct bh_tx_leaf_claim *diagnostic_claim, struct bh_tx_result *r) {
+    if (!owner || !r || !diagnostic_claim ||
+        overlap(owner,sizeof(*owner),r,sizeof(*r)) ||
+        overlap(owner,sizeof(*owner),diagnostic_claim,sizeof(*diagnostic_claim)) ||
+        overlap(r,sizeof(*r),diagnostic_claim,sizeof(*diagnostic_claim))) return BH_TX_REJECTED;
+    struct bh_v2_transaction *t = *owner;
+    if (!t) return BH_TX_REJECTED;
+    struct bh_tx_result zero = {0};
+    if (t == &terminal_owner) {
+        if (memcmp(r,&zero,sizeof(zero))) return BH_TX_REJECTED;
+        return outcome(r,BH_TX_UNAVAILABLE);
+    }
+    if (leaf_range_overlap(t,owner,sizeof(*owner)) || leaf_range_overlap(t,r,sizeof(*r)) ||
+        leaf_range_overlap(t,diagnostic_claim,sizeof(*diagnostic_claim))) return BH_TX_REJECTED;
+    if (memcmp(r,&zero,sizeof(zero))) return BH_TX_REJECTED;
+    if (t->observation_failed || t->state_observation_failed || t->codec_observation_failed ||
+        t->leaf_digest_failed) return outcome(r,BH_TX_UNAVAILABLE);
+    if (t->leaf_digest_done || !t->observation_done || !t->state_observation_done ||
+        !t->codec_observation_done || !t->saved_parameters_valid) return outcome(r,BH_TX_REJECTED);
+    struct bh_tx_leaf_claim claim;
+    memcpy(&claim,diagnostic_claim,sizeof(claim));
+    size_t version_length = leaf_version_length(&t->install.version);
+    if (!claim.epoch || claim.key_state < 1 || claim.key_state > 3 || !version_length)
+        return leaf_failure(t,r,BH_TX_REJECTED);
+    if (!t->snapshots[0] || t->snapshot_lengths[0] < 49 || t->snapshot_lengths[0] > 65584 ||
+        !t->snapshots[1] || t->snapshot_lengths[1] != 64 ||
+        !t->snapshots[2] || t->snapshot_lengths[2] < 17 || t->snapshot_lengths[2] > 65552 ||
+        !t->state_snapshots[0] || !t->state_snapshot_lengths[0] ||
+        t->state_snapshot_lengths[0] > BH_JOURNAL_MAX_BYTES ||
+        !t->state_snapshots[1] || !t->state_snapshot_lengths[1] ||
+        t->state_snapshot_lengths[1] > BH_SELECTOR_MAX_BYTES)
+        return leaf_failure(t,r,BH_TX_UNAVAILABLE);
+    bh_journal_candidate candidate = {0};
+    if (CC_SHA256(t->snapshots[0],(CC_LONG)t->snapshot_lengths[0],candidate.policy_digest) !=
+        candidate.policy_digest) return leaf_failure(t,r,BH_TX_UNAVAILABLE);
+    if (CC_SHA256(t->snapshots[2],(CC_LONG)t->snapshot_lengths[2],candidate.manifest_digest) !=
+        candidate.manifest_digest) return leaf_failure(t,r,BH_TX_UNAVAILABLE);
+    memcpy(candidate.installation_id,t->saved_parameters.installation_id,sizeof(candidate.installation_id));
+    candidate.epoch = claim.epoch;
+    candidate.key_state = (uint8_t)claim.key_state;
+    if (claim.key_state != 1)
+        memcpy(candidate.new_key_id,t->saved_parameters.new_key_id,sizeof(candidate.new_key_id));
+    candidate.version_length = version_length;
+    memcpy(candidate.version_id,t->install.version.components[t->install.version.count-1],version_length);
+    bh_journal_snapshot journal = {t->state_snapshots[0],t->state_snapshot_lengths[0],1};
+    bh_journal_snapshot selector = {t->state_snapshots[1],t->state_snapshot_lengths[1],1};
+    bh_journal_observation observation = bh_journal_observe(journal,selector,
+        &t->saved_parameters,BH_JOURNAL_SAME_EPOCH_CANDIDATE,&candidate);
+    if (observation.outcome != BH_JOURNAL_CONSISTENT_ONLY)
+        return leaf_failure(t,r,observation.outcome == BH_JOURNAL_OFF_REJECT ?
+            BH_TX_REJECTED : BH_TX_UNAVAILABLE);
+    t->leaf_digest_done = 1;
+    return outcome(r,BH_TX_PREPARED_UNTRUSTED);
 }
 uint32_t bh_v2_transaction_abort(struct bh_v2_transaction **owner, struct bh_tx_result *r) {
     if (!owner || !r || overlap(owner,sizeof(*owner),r,sizeof(*r))) return BH_TX_REJECTED;
