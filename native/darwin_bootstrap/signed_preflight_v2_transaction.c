@@ -1,5 +1,6 @@
 #include "signed_preflight_v2_transaction.h"
 #include "signed_preflight_v2_transaction_os.h"
+#include "signed_preflight_v2_journal_codec.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -22,9 +23,13 @@ struct bh_v2_transaction {
     struct owned_fd ledger[TX_FDS];
     unsigned count, next_generation;
     unsigned leaves[3];
+    unsigned state_indices[2], state_generations[2];
     unsigned char *snapshots[3];
     size_t snapshot_lengths[3];
     int observation_done, observation_failed;
+    unsigned char *state_snapshots[2];
+    size_t state_snapshot_lengths[2];
+    int state_observation_done, state_observation_failed;
     int lock_index, locked, uncertain;
 };
 /* Address identity only: never a live transaction, never dereferenced or freed.
@@ -184,7 +189,11 @@ static uint32_t acquire(struct bh_v2_transaction *t, int anchor) {
     STEP(open_edge(t,version,"release.v2.bin",0,0,17,65552,&leaf));
     t->leaves[2] = leaf;
     STEP(open_edge(t,floor_parent,t->install.floor_name,0,1,0,INT64_MAX,&leaf));
+    t->state_indices[0] = leaf;
+    t->state_generations[0] = t->ledger[leaf].generation;
     STEP(open_edge(t,selector_parent,t->install.selector_name,0,0,0,INT64_MAX,&leaf));
+    t->state_indices[1] = leaf;
+    t->state_generations[1] = t->ledger[leaf].generation;
 #undef STEP
     return BH_TX_PREPARED_UNTRUSTED;
 }
@@ -221,6 +230,15 @@ static void free_snapshots(struct bh_v2_transaction *t) {
             t->snapshots[i] = NULL;
         }
         t->snapshot_lengths[i] = 0;
+    }
+}
+static void free_state_snapshots(struct bh_v2_transaction *t) {
+    for (unsigned i=0; i<2; ++i) {
+        if (t->state_snapshots[i]) {
+            bh_tx_os_free(t->state_snapshots[i]);
+            t->state_snapshots[i] = NULL;
+        }
+        t->state_snapshot_lengths[i] = 0;
     }
 }
 /* Observe one immutable ledger edge. The enumeration handle is independent
@@ -325,6 +343,85 @@ uint32_t bh_v2_transaction_observe_retained(struct bh_v2_transaction **owner,
     else { free_snapshots(t); t->observation_failed = 1; }
     return outcome(r,status);
 }
+uint32_t bh_v2_transaction_observe_local_state(struct bh_v2_transaction **owner,
+    struct bh_tx_result *r) {
+    if (!owner || !r || overlap(owner,sizeof(*owner),r,sizeof(*r)))
+        return BH_TX_REJECTED;
+    struct bh_tx_result zero = {0};
+    if (memcmp(r,&zero,sizeof(zero)) || !*owner) return BH_TX_REJECTED;
+    struct bh_v2_transaction *t = *owner;
+    if (t == &terminal_owner) return outcome(r,BH_TX_UNAVAILABLE);
+    if (overlap(t,sizeof(*t),owner,sizeof(*owner)) ||
+        overlap(t,sizeof(*t),r,sizeof(*r))) return BH_TX_REJECTED;
+    if (t->state_observation_failed || t->observation_failed)
+        return outcome(r,BH_TX_UNAVAILABLE);
+    if (t->state_observation_done || !t->observation_done)
+        return outcome(r,BH_TX_REJECTED);
+
+    uint32_t status = observe_all_edges(t);
+    size_t lengths[2] = {0};
+    unsigned char *scratch = NULL;
+    if (status == BH_TX_PREPARED_UNTRUSTED) {
+        for (unsigned i=0; i<2; ++i) {
+            unsigned index = t->state_indices[i];
+            /* The original ledger generation and signed size must be checked
+             * before conversion, allocation, or an exact-length read. */
+            if (index >= t->count) { status = BH_TX_UNAVAILABLE; break; }
+            const struct owned_fd *state = &t->ledger[index];
+            off_t size = state->metadata.st_size;
+            size_t limit = i == 0 ? BH_JOURNAL_MAX_BYTES : BH_SELECTOR_MAX_BYTES;
+            if (state->fd < 0 ||
+                state->generation != t->state_generations[i]) {
+                status = BH_TX_UNAVAILABLE; break;
+            }
+            if (size < 0 || (uintmax_t)size > (uintmax_t)limit ||
+                (uintmax_t)size > (uintmax_t)SSIZE_MAX) {
+                status = BH_TX_REJECTED; break;
+            }
+            if (size == 0) { status = BH_TX_UNAVAILABLE; break; }
+            lengths[i] = (size_t)size;
+        }
+    }
+    if (status == BH_TX_PREPARED_UNTRUSTED) {
+        for (unsigned i=0; i<2; ++i) {
+            t->state_snapshot_lengths[i] = lengths[i];
+            t->state_snapshots[i] = bh_tx_os_alloc(lengths[i]);
+            if (!t->state_snapshots[i]) { status = BH_TX_UNAVAILABLE; break; }
+        }
+        if (status == BH_TX_PREPARED_UNTRUSTED) {
+            size_t max_length = lengths[0] > lengths[1] ? lengths[0] : lengths[1];
+            scratch = bh_tx_os_alloc(max_length);
+            if (!scratch) status = BH_TX_UNAVAILABLE;
+        }
+    }
+    if (status == BH_TX_PREPARED_UNTRUSTED) {
+        for (unsigned i=0; i<2; ++i) {
+            const struct owned_fd *state = &t->ledger[t->state_indices[i]];
+            if (bh_tx_os_pread(state->fd,t->state_snapshots[i],lengths[i],0) !=
+                (ssize_t)lengths[i]) { status = BH_TX_UNAVAILABLE; break; }
+        }
+    }
+    if (status == BH_TX_PREPARED_UNTRUSTED) status = observe_all_edges(t);
+    int bytes_changed = 0;
+    if (status == BH_TX_PREPARED_UNTRUSTED) {
+        for (unsigned i=0; i<2; ++i) {
+            const struct owned_fd *state = &t->ledger[t->state_indices[i]];
+            if (bh_tx_os_pread(state->fd,scratch,lengths[i],0) !=
+                (ssize_t)lengths[i]) { status = BH_TX_UNAVAILABLE; break; }
+            if (memcmp(t->state_snapshots[i],scratch,lengths[i])) bytes_changed = 1;
+        }
+    }
+    if (status == BH_TX_PREPARED_UNTRUSTED) status = observe_all_edges(t);
+    if (status == BH_TX_PREPARED_UNTRUSTED && bytes_changed) status = BH_TX_REJECTED;
+    if (scratch) bh_tx_os_free(scratch);
+    if (status == BH_TX_PREPARED_UNTRUSTED) t->state_observation_done = 1;
+    else {
+        free_state_snapshots(t);
+        free_snapshots(t);
+        t->state_observation_failed = 1;
+    }
+    return outcome(r,status);
+}
 uint32_t bh_v2_transaction_abort(struct bh_v2_transaction **owner, struct bh_tx_result *r) {
     if (!owner || !r || overlap(owner,sizeof(*owner),r,sizeof(*r))) return BH_TX_REJECTED;
     struct bh_v2_transaction *t = *owner;
@@ -332,6 +429,7 @@ uint32_t bh_v2_transaction_abort(struct bh_v2_transaction **owner, struct bh_tx_
     if (!t) return outcome(r,BH_TX_ABORTED);
     if (overlap(t,sizeof(*t),owner,sizeof(*owner)) || overlap(t,sizeof(*t),r,sizeof(*r))) return BH_TX_REJECTED;
     *owner = NULL;
+    free_state_snapshots(t);
     free_snapshots(t);
     int failed = release(t);
     if (t->uncertain) failed = 1;

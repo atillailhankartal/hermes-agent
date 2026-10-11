@@ -44,5 +44,10 @@ uint32_t bh_v2_transaction_begin(int borrowed_anchor, const struct bh_tx_install
  * The live owner retains private bounded snapshots until abort. */
 uint32_t bh_v2_transaction_observe_retained(struct bh_v2_transaction **owner,
     struct bh_tx_result *result);
+/* One-shot OFF-only diagnostic of the original retained local floor/selector
+ * descriptions. Requires successful leaf observation first. Both snapshots
+ * remain private until abort; no format, witness, or admission proof is made. */
+uint32_t bh_v2_transaction_observe_local_state(struct bh_v2_transaction **owner,
+    struct bh_tx_result *result);
 uint32_t bh_v2_transaction_abort(struct bh_v2_transaction **owner, struct bh_tx_result *result);
 #endif
