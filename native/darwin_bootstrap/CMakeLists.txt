@@ -26,6 +26,28 @@ if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_TESTS)
     bee_hermes_signed_preflight_v2)
 endif()
 
+# Explicit cryptographic-consistency exercise using a caller-supplied public
+# key. OFF, excluded from ALL, and never linked into an installed image.
+option(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_CRYPTO_TESTS
+  "Explicit dormant signed-preflight v2 crypto tests" OFF)
+if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_CRYPTO_TESTS)
+  add_library(bee_hermes_signed_preflight_v2_crypto STATIC EXCLUDE_FROM_ALL
+    signed_preflight_v2_crypto.c signed_preflight_v2.c)
+  add_executable(bee_hermes_signed_preflight_v2_crypto_test EXCLUDE_FROM_ALL
+    ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_crypto.c)
+  foreach(crypto_target bee_hermes_signed_preflight_v2_crypto
+          bee_hermes_signed_preflight_v2_crypto_test)
+    target_compile_features(${crypto_target} PRIVATE c_std_11)
+    target_compile_options(${crypto_target} PRIVATE
+      -Wall -Wextra -Werror -pedantic)
+    target_include_directories(${crypto_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  endforeach()
+  target_link_libraries(bee_hermes_signed_preflight_v2_crypto PRIVATE
+    "-framework Security" "-framework CoreFoundation")
+  target_link_libraries(bee_hermes_signed_preflight_v2_crypto_test PRIVATE
+    bee_hermes_signed_preflight_v2_crypto)
+endif()
+
 add_library(bee_hermes_a2a STATIC
   launch_authority.c
   stage0.c
