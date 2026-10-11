@@ -205,3 +205,27 @@ if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_BUNDLE_TESTS)
   add_dependencies(bee_hermes_signed_preflight_v2_bundle_test
     hermes_bee_install_preflight bee_hermes_signed_preflight_v2_bundle)
 endif()
+
+# Stateless consistency only; no installed/default consumer or registration.
+option(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_KEY_POLICY_TESTS
+  "Explicit dormant signed-preflight v2 key-policy tests" OFF)
+if(BH_BUILD_DORMANT_SIGNED_PREFLIGHT_V2_KEY_POLICY_TESTS)
+  add_library(bee_hermes_signed_preflight_v2_key_policy STATIC EXCLUDE_FROM_ALL
+    signed_preflight_v2_key_policy.c)
+  add_executable(bee_hermes_signed_preflight_v2_key_policy_test EXCLUDE_FROM_ALL
+    ../../tests/native/darwin_bootstrap/test_signed_preflight_v2_key_policy.c
+    signed_preflight_v2_key_policy.c signed_preflight_v2.c signed_preflight_v2_crypto.c)
+  foreach(key_policy_target bee_hermes_signed_preflight_v2_key_policy
+          bee_hermes_signed_preflight_v2_key_policy_test)
+    target_compile_features(${key_policy_target} PRIVATE c_std_11)
+    target_compile_options(${key_policy_target} PRIVATE -Wall -Wextra -Werror -pedantic)
+    target_include_directories(${key_policy_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_property(TARGET ${key_policy_target} PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+  endforeach()
+  target_compile_definitions(bee_hermes_signed_preflight_v2_key_policy_test PRIVATE
+    BH_KEY_POLICY_TESTING)
+  target_link_libraries(bee_hermes_signed_preflight_v2_key_policy_test PRIVATE
+    "-framework Security" "-framework CoreFoundation")
+  target_link_options(bee_hermes_signed_preflight_v2_key_policy_test PRIVATE
+    "LINKER:-map,${CMAKE_CURRENT_BINARY_DIR}/bee_hermes_signed_preflight_v2_key_policy_test.map")
+endif()
