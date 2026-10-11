@@ -40,7 +40,12 @@ static int path_valid(const struct bh_tx_path *p) {
 static int same(const struct stat *a, const struct stat *b) {
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
         a->st_mode == b->st_mode && a->st_uid == b->st_uid &&
-        a->st_gid == b->st_gid && a->st_flags == b->st_flags && a->st_nlink == b->st_nlink && a->st_size == b->st_size;
+        a->st_gid == b->st_gid && a->st_flags == b->st_flags &&
+        a->st_nlink == b->st_nlink && a->st_size == b->st_size &&
+        a->st_ctimespec.tv_sec == b->st_ctimespec.tv_sec &&
+        a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec &&
+        a->st_mtimespec.tv_sec == b->st_mtimespec.tv_sec &&
+        a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec;
 }
 static int acceptable(const struct bh_v2_transaction *t, const struct stat *s,
                       int directory, off_t min, off_t max) {

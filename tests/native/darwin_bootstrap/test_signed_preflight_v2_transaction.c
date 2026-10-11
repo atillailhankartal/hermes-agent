@@ -28,6 +28,8 @@ static struct {
     unsigned leaf_original[3]; int close_sequence[LIMIT], closes;
     int caller_flags, caller_offset, ready, pair;
     int cleanup_mode, failed_handle, recycled_handle, quarantine_required;
+    int timestamp_node, timestamp_kind, timestamp_reached, timestamp_event;
+    struct stat timestamp_observed;
     void *allocation;
 } f;
 static const char *current;
@@ -68,7 +70,7 @@ static int lookup(int fd, const char *name) {
 }
 static void reset(void) {
     if (f.allocation) free(f.allocation);
-    memset(&f,0,sizeof(f)); f.poison_node = f.alias_node = f.failed_handle = f.recycled_handle = -1;
+    memset(&f,0,sizeof(f)); f.poison_node = f.alias_node = f.failed_handle = f.recycled_handle = f.timestamp_node = -1;
     f.caller_flags = 0x123; f.caller_offset = 37;
     for (int i = 0; i < NODES; ++i) {
         strcpy(f.visible_names[i], names[i]);
@@ -100,6 +102,20 @@ static void poison(int node, struct stat *s, int opened) {
         default: abort();
     }
 }
+static void timestamp_drift(struct handle *h, struct stat *s) {
+    if (f.timestamp_reached || h->node != f.timestamp_node ||
+        !(h->node == VERSION ? h->enumeration :
+          h->node >= POLICY && h->node <= MANIFEST && !h->enumeration)) return;
+    ++f.timestamp_reached; f.timestamp_event = f.count;
+    switch (f.timestamp_kind) {
+        case 0: ++s->st_ctimespec.tv_sec; break;
+        case 1: ++s->st_ctimespec.tv_nsec; break;
+        case 2: ++s->st_mtimespec.tv_sec; break;
+        case 3: ++s->st_mtimespec.tv_nsec; break;
+        default: abort();
+    }
+    f.timestamp_observed = *s;
+}
 int bh_tx_os_dup_cloexec(int fd) {
     struct handle *h = handle(fd); if (!h) return -1;
     if (event('D',h->node,O_CLOEXEC)) return -1;
@@ -117,7 +133,7 @@ int bh_tx_os_openat(int parent, const char *name, int flags) {
 int bh_tx_os_fstat(int fd, struct stat *out) {
     struct handle *h = handle(fd); if (!h) return -1;
     if (event('S',h->node,0)) return -1;
-    *out = f.meta[h->node]; poison(h->node,out,1); return 0;
+    *out = f.meta[h->node]; poison(h->node,out,1); timestamp_drift(h,out); return 0;
 }
 int bh_tx_os_fstatat(int parent, const char *name, struct stat *out, int flags) {
     int n = lookup(parent,name); if (n < 0) return -1;
@@ -564,6 +580,60 @@ static int clean_begin_failure(int v) {
     REQUIRE(borrowed_preserved() && !f.errors && !f.acl_live && !f.alloc_live);
     dump(); return ok;
 }
+static int timestamp_identity(int v) {
+    int ok = 1; variant = v; reset(); expected_begin();
+    struct bh_tx_install d = install(); struct bh_v2_transaction *owner = NULL;
+    struct bh_tx_result r = {0};
+    int unrelated = f.handles;
+    f.h[f.handles++] = (struct handle){1000,-1,1,1,0,0,++f.next_generation};
+    struct handle saved_unrelated = f.h[unrelated];
+    if (v < 16) {
+        const int targets[] = {VERSION,POLICY,SIGNATURE,MANIFEST};
+        f.timestamp_node = targets[v/4]; f.timestamp_kind = v%4;
+    }
+    uint32_t status = bh_v2_transaction_begin(9,&d,&owner,&r);
+    if (v == 16) {
+        REQUIRE(status == BH_TX_PREPARED_UNTRUSTED && r.status == status && owner != NULL);
+        REQUIRE(f.timestamp_reached == 0 && f.count == expected_count && trace_prefix(expected_count));
+        REQUIRE(retention() && f.lock_held && owned_live() == 12);
+        REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_ABORTED);
+        REQUIRE(owner == NULL && r.status == BH_TX_ABORTED);
+    } else {
+        struct stat intended = f.meta[f.timestamp_node];
+        switch (f.timestamp_kind) {
+            case 0: ++intended.st_ctimespec.tv_sec; break;
+            case 1: ++intended.st_ctimespec.tv_nsec; break;
+            case 2: ++intended.st_mtimespec.tv_sec; break;
+            case 3: ++intended.st_mtimespec.tv_nsec; break;
+            default: abort();
+        }
+        REQUIRE(f.timestamp_reached == 1 && f.timestamp_event > 1);
+        REQUIRE(memcmp(&f.timestamp_observed,&intended,sizeof(intended)) == 0);
+        if (f.timestamp_event > 1 && f.timestamp_event < f.count) {
+            REQUIRE(trace_prefix(f.timestamp_event));
+            REQUIRE(f.events[f.timestamp_event-1].op == 'S' &&
+                    f.events[f.timestamp_event-1].node == f.timestamp_node);
+            REQUIRE(f.events[f.timestamp_event-2].op == (f.timestamp_node == VERSION ? 'E' : 'O'));
+        }
+        REQUIRE(status == BH_TX_REJECTED && r.status == BH_TX_REJECTED);
+        if (status == BH_TX_REJECTED) {
+            REQUIRE(f.events[f.timestamp_event].op == (f.timestamp_node == VERSION ? 'e' : 'C'));
+            REQUIRE(owner == NULL && f.allocations == 0 && !f.quarantine_required);
+            REQUIRE(f.leaf_opens[0]+f.leaf_opens[1]+f.leaf_opens[2] ==
+                    (f.timestamp_node == VERSION ? 0 : f.timestamp_node-POLICY+1));
+        } else if (owner && status == BH_TX_PREPARED_UNTRUSTED) {
+            /* Keep each RED variant isolated even when the unfixed source accepts it. */
+            REQUIRE(bh_v2_transaction_abort(&owner,&r) == BH_TX_ABORTED);
+        }
+    }
+    REQUIRE(safe_result(&r) && borrowed_preserved());
+    REQUIRE(memcmp(&f.h[unrelated],&saved_unrelated,sizeof(saved_unrelated)) == 0);
+    REQUIRE(owned_live() == 0 && f.acl_live == 0 && f.alloc_live == 0 && !f.errors);
+    REQUIRE(cleanup_order());
+    fprintf(stderr,"TIMESTAMP target=%d kind=%d reached=%d event=%d status=%u owner=%s\n",
+        f.timestamp_node,f.timestamp_kind,f.timestamp_reached,f.timestamp_event,status,owner ? "live" : "null");
+    dump(); return ok;
+}
 struct test_case { const char *name; int variants; };
 static const struct test_case cases[] = {
     {"Begin_WhenArgumentsOrAbiAreInvalid_RejectsBeforeOsCalls",13},
@@ -582,21 +652,22 @@ static const struct test_case cases[] = {
     {"Begin_WhenPendingReleaseFailsAfterAcquisitionFailure_LatchesTerminalOwner",78},
     {"Begin_WhenLockAcquisitionIsAmbiguous_LatchesTerminalOwner",4},
     {"Begin_WhenBusyOrCleanlyRejected_ReleasesWithoutTerminalOwner",2},
-    {"Begin_WhenFlockEaccesMayHaveAcquiredLock_LatchesTerminalOwner",2}
+    {"Begin_WhenFlockEaccesMayHaveAcquiredLock_LatchesTerminalOwner",2},
+    {"Begin_WhenRetainedAncestorOrLeafTimestampDrifts_RejectsIdentityMismatch",17}
 };
 int main(void) {
     int passed = 0, variants = 0; size_t count = sizeof(cases)/sizeof(cases[0]);
-    if (count != 17) { fprintf(stderr,"FAIL empty or changed registry\n"); return 2; }
+    if (count != 18) { fprintf(stderr,"FAIL empty or changed registry\n"); return 2; }
     expected_begin(); int acquisitions = expected_count;
     for (size_t i = 0; i < count; ++i) {
         int ok = 1, n = cases[i].variants < 0 ? acquisitions : cases[i].variants;
         current = cases[i].name;
         if (!current[0] || n <= 0) return 2;
         for (size_t j = 0; j < i; ++j) if (!strcmp(current,cases[j].name)) return 2;
-        for (int v = 0; v < n; ++v) { if (!(i == 16 ? preowner_ambiguity(3,v) : i == 15 ? clean_begin_failure(v) : i >= 12 ? preowner_ambiguity((int)i-12,v) : i == 11 ? terminal_latch(v) : i == 10 ? mutation_oracle() : run_variant((int)i,v))) ok = 0; ++variants; }
+        for (int v = 0; v < n; ++v) { if (!(i == 17 ? timestamp_identity(v) : i == 16 ? preowner_ambiguity(3,v) : i == 15 ? clean_begin_failure(v) : i >= 12 ? preowner_ambiguity((int)i-12,v) : i == 11 ? terminal_latch(v) : i == 10 ? mutation_oracle() : run_variant((int)i,v))) ok = 0; ++variants; }
         printf("%s %s variants=%d\n",ok ? "PASS" : "FAIL",current,n); fflush(stdout); passed += ok;
     }
-    printf("SUMMARY %d/%zu named cases passed; %zu failed; variants=%d; 0 skipped; frozen Begin=9; source positive=1; harness=1; terminal latch=1\n",passed,count,count-(size_t)passed,variants);
+    printf("SUMMARY %d/%zu named cases passed; %zu failed; variants=%d; 0 skipped; frozen Begin=9; source positive=1; harness=1; terminal latch=1; timestamp drift=16 control=1\n",passed,count,count-(size_t)passed,variants);
     current = "Abort_WhenUnlockOrCloseIsAmbiguous_RetiresOwnershipWithoutRetry";
     int terminal = abort_ambiguity();
     printf("%s %s variants=26; source supplement; 0 skipped\n",terminal ? "PASS" : "FAIL",current);
